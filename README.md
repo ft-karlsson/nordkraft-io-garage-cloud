@@ -1,5 +1,7 @@
 # Nordkraft I/O Garage Cloud
 
+> ⚠️ **Still in active development.** MARK I ready: The platform runs in frendly user testing today and active development is ongoing. For a full stable production release wait for MARK II.
+
 **Run containers on infrastructure you control — from anywhere, on any hardware.**
 
 CLI-first. WireGuard private-by-default. Built on refurbished hardware in Denmark.
