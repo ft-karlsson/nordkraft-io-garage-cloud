@@ -62,7 +62,7 @@ nordkraft ingress enable my-app --subdomain my-app
 ## How it works
 
 ```
-Your laptop  →  WireGuard VPN  →  Nordkraft I/O Garage Cloud.io node  →  Isolated containers
+Your laptop  →  WireGuard VPN  →  Controller  →  NATS  →  Agent nodes  →  Isolated containers
 ```
 
 Your VPN connection *is* your authentication. No passwords, no tokens to manage at runtime. When you connect over WireGuard, the system resolves your IP to your public key to your account — cryptographically. All container operations flow through that encrypted tunnel.
@@ -71,26 +71,29 @@ Containers run with VM-level isolation via Kata Containers on top of containerd.
 
 ### Architecture
 
+The controller and agent nodes are separate hosts that communicate over NATS. In hybrid mode, the controller also runs workloads — useful for small setups or single-machine installs.
+
 ```
-┌─────────────────────────────────────────────────────┐
-│                  NORDKRAFT.IO NODE                   │
-│                                                     │
-│  ┌──────────────────┐      ┌─────────────────────┐  │
-│  │  Raspberry Pi    │      │  Dell OptiPlex      │  │
-│  │  (Controller)    │◄────►│  (Agent node)       │  │
-│  │                  │ NATS │                     │  │
-│  │  • WireGuard VPN │      │  • Kata Containers  │  │
-│  │  • Container API │      │  • Your workloads   │  │
-│  │  • PostgreSQL    │      │  • 172.21.x.x IPs   │  │
-│  └──────────────────┘      └─────────────────────┘  │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────┐          ┌─────────────────────┐
+│  HOST A: Controller  │          │  HOST B: Agent node  │
+│                      │   NATS   │                      │
+│  • WireGuard VPN     │◄────────►│  • Kata Containers   │
+│  • Container API     │          │  • Your workloads    │
+│  • PostgreSQL        │          │  • 172.21.x.x IPs    │
+│  • NATS server       │          └──────────────────────┘
+│                      │
+│  In hybrid mode:     │          ┌──────────────────────┐
+│  • Kata Containers   │   NATS   │  HOST C: Agent node  │
+│  • Local workloads   │◄────────►│  • Kata Containers   │
+│                      │          │  • More workloads    │
+└──────────────────────┘          └──────────────────────┘
          ▲
          │ WireGuard (encrypted)
          │
     Your laptop / CI / anywhere
 ```
 
-Add more machines, add more capacity. Controller discovers nodes automatically via NATS.
+Add more agent nodes, add more capacity. The controller discovers nodes automatically via NATS.
 
 ---
 
