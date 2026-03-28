@@ -1,10 +1,17 @@
 // src/services/route_manager.rs
-// Ensure routes to hardware/agent nodes on controller or host and
+// Ensure routes to hardware/agent nodes on controller or host.
+//
+// RouteReconciler: Periodically compares OS routing table with DB state.
+// If routes are missing (e.g. after systemd-networkd restart triggered by
+// unattended-upgrades / apt-daily-upgrade), re-provisions them from the database.
 
 use std::net::IpAddr;
 use std::process::Stdio;
+use std::sync::Arc;
+use sqlx::PgPool;
 use tokio::process::Command;
-use tracing::{debug, info, warn};
+use tokio::time::{interval, Duration};
+use tracing::{debug, error, info, warn};
 
 pub struct StaticRouteManager {
     use_sudo: bool,
@@ -212,4 +219,136 @@ mod tests {
         // Now handles CIDR via strip_cidr, but validate_ip itself should fail on CIDR
         assert!(StaticRouteManager::validate_ip("172.21.3.15/32").is_err());
     }
+}
+
+// ============= ROUTE RECONCILER =============
+// Periodically compares OS routing table with DB state.
+// If routes are missing (e.g. after systemd-networkd restart triggered by
+// unattended-upgrades / apt-daily-upgrade / netplan apply),
+// re-provisions them from the database — reuses sync_routes_on_startup logic.
+
+#[derive(Clone)]
+pub struct RouteReconciler {
+    route_manager: Arc<StaticRouteManager>,
+    db_pool: PgPool,
+    interval_secs: u64,
+}
+
+impl RouteReconciler {
+    pub fn new(route_manager: Arc<StaticRouteManager>, db_pool: PgPool) -> Self {
+        Self {
+            route_manager,
+            db_pool,
+            interval_secs: 300, // 5 minutes, same as WgReconciler
+        }
+    }
+
+    /// Spawn background reconciliation loop
+    pub async fn start(&self) {
+        let route_manager = Arc::clone(&self.route_manager);
+        let db_pool = self.db_pool.clone();
+        let interval_secs = self.interval_secs;
+
+        tokio::spawn(async move {
+            // Wait one interval before first check (sync_routes_on_startup handles boot)
+            let mut tick = interval(Duration::from_secs(interval_secs));
+            tick.tick().await; // skip immediate first tick
+
+            loop {
+                tick.tick().await;
+
+                if let Err(e) = reconcile_routes(&route_manager, &db_pool).await {
+                    error!("Route reconciler error: {}", e);
+                }
+            }
+        });
+
+        info!(
+            "🔄 Route reconciler started (interval: {}s)",
+            self.interval_secs
+        );
+    }
+}
+
+/// Compare DB routes with OS routing table, re-add any missing.
+async fn reconcile_routes(
+    route_manager: &StaticRouteManager,
+    db_pool: &PgPool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use sqlx::Row;
+
+    // Step 1: Get expected routes from DB (running containers with IPs)
+    let db_routes = sqlx::query(
+        "SELECT c.internal_ip, c.container_name, n.internal_ip AS node_ip, n.network_interface
+         FROM containers c
+         JOIN nodes n ON c.node_id = n.node_id
+         WHERE c.status = 'running' AND c.internal_ip IS NOT NULL",
+    )
+    .fetch_all(db_pool)
+    .await?;
+
+    if db_routes.is_empty() {
+        debug!("🔄 Route reconciler: no running containers in DB");
+        return Ok(());
+    }
+
+    // Step 2: Check each expected route, re-add if missing
+    let mut restored = 0u32;
+
+    for row in &db_routes {
+        let container_ip: String = row.get("internal_ip");
+        let container_name: String = row.get("container_name");
+        let node_ip: String = row.get("node_ip");
+        let interface: String = row.get("network_interface");
+
+        match route_manager.route_exists(&container_ip).await {
+            Ok(true) => {
+                // Route present, nothing to do
+            }
+            Ok(false) => {
+                warn!(
+                    "🔄 Route reconciler: route missing for {} ({}), re-adding",
+                    container_name, container_ip
+                );
+                match route_manager
+                    .add_container_route(&container_ip, &node_ip, &interface)
+                    .await
+                {
+                    Ok(_) => {
+                        info!(
+                            "🔄 Route reconciler: restored route {} -> {}",
+                            container_name, container_ip
+                        );
+                        restored += 1;
+                    }
+                    Err(e) => {
+                        error!(
+                            "🔄 Route reconciler: failed to restore route {} ({}): {}",
+                            container_name, container_ip, e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "🔄 Route reconciler: failed to check route {} ({}): {}",
+                    container_name, container_ip, e
+                );
+            }
+        }
+    }
+
+    if restored > 0 {
+        warn!(
+            "🔄 Route reconciler: restored {} missing route(s)",
+            restored
+        );
+    } else {
+        debug!(
+            "🔄 Route reconciler: all {} routes present",
+            db_routes.len()
+        );
+    }
+
+    Ok(())
 }

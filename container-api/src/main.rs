@@ -802,6 +802,22 @@ async fn rocket() -> _ {
         None
     };
 
+    // =========================================================
+    // ROUTE RECONCILER - re-provisions missing routes from DB
+    // Catches routes lost to systemd-networkd restarts, netplan
+    // apply, unattended-upgrades, etc. Runs every 5 minutes.
+    // =========================================================
+    if matches!(
+        config.mode,
+        config::OperationMode::Controller | config::OperationMode::Hybrid
+    ) {
+        let route_reconciler = RouteReconciler::new(
+            Arc::clone(&app_state.route_manager),
+            db_pool.clone(),
+        );
+        route_reconciler.start().await;
+    }
+
     // Create orchestrator
     let orchestrator = OrchestratorService::new(
         &config,
