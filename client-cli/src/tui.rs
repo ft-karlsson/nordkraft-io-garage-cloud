@@ -1,5 +1,5 @@
 // tui.rs — nordkraft ui
-//
+// k9s-style terminal dashboard for NordKraft.io
 //
 // DEPS (Cargo.toml):
 //   ratatui  = "0.28"
@@ -856,7 +856,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "Nordkraft.io",
+                "NordKraft.io",
                 Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
             ),
             Span::styled("  ·  ", Style::default().fg(MUTED)),
@@ -1129,6 +1129,7 @@ fn status_icon_color(status: &str) -> (&'static str, Color) {
         "running" | "up" => ("●", EMERALD),
         "stopped" | "exited" => ("○", ROSE),
         "starting" | "deploying" => ("◎", AMBER),
+        "failed" => ("✖", ROSE),
         "paused" => ("⏸", INDIGO),
         _ => ("?", MUTED),
     }

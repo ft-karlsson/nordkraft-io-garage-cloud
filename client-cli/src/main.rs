@@ -210,6 +210,14 @@ enum Commands {
     Specs,
     /// Show plan usage vs. limits
     Usage,
+    /// Show deploy lifecycle events
+    Events {
+        /// Filter by container name or alias
+        container: Option<String>,
+        /// Number of events to show
+        #[arg(short = 'n', long, default_value = "20")]
+        limit: usize,
+    },
 }
 
 // ============= AUTH COMMANDS =============
@@ -1456,6 +1464,7 @@ async fn main() {
         Commands::Edit { container } => handle_edit_interactive(container, json_output).await,
         Commands::Specs => handle_specs_list(json_output).await,
         Commands::Usage => handle_usage(json_output).await,
+        Commands::Events { container, limit } => handle_events(container, limit, json_output).await,
 
         // Shortcuts with interactive selection
         Commands::Deploy(args) => handle_deploy(args, json_output).await,
@@ -1704,8 +1713,15 @@ async fn handle_container_list(json_output: bool) -> Result<(), Box<dyn std::err
     println!();
 
     for c in &data.containers {
-        let status_colored = if c.status.contains("Up") || c.status.contains("running") {
-            c.status.green()
+        let status_lower = c.status.to_lowercase();
+        let status_colored = if status_lower.contains("up") || status_lower == "running" {
+            "Up".green().bold()
+        } else if status_lower == "deploying" {
+            "Deploying".yellow().bold()
+        } else if status_lower == "failed" {
+            "Failed".red().bold()
+        } else if status_lower.contains("exited") || status_lower.contains("stopped") {
+            c.status.red()
         } else {
             c.status.yellow()
         };
@@ -3182,6 +3198,124 @@ async fn handle_usage(json_output: bool) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+// ============= EVENTS HANDLER =============
+
+async fn handle_events(
+    container: Option<String>,
+    limit: usize,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = create_client()?;
+
+    // Resolve alias if provided
+    let container = container.map(|c| resolve_alias(&c));
+
+    let mut url = format!("{}/events?limit={}", *API_BASE_URL, limit);
+    if let Some(ref name) = container {
+        url = format!("{}&container={}", url, name);
+    }
+
+    let response = client.get(&url).send().await?;
+
+    if !response.status().is_success() {
+        let error: ApiError = response.json().await?;
+        return Err(format!("Failed to fetch events: {}", error.error).into());
+    }
+
+    let data: serde_json::Value = response.json().await?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&data)?);
+        return Ok(());
+    }
+
+    let events = data["events"].as_array();
+
+    if events.is_none() || events.unwrap().is_empty() {
+        println!("{}", "No deploy events found.".dimmed());
+        if container.is_some() {
+            println!(
+                "   Try without filter: {}",
+                "nordkraft events".cyan()
+            );
+        }
+        return Ok(());
+    }
+
+    let events = events.unwrap();
+
+    if let Some(ref name) = container {
+        println!(
+            "{}",
+            format!("📋 Deploy events for: {}", name).cyan().bold()
+        );
+    } else {
+        println!("{}", "📋 Deploy events".cyan().bold());
+    }
+    println!();
+
+    // Events come newest-first from API, reverse for chronological display
+    for event in events.iter().rev() {
+        let phase = event["phase"].as_str().unwrap_or("?");
+        let message = event["message"].as_str().unwrap_or("");
+        let success = event["success"].as_bool().unwrap_or(true);
+        let timestamp = event["timestamp"].as_str().unwrap_or("");
+        let container_name = event["container_name"].as_str().unwrap_or("");
+
+        // Format timestamp to just time if today
+        let time_str = if timestamp.len() > 19 {
+            &timestamp[11..19]
+        } else {
+            timestamp
+        };
+
+        let phase_icon = match phase {
+            "pulling" => "⬇️ ",
+            "pulled" => "📦",
+            "creating" => "🔧",
+            "starting" => "🚀",
+            "running" => "✅",
+            "upgrading" => "🔄",
+            "failed" => "❌",
+            _ => "  ",
+        };
+
+        let phase_colored = if success {
+            match phase {
+                "running" => phase.green().bold().to_string(),
+                "pulling" | "upgrading" => phase.cyan().to_string(),
+                _ => phase.white().to_string(),
+            }
+        } else {
+            phase.red().bold().to_string()
+        };
+
+        // Show container name only in unfiltered view
+        if container.is_none() {
+            println!(
+                "   {} {} {} {} {}",
+                time_str.dimmed(),
+                phase_icon,
+                phase_colored,
+                container_name.white().bold(),
+                message.dimmed()
+            );
+        } else {
+            println!(
+                "   {} {} {} {}",
+                time_str.dimmed(),
+                phase_icon,
+                phase_colored,
+                message.dimmed()
+            );
+        }
+    }
+
+    println!();
+
+    Ok(())
+}
+
 fn print_quota_error(error: &ApiError) {
     eprintln!("{}", "❌ Deploy blocked — plan quota exceeded".red().bold());
     eprintln!();
@@ -4309,7 +4443,7 @@ async fn handle_registry_push(
         println!("{}", format!("✅ Pushed {}", image).green().bold());
         println!();
         println!("   {} Deploy it:", "🎯".yellow());
-        println!("     nordkraft deploy {} --port <PORT>", image);
+        println!("     nordkraft deploy registry://{} --port <PORT>", image);
     } else {
         println!(
             "{}",
@@ -5129,7 +5263,7 @@ fn show_help() {
 
     println!("{}", "INGRESS (HTTPS):".yellow().bold());
     println!(
-        "   nordkraft ingress enable <name> -s myapp    Enable HTTPS at e.g. myapp.nordkraft.cloud"
+        "   nordkraft ingress enable <name> -s myapp    Enable HTTPS at myapp.nordkraft.cloud"
     );
     println!("   nordkraft ingress disable <name>            Disable ingress");
     println!("   nordkraft ingress status <name>             Show ingress status");
