@@ -172,7 +172,7 @@ pub fn init_config() -> AppConfig {
             .unwrap_or_else(|_| "unless-stopped".to_string()),
 
         // Admin API security
-       admin_api_key: env::var("ADMIN_API_KEY")
+        admin_api_key: env::var("ADMIN_API_KEY")
             .expect("ADMIN_API_KEY must be set — generate one with: openssl rand -hex 32"),
         admin_allowed_ips: env::var("ADMIN_ALLOWED_IPS")
             .unwrap_or_else(|_| "127.0.0.1,172.20.0.254".to_string())

@@ -348,6 +348,22 @@ impl OrchestratorService {
                     make_container_deleted_handler(),
                 )
                 .await;
+
+            // Subscribe to deployment results — update container status in DB
+            let _ = nats_clone
+                .subscribe_to_messages(
+                    NatsSubjects::CONTAINER_DEPLOYMENT_RESULT.to_string(),
+                    make_deployment_result_handler(),
+                )
+                .await;
+
+            // Subscribe to upgrade results — same status update
+            let _ = nats_clone
+                .subscribe_to_messages(
+                    NatsSubjects::CONTAINER_UPGRADE_RESULT.to_string(),
+                    make_upgrade_result_handler(),
+                )
+                .await;
         });
     }
 }
@@ -474,6 +490,82 @@ fn make_container_deleted_handler() -> impl Fn(String, String) + Send + Sync + '
     }
 }
 
+/// Handle deployment result from agent — update container status in DB
+fn make_deployment_result_handler() -> impl Fn(NatsMessage) + Send + Sync + 'static {
+    move |msg: NatsMessage| {
+        if let NatsMessage::ContainerDeploymentResult {
+            container_name,
+            success,
+            error,
+            ..
+        } = msg
+        {
+            let status = if success { "running" } else { "failed" };
+            info!(
+                "📋 Deployment result: {} → {}{}",
+                container_name,
+                status,
+                error
+                    .as_ref()
+                    .map(|e| format!(" ({})", e))
+                    .unwrap_or_default()
+            );
+
+            tokio::spawn(async move {
+                if let Err(e) = update_container_status_from_result(&container_name, status).await {
+                    error!(
+                        "Failed to update container status for {}: {}",
+                        container_name, e
+                    );
+                }
+            });
+        }
+    }
+}
+
+/// Handle upgrade result from agent — same status update
+fn make_upgrade_result_handler() -> impl Fn(NatsMessage) + Send + Sync + 'static {
+    move |msg: NatsMessage| {
+        if let NatsMessage::ContainerUpgradeResult {
+            container_name,
+            success,
+            error,
+            ..
+        } = msg
+        {
+            let status = if success { "running" } else { "failed" };
+            info!(
+                "📋 Upgrade result: {} → {}{}",
+                container_name,
+                status,
+                error
+                    .as_ref()
+                    .map(|e| format!(" ({})", e))
+                    .unwrap_or_default()
+            );
+
+            tokio::spawn(async move {
+                if let Err(e) = update_container_status_from_result(&container_name, status).await {
+                    error!(
+                        "Failed to update container status for {}: {}",
+                        container_name, e
+                    );
+                }
+            });
+        }
+    }
+}
+
+/// Connect to DB and update container status
+async fn update_container_status_from_result(
+    container_name: &str,
+    status: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let db_url = std::env::var("DATABASE_URL")?;
+    let pool = sqlx::PgPool::connect(&db_url).await?;
+    storage::update_container_status(&pool, container_name, status).await
+}
+
 async fn handle_container_deletion_cleanup(
     container_name: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -547,6 +639,17 @@ fn make_container_assignment_handler(
         let node = node_id.clone();
 
         tokio::spawn(async move {
+            // Emit: pulling phase
+            let _ = nats
+                .publish_deploy_event(
+                    &container_name,
+                    &owner_pubkey,
+                    "pulling",
+                    &format!("Pulling image: {}", image),
+                    true,
+                )
+                .await;
+
             let result = cm
                 .deploy_secure_container(
                     &owner_pubkey,
@@ -573,6 +676,18 @@ fn make_container_assignment_handler(
                         "✅ Container {} deployed: IPv4={}, IPv6={:?}",
                         name, ip, deployed_ipv6
                     );
+
+                    // Emit: running phase
+                    let _ = nats
+                        .publish_deploy_event(
+                            &name,
+                            &owner_pubkey,
+                            "running",
+                            &format!("Container running at {}", ip),
+                            true,
+                        )
+                        .await;
+
                     NatsMessage::ContainerDeploymentResult {
                         job_id,
                         container_name: name,
@@ -586,6 +701,18 @@ fn make_container_assignment_handler(
                 }
                 Err(e) => {
                     error!("❌ Container deployment failed: {}", e);
+
+                    // Emit: failed phase
+                    let _ = nats
+                        .publish_deploy_event(
+                            &container_name,
+                            &owner_pubkey,
+                            "failed",
+                            &format!("Deploy failed: {}", e),
+                            false,
+                        )
+                        .await;
+
                     NatsMessage::ContainerDeploymentResult {
                         job_id,
                         container_name,
@@ -725,6 +852,17 @@ fn make_container_upgrade_handler(
         let node = node_id.clone();
 
         tokio::spawn(async move {
+            // Emit: upgrading phase
+            let _ = nats
+                .publish_deploy_event(
+                    &container_name,
+                    &owner_pubkey,
+                    "upgrading",
+                    &format!("Upgrading to image: {}", config.image),
+                    true,
+                )
+                .await;
+
             // Step 1: Stop the container
             info!("⏸️  Upgrade: stopping {}", container_name);
             if let Err(e) = cm.stop_container(&container_name, &owner_pubkey).await {
@@ -737,6 +875,17 @@ fn make_container_upgrade_handler(
             let _ = tokio::process::Command::new("nerdctl")
                 .args(["rm", "-f", &container_name])
                 .output()
+                .await;
+
+            // Emit: pulling phase
+            let _ = nats
+                .publish_deploy_event(
+                    &container_name,
+                    &owner_pubkey,
+                    "pulling",
+                    &format!("Pulling image: {}", config.image),
+                    true,
+                )
                 .await;
 
             // Step 3: Redeploy with same name + same IP + updated config
@@ -780,6 +929,18 @@ fn make_container_upgrade_handler(
             let msg = match result {
                 Ok((name, _, ip, _, _)) => {
                     info!("✅ Upgrade complete: {} → {}", name, config.image);
+
+                    // Emit: running phase
+                    let _ = nats
+                        .publish_deploy_event(
+                            &name,
+                            &owner_pubkey,
+                            "running",
+                            &format!("Upgrade complete, running at {}", ip),
+                            true,
+                        )
+                        .await;
+
                     NatsMessage::ContainerUpgradeResult {
                         container_name: name,
                         node_id: node,
@@ -794,6 +955,18 @@ fn make_container_upgrade_handler(
                         "❌ Upgrade FAILED for {}: {}. Container is DOWN.",
                         container_name, e
                     );
+
+                    // Emit: failed phase
+                    let _ = nats
+                        .publish_deploy_event(
+                            &container_name,
+                            &owner_pubkey,
+                            "failed",
+                            &format!("Upgrade failed: {}", e),
+                            false,
+                        )
+                        .await;
+
                     NatsMessage::ContainerUpgradeResult {
                         container_name,
                         node_id: node,

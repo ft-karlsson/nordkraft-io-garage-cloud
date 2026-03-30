@@ -497,7 +497,7 @@ pub async fn track_container_deployment(
     sqlx::query(
         "INSERT INTO containers 
          (container_id, container_name, user_id, node_id, image, internal_ip, status, cpu_limit, memory_limit_mb, volume_size_mb, created_at) 
-         VALUES ($1, $2, $3, $4, $5, $6, 'running', $7, $8, $9, NOW())",
+         VALUES ($1, $2, $3, $4, $5, $6, 'deploying', $7, $8, $9, NOW())",
     )
     .bind(container_id)
     .bind(container_name)
@@ -510,6 +510,24 @@ pub async fn track_container_deployment(
     .bind(vol_mb)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Update container status (called when agent reports deployment result)
+pub async fn update_container_status(
+    pool: &PgPool,
+    container_name: &str,
+    status: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    sqlx::query(
+        "UPDATE containers SET status = $1, updated_at = NOW() 
+         WHERE container_name = $2 AND status != 'deleted'",
+    )
+    .bind(status)
+    .bind(container_name)
+    .execute(pool)
+    .await?;
+    info!("📋 Container {} status → {}", container_name, status);
     Ok(())
 }
 

@@ -5,10 +5,10 @@
 // If routes are missing (e.g. after systemd-networkd restart triggered by
 // unattended-upgrades / apt-daily-upgrade), re-provisions them from the database.
 
+use sqlx::PgPool;
 use std::net::IpAddr;
 use std::process::Stdio;
 use std::sync::Arc;
-use sqlx::PgPool;
 use tokio::process::Command;
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
@@ -348,6 +348,197 @@ async fn reconcile_routes(
             "🔄 Route reconciler: all {} routes present",
             db_routes.len()
         );
+    }
+
+    Ok(())
+}
+
+// ============= AGENT ROUTE RECONCILER =============
+// Periodically ensures agent-side routes survive systemd-networkd restarts:
+//   1. VPN return route (172.20.0.0/16 via controller)
+//   2. Macvlan shim interfaces + per-tenant subnet routes
+// Complements the controller-side RouteReconciler.
+
+#[derive(Clone)]
+pub struct AgentRouteReconciler {
+    vpn_network: String,
+    controller_ip: String,
+    agent_interface: String,
+    interval_secs: u64,
+}
+
+impl AgentRouteReconciler {
+    pub fn new(vpn_network: &str, controller_ip: &str, agent_interface: &str) -> Self {
+        Self {
+            vpn_network: vpn_network.to_string(),
+            controller_ip: controller_ip.to_string(),
+            agent_interface: agent_interface.to_string(),
+            interval_secs: 300, // 5 minutes
+        }
+    }
+
+    /// Spawn background reconciliation loop
+    pub async fn start(&self) {
+        let vpn_network = self.vpn_network.clone();
+        let controller_ip = self.controller_ip.clone();
+        let agent_interface = self.agent_interface.clone();
+        let interval_secs = self.interval_secs;
+
+        tokio::spawn(async move {
+            // Wait one interval before first check (ensure_agent_vpn_routes handles startup)
+            let mut tick = interval(Duration::from_secs(interval_secs));
+            tick.tick().await; // skip immediate first tick
+
+            loop {
+                tick.tick().await;
+
+                if let Err(e) =
+                    reconcile_agent_routes(&vpn_network, &controller_ip, &agent_interface).await
+                {
+                    error!("Agent route reconciler error: {}", e);
+                }
+            }
+        });
+
+        info!(
+            "🔄 Agent route reconciler started (interval: {}s)",
+            self.interval_secs
+        );
+    }
+}
+
+/// Check and restore agent-side routes
+async fn reconcile_agent_routes(
+    vpn_network: &str,
+    controller_ip: &str,
+    agent_interface: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut restored = 0u32;
+
+    // Step 1: Check VPN return route
+    let check = Command::new("ip")
+        .args(["route", "show", vpn_network])
+        .output()
+        .await?;
+
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    if stdout.is_empty() || !stdout.contains(controller_ip) {
+        warn!(
+            "🔄 Agent reconciler: VPN return route missing ({} via {}), re-adding",
+            vpn_network, controller_ip
+        );
+
+        let result = Command::new("ip")
+            .args([
+                "route",
+                "add",
+                vpn_network,
+                "via",
+                controller_ip,
+                "dev",
+                agent_interface,
+            ])
+            .output()
+            .await?;
+
+        if result.status.success() {
+            info!(
+                "🔄 Agent reconciler: restored VPN route {} via {} dev {}",
+                vpn_network, controller_ip, agent_interface
+            );
+            restored += 1;
+        } else {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            if !stderr.contains("File exists") {
+                error!(
+                    "🔄 Agent reconciler: failed to restore VPN route: {}",
+                    stderr
+                );
+            }
+        }
+    }
+
+    // Step 2: Check macvlan shim interfaces + tenant routes
+    // List all nk-shim-t* interfaces that should exist
+    let link_output = Command::new("ip")
+        .args(["-o", "link", "show"])
+        .output()
+        .await?;
+
+    let link_stdout = String::from_utf8_lossy(&link_output.stdout);
+
+    // Get current routes to check which tenant routes exist
+    let route_output = Command::new("ip").args(["route", "show"]).output().await?;
+
+    let route_stdout = String::from_utf8_lossy(&route_output.stdout);
+
+    // Find all nk-shim-t* interfaces and verify their routes
+    for line in link_stdout.lines() {
+        // Match lines like: "12: nk-shim-t1@if2: <BROADCAST..."
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+
+        let iface_part = parts[1].trim();
+        let iface_name = iface_part.split('@').next().unwrap_or(iface_part);
+
+        if !iface_name.starts_with("nk-shim-t") {
+            continue;
+        }
+
+        // Extract slot number from "nk-shim-t{slot}"
+        let slot_str = iface_name.strip_prefix("nk-shim-t").unwrap_or("");
+        let slot: i32 = match slot_str.parse() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let subnet = format!("172.21.{}.0/24", slot);
+
+        // Check if tenant route exists pointing at this shim
+        if !route_stdout.contains(&format!("{} dev {}", subnet, iface_name)) {
+            warn!(
+                "🔄 Agent reconciler: tenant route missing for {} dev {}, re-adding",
+                subnet, iface_name
+            );
+
+            // Remove any stale route first
+            let _ = Command::new("ip")
+                .args(["route", "del", &subnet])
+                .output()
+                .await;
+
+            let add = Command::new("ip")
+                .args(["route", "add", &subnet, "dev", iface_name])
+                .output()
+                .await?;
+
+            if add.status.success() {
+                info!(
+                    "🔄 Agent reconciler: restored tenant route {} dev {}",
+                    subnet, iface_name
+                );
+                restored += 1;
+            } else {
+                let stderr = String::from_utf8_lossy(&add.stderr);
+                if !stderr.contains("File exists") {
+                    error!(
+                        "🔄 Agent reconciler: failed to restore tenant route {}: {}",
+                        subnet, stderr
+                    );
+                }
+            }
+        }
+    }
+
+    if restored > 0 {
+        warn!(
+            "🔄 Agent reconciler: restored {} missing route(s)",
+            restored
+        );
+    } else {
+        debug!("🔄 Agent reconciler: all routes present");
     }
 
     Ok(())

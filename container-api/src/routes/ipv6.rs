@@ -3,7 +3,6 @@
 // The ipv6_firewall_rules table only tracks: container_name, ports, rule_id, sync status
 // IPv6 addresses come from actual containers (SLAAC assigned) - in future we might want to assign static IPv6 from a pool.
 
-
 use crate::controller::OrchestratorService;
 use crate::guards::AuthenticatedUser;
 use crate::services::pfsense_client::PfSenseClientTrait;
