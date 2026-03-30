@@ -1,4 +1,4 @@
-# Nordkraft I/O Garage Cloud
+# Nordkraft IO Garage Cloud
 
 > ⚠️ **Still in active development.** MARK I ready: The platform runs in frendly user testing today and active development is ongoing. For a full stable production release wait for MARK II.
 
