@@ -20,7 +20,10 @@ pub async fn get_events(
     let limit = limit.unwrap_or(50).min(200);
     let user_id = &user.0.wireguard_public_key;
 
-    match event_store.query_events(user_id, container.as_deref(), limit).await {
+    match event_store
+        .query_events(user_id, container.as_deref(), limit)
+        .await
+    {
         Ok(events) => Json(serde_json::json!({
             "events": events,
             "count": events.len(),

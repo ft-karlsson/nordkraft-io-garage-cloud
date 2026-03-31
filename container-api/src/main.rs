@@ -23,9 +23,9 @@ use services::peer_resolver::{PeerCache, WgReconciler};
 use services::pfsense_client::{DummyPfSenseClient, PfSenseClient, PfSenseClientTrait};
 use services::route_manager::StaticRouteManager;
 
+use crate::services::event_store::{start_event_collector, EventStore};
 use crate::services::macvlan_manager::MacvlanManager;
 use crate::services::route_manager::RouteReconciler;
-use crate::services::event_store::{EventStore, start_event_collector};
 
 use rocket::serde::{json::Json, Deserialize};
 

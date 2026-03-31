@@ -129,10 +129,7 @@ impl From<DeployEventRow> for DeployEvent {
 
 /// Start a background task that subscribes to all deploy events
 /// via NATS wildcard `nordkraft.events.deploy.>` and writes them to PostgreSQL.
-pub async fn start_event_collector(
-    nats_client: async_nats::Client,
-    event_store: Arc<EventStore>,
-) {
+pub async fn start_event_collector(nats_client: async_nats::Client, event_store: Arc<EventStore>) {
     use futures::StreamExt;
 
     tokio::spawn(async move {
