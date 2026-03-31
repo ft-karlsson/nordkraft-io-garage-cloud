@@ -518,17 +518,74 @@ pub async fn update_container_status(
     pool: &PgPool,
     container_name: &str,
     status: &str,
+    status_message: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     sqlx::query(
-        "UPDATE containers SET status = $1, updated_at = NOW() 
-         WHERE container_name = $2 AND status != 'deleted'",
+        "UPDATE containers SET status = $1, status_message = $2, updated_at = NOW() 
+         WHERE container_name = $3 AND status != 'deleted'",
     )
     .bind(status)
+    .bind(status_message)
     .bind(container_name)
     .execute(pool)
     .await?;
     info!("📋 Container {} status → {}", container_name, status);
     Ok(())
+}
+
+/// Get containers in deploying/failed state from DB.
+/// These don't exist in nerdctl runtime — only in our database.
+/// Used by list endpoint to show the full picture.
+pub async fn get_non_running_containers(
+    pool: &PgPool,
+    user_id: &str,
+) -> Result<Vec<crate::models::ContainerInfo>, Box<dyn std::error::Error + Send + Sync>> {
+    let rows = sqlx::query(
+        "SELECT container_name, image, status, status_message, internal_ip, created_at::TEXT
+         FROM containers
+         WHERE user_id = $1 AND status IN ('deploying', 'failed')
+         ORDER BY created_at DESC",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    let containers = rows
+        .iter()
+        .map(|row| {
+            let status: String = row.get("status");
+            let status_message: Option<String> = row.get("status_message");
+
+            // Build a display status string that includes the reason for failed
+            let display_status = if status == "failed" {
+                if let Some(msg) = &status_message {
+                    // Take first line, truncate
+                    let first_line = msg.lines().next().unwrap_or(msg);
+                    let short: String = first_line.chars().take(80).collect();
+                    format!("failed: {}", short)
+                } else {
+                    "failed".to_string()
+                }
+            } else {
+                status
+            };
+
+            crate::models::ContainerInfo {
+                container_id: row.get::<String, _>("container_name").clone(),
+                name: row.get("container_name"),
+                image: row.get("image"),
+                status: display_status,
+                pod_id: None,
+                created_at: row.get::<Option<String>, _>("created_at").unwrap_or_default(),
+                ports: vec![],
+                container_ip: row.get("internal_ip"),
+                ipv6_address: None,
+                ipv6_enabled: false,
+            }
+        })
+        .collect();
+
+    Ok(containers)
 }
 
 /// Find which node has a container

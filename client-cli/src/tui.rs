@@ -24,9 +24,7 @@ use ratatui::{
 use reqwest::Client;
 use serde::Deserialize;
 use std::{
-    io,
-    sync::LazyLock,
-    time::{Duration, Instant},
+    io, time::{Duration, Instant}
 };
 use tokio::sync::mpsc;
 
@@ -44,9 +42,7 @@ const HEADER_BG: Color = Color::Rgb(5, 10, 20);
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-static API_BASE_URL: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("API_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8001/api".to_string())
-});
+use super::API_BASE_URL;
 
 const POLL_INTERVAL_SECS: u64 = 5;
 

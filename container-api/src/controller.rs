@@ -501,6 +501,7 @@ fn make_deployment_result_handler() -> impl Fn(NatsMessage) + Send + Sync + 'sta
         } = msg
         {
             let status = if success { "running" } else { "failed" };
+            let error_msg = error.clone();
             info!(
                 "📋 Deployment result: {} → {}{}",
                 container_name,
@@ -512,7 +513,13 @@ fn make_deployment_result_handler() -> impl Fn(NatsMessage) + Send + Sync + 'sta
             );
 
             tokio::spawn(async move {
-                if let Err(e) = update_container_status_from_result(&container_name, status).await {
+                if let Err(e) = update_container_status_from_result(
+                    &container_name,
+                    status,
+                    error_msg.as_deref(),
+                )
+                .await
+                {
                     error!(
                         "Failed to update container status for {}: {}",
                         container_name, e
@@ -534,6 +541,7 @@ fn make_upgrade_result_handler() -> impl Fn(NatsMessage) + Send + Sync + 'static
         } = msg
         {
             let status = if success { "running" } else { "failed" };
+            let error_msg = error.clone();
             info!(
                 "📋 Upgrade result: {} → {}{}",
                 container_name,
@@ -545,7 +553,13 @@ fn make_upgrade_result_handler() -> impl Fn(NatsMessage) + Send + Sync + 'static
             );
 
             tokio::spawn(async move {
-                if let Err(e) = update_container_status_from_result(&container_name, status).await {
+                if let Err(e) = update_container_status_from_result(
+                    &container_name,
+                    status,
+                    error_msg.as_deref(),
+                )
+                .await
+                {
                     error!(
                         "Failed to update container status for {}: {}",
                         container_name, e
@@ -560,10 +574,11 @@ fn make_upgrade_result_handler() -> impl Fn(NatsMessage) + Send + Sync + 'static
 async fn update_container_status_from_result(
     container_name: &str,
     status: &str,
+    status_message: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let db_url = std::env::var("DATABASE_URL")?;
     let pool = sqlx::PgPool::connect(&db_url).await?;
-    storage::update_container_status(&pool, container_name, status).await
+    storage::update_container_status(&pool, container_name, status, status_message).await
 }
 
 async fn handle_container_deletion_cleanup(
@@ -639,16 +654,27 @@ fn make_container_assignment_handler(
         let node = node_id.clone();
 
         tokio::spawn(async move {
-            // Emit: pulling phase
-            let _ = nats
-                .publish_deploy_event(
-                    &container_name,
-                    &owner_pubkey,
-                    "pulling",
-                    &format!("Pulling image: {}", image),
-                    true,
-                )
-                .await;
+            // Create event channel — 256 buffer, plenty for ~8 lifecycle events
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<
+                crate::services::container_manager::DeployPhaseEvent,
+            >(256);
+
+            // Spawn async drainer: forwards events to NATS without blocking deploy
+            let nats_drain = nats.clone();
+            let drain_owner = owner_pubkey.clone();
+            tokio::spawn(async move {
+                while let Some(evt) = event_rx.recv().await {
+                    let _ = nats_drain
+                        .publish_deploy_event(
+                            &evt.container_name,
+                            &drain_owner,
+                            &evt.phase,
+                            &evt.message,
+                            evt.success,
+                        )
+                        .await;
+                }
+            });
 
             let result = cm
                 .deploy_secure_container(
@@ -667,6 +693,7 @@ fn make_container_assignment_handler(
                     allocated_ip,
                     Some(container_name.clone()),
                     enable_ipv6,
+                    Some(event_tx),
                 )
                 .await;
 
@@ -676,17 +703,6 @@ fn make_container_assignment_handler(
                         "✅ Container {} deployed: IPv4={}, IPv6={:?}",
                         name, ip, deployed_ipv6
                     );
-
-                    // Emit: running phase
-                    let _ = nats
-                        .publish_deploy_event(
-                            &name,
-                            &owner_pubkey,
-                            "running",
-                            &format!("Container running at {}", ip),
-                            true,
-                        )
-                        .await;
 
                     NatsMessage::ContainerDeploymentResult {
                         job_id,
@@ -701,17 +717,6 @@ fn make_container_assignment_handler(
                 }
                 Err(e) => {
                     error!("❌ Container deployment failed: {}", e);
-
-                    // Emit: failed phase
-                    let _ = nats
-                        .publish_deploy_event(
-                            &container_name,
-                            &owner_pubkey,
-                            "failed",
-                            &format!("Deploy failed: {}", e),
-                            false,
-                        )
-                        .await;
 
                     NatsMessage::ContainerDeploymentResult {
                         job_id,
@@ -852,16 +857,35 @@ fn make_container_upgrade_handler(
         let node = node_id.clone();
 
         tokio::spawn(async move {
+            // Create event channel for upgrade lifecycle
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<
+                crate::services::container_manager::DeployPhaseEvent,
+            >(256);
+
+            // Spawn async drainer
+            let nats_drain = nats.clone();
+            let drain_owner = owner_pubkey.clone();
+            tokio::spawn(async move {
+                while let Some(evt) = event_rx.recv().await {
+                    let _ = nats_drain
+                        .publish_deploy_event(
+                            &evt.container_name,
+                            &drain_owner,
+                            &evt.phase,
+                            &evt.message,
+                            evt.success,
+                        )
+                        .await;
+                }
+            });
+
             // Emit: upgrading phase
-            let _ = nats
-                .publish_deploy_event(
-                    &container_name,
-                    &owner_pubkey,
-                    "upgrading",
-                    &format!("Upgrading to image: {}", config.image),
-                    true,
-                )
-                .await;
+            let _ = event_tx.try_send(crate::services::container_manager::DeployPhaseEvent {
+                container_name: container_name.clone(),
+                phase: "upgrading".to_string(),
+                message: format!("Upgrading to image: {}", config.image),
+                success: true,
+            });
 
             // Step 1: Stop the container
             info!("⏸️  Upgrade: stopping {}", container_name);
@@ -875,17 +899,6 @@ fn make_container_upgrade_handler(
             let _ = tokio::process::Command::new("nerdctl")
                 .args(["rm", "-f", &container_name])
                 .output()
-                .await;
-
-            // Emit: pulling phase
-            let _ = nats
-                .publish_deploy_event(
-                    &container_name,
-                    &owner_pubkey,
-                    "pulling",
-                    &format!("Pulling image: {}", config.image),
-                    true,
-                )
                 .await;
 
             // Step 3: Redeploy with same name + same IP + updated config
@@ -923,23 +936,13 @@ fn make_container_upgrade_handler(
                     Some(container_ip.clone()),
                     Some(container_name.clone()),
                     config.enable_ipv6,
+                    Some(event_tx),
                 )
                 .await;
 
             let msg = match result {
                 Ok((name, _, ip, _, _)) => {
                     info!("✅ Upgrade complete: {} → {}", name, config.image);
-
-                    // Emit: running phase
-                    let _ = nats
-                        .publish_deploy_event(
-                            &name,
-                            &owner_pubkey,
-                            "running",
-                            &format!("Upgrade complete, running at {}", ip),
-                            true,
-                        )
-                        .await;
 
                     NatsMessage::ContainerUpgradeResult {
                         container_name: name,
@@ -955,17 +958,6 @@ fn make_container_upgrade_handler(
                         "❌ Upgrade FAILED for {}: {}. Container is DOWN.",
                         container_name, e
                     );
-
-                    // Emit: failed phase
-                    let _ = nats
-                        .publish_deploy_event(
-                            &container_name,
-                            &owner_pubkey,
-                            "failed",
-                            &format!("Upgrade failed: {}", e),
-                            false,
-                        )
-                        .await;
 
                     NatsMessage::ContainerUpgradeResult {
                         container_name,

@@ -6,8 +6,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::LazyLock;
 use std::time::Duration;
+use std::sync::LazyLock;
 
 mod tui;
 
@@ -759,8 +759,7 @@ fn spec_from_inspect(c: &ContainerInspectResponse) -> DeploymentSpec {
     // Detect volume_path from real mounts
     let volume_path: Option<String> = c
         .volume_mounts
-        .iter()
-        .find(|m| !m.starts_with("tmpfs:"))
+        .iter().find(|m| !m.starts_with("tmpfs:"))
         .and_then(|m| {
             // Format is usually "host_path:container_path" or just container_path
             m.split(':')
@@ -1036,7 +1035,7 @@ const WG_CONFIG_FILE: &str = "wg.conf";
 const WG_INTERFACE: &str = "nordkraft";
 const CONNECTION_FILE: &str = "connection.json";
 
-static API_BASE_URL: LazyLock<String> = LazyLock::new(|| {
+pub(crate) static API_BASE_URL: LazyLock<String> = LazyLock::new(|| {
     // 1. Env var override (dev/testing)
     if let Ok(url) = std::env::var("API_BASE_URL") {
         return url;
@@ -1150,6 +1149,8 @@ struct ContainerInfo {
     name: String,
     image: String,
     status: String,
+    #[serde(default)]
+    status_message: Option<String>,
     pod_id: Option<String>,
     created_at: String,
     #[serde(default)]
@@ -1749,16 +1750,21 @@ async fn handle_container_list(json_output: bool) -> Result<(), Box<dyn std::err
 
     for c in &data.containers {
         let status_lower = c.status.to_lowercase();
-        let status_colored = if status_lower.contains("up") || status_lower == "running" {
-            "Up".green().bold()
+        let (status_colored, failure_reason) = if status_lower.contains("up") || status_lower == "running" {
+            ("Up".green().bold(), None)
         } else if status_lower == "deploying" {
-            "Deploying".yellow().bold()
-        } else if status_lower == "failed" {
-            "Failed".red().bold()
+            ("Deploying".yellow().bold(), None)
+        } else if status_lower.starts_with("failed") {
+            let reason = if status_lower.starts_with("failed: ") {
+                Some(c.status[8..].to_string())
+            } else {
+                c.status_message.clone()
+            };
+            ("Failed".red().bold(), reason)
         } else if status_lower.contains("exited") || status_lower.contains("stopped") {
-            c.status.red()
+            (c.status.red(), None)
         } else {
-            c.status.yellow()
+            (c.status.yellow(), None)
         };
 
         // Show alias as primary name if available
@@ -1774,6 +1780,17 @@ async fn handle_container_list(json_output: bool) -> Result<(), Box<dyn std::err
         }
         println!("    {} {}", "Image:".dimmed(), c.image);
         println!("    {} {}", "Status:".dimmed(), status_colored);
+
+        // Show failure reason
+        if let Some(reason) = failure_reason {
+            let truncated: String = reason.chars().take(120).collect();
+            println!("    {} {}", "Reason:".dimmed(), truncated.red());
+            println!(
+                "    {} {}",
+                "💡".dimmed(),
+                "Run 'nordkraft events' for full details".dimmed()
+            );
+        }
 
         if let Some(ip) = &c.container_ip {
             println!("    {} {}", "IPv4:".dimmed(), ip);
@@ -3269,7 +3286,10 @@ async fn handle_events(
     if events.is_none() || events.unwrap().is_empty() {
         println!("{}", "No deploy events found.".dimmed());
         if container.is_some() {
-            println!("   Try without filter: {}", "nordkraft events".cyan());
+            println!(
+                "   Try without filter: {}",
+                "nordkraft events".cyan()
+            );
         }
         return Ok(());
     }
@@ -3291,7 +3311,7 @@ async fn handle_events(
         let phase = event["phase"].as_str().unwrap_or("?");
         let message = event["message"].as_str().unwrap_or("");
         let success = event["success"].as_bool().unwrap_or(true);
-        let timestamp = event["timestamp"].as_str().unwrap_or("");
+        let timestamp = event["created_at"].as_str().unwrap_or("");
         let container_name = event["container_name"].as_str().unwrap_or("");
 
         // Format timestamp to just time if today
@@ -3302,9 +3322,10 @@ async fn handle_events(
         };
 
         let phase_icon = match phase {
+            "network" => "🌐",
             "pulling" => "⬇️ ",
             "pulled" => "📦",
-            "creating" => "🔧",
+            "created" => "🔧",
             "starting" => "🚀",
             "running" => "✅",
             "upgrading" => "🔄",
