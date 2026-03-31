@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict S1AtI0fvXDZrGcXCsmdjM2f2y6soVb7NHnF8lWdk563D7I47e81bE9uxPhhDQ0d
+\restrict mhKaGPDCFbAimCF392RzHAYSdYrZgFbIT2ZPUYFdN4hFFlZ8mNCO6N5yqHk8vQF
 
 -- Dumped from database version 16.13 (Ubuntu 16.13-0ubuntu0.24.04.1)
 -- Dumped by pg_dump version 16.13 (Ubuntu 16.13-0ubuntu0.24.04.1)
@@ -391,6 +391,45 @@ ALTER SEQUENCE public.containers_id_seq OWNED BY public.containers.id;
 
 
 --
+-- Name: deploy_events; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.deploy_events (
+    id bigint NOT NULL,
+    user_id text NOT NULL,
+    container_name text NOT NULL,
+    node_id text NOT NULL,
+    phase text NOT NULL,
+    message text NOT NULL,
+    success boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE public.deploy_events OWNER TO postgres;
+
+--
+-- Name: deploy_events_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+CREATE SEQUENCE public.deploy_events_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE public.deploy_events_id_seq OWNER TO postgres;
+
+--
+-- Name: deploy_events_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+--
+
+ALTER SEQUENCE public.deploy_events_id_seq OWNED BY public.deploy_events.id;
+
+
+--
 -- Name: garage_container_allocations; Type: TABLE; Schema: public; Owner: garage_user
 --
 
@@ -773,6 +812,13 @@ ALTER TABLE ONLY public.containers ALTER COLUMN id SET DEFAULT nextval('public.c
 
 
 --
+-- Name: deploy_events id; Type: DEFAULT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.deploy_events ALTER COLUMN id SET DEFAULT nextval('public.deploy_events_id_seq'::regclass);
+
+
+--
 -- Name: garage_container_allocations id; Type: DEFAULT; Schema: public; Owner: garage_user
 --
 
@@ -839,6 +885,14 @@ ALTER TABLE ONLY public.containers
 
 ALTER TABLE ONLY public.containers
     ADD CONSTRAINT containers_public_url_key UNIQUE (public_url);
+
+
+--
+-- Name: deploy_events deploy_events_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.deploy_events
+    ADD CONSTRAINT deploy_events_pkey PRIMARY KEY (id);
 
 
 --
@@ -1017,6 +1071,27 @@ CREATE INDEX idx_containers_user ON public.containers USING btree (user_id);
 --
 
 CREATE INDEX idx_containers_user_active ON public.containers USING btree (user_id, status) WHERE ((status)::text <> 'deleted'::text);
+
+
+--
+-- Name: idx_deploy_events_container; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX idx_deploy_events_container ON public.deploy_events USING btree (container_name, created_at DESC);
+
+
+--
+-- Name: idx_deploy_events_created; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX idx_deploy_events_created ON public.deploy_events USING btree (created_at DESC);
+
+
+--
+-- Name: idx_deploy_events_user; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX idx_deploy_events_user ON public.deploy_events USING btree (user_id, created_at DESC);
 
 
 --
@@ -1220,6 +1295,20 @@ GRANT ALL ON TABLE public.container_config TO garage_user;
 
 
 --
+-- Name: TABLE deploy_events; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON TABLE public.deploy_events TO garage_user;
+
+
+--
+-- Name: SEQUENCE deploy_events_id_seq; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON SEQUENCE public.deploy_events_id_seq TO garage_user;
+
+
+--
 -- Name: DEFAULT PRIVILEGES FOR SEQUENCES; Type: DEFAULT ACL; Schema: public; Owner: postgres
 --
 
@@ -1244,5 +1333,5 @@ ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT ALL ON TABLES 
 -- PostgreSQL database dump complete
 --
 
-\unrestrict S1AtI0fvXDZrGcXCsmdjM2f2y6soVb7NHnF8lWdk563D7I47e81bE9uxPhhDQ0d
+\unrestrict mhKaGPDCFbAimCF392RzHAYSdYrZgFbIT2ZPUYFdN4hFFlZ8mNCO6N5yqHk8vQF
 

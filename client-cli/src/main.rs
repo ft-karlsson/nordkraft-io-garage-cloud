@@ -6,8 +6,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 mod tui;
 
@@ -759,7 +759,8 @@ fn spec_from_inspect(c: &ContainerInspectResponse) -> DeploymentSpec {
     // Detect volume_path from real mounts
     let volume_path: Option<String> = c
         .volume_mounts
-        .iter().find(|m| !m.starts_with("tmpfs:"))
+        .iter()
+        .find(|m| !m.starts_with("tmpfs:"))
         .and_then(|m| {
             // Format is usually "host_path:container_path" or just container_path
             m.split(':')
@@ -1036,13 +1037,41 @@ const WG_INTERFACE: &str = "nordkraft";
 const CONNECTION_FILE: &str = "connection.json";
 
 static API_BASE_URL: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("API_BASE_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8001/api".to_string())
+    // 1. Env var override (dev/testing)
+    if let Ok(url) = std::env::var("API_BASE_URL") {
+        return url;
+    }
+
+    // 2. From connection config if set
+    if let Some(config) = load_connection_config() {
+        if let Some(endpoint) = config.api_endpoint {
+            if !endpoint.is_empty() {
+                return endpoint;
+            }
+        }
+    }
+
+    // 3. Default — matches open source controller default
+    "http://172.20.0.254:8001/api".to_string()
 });
 
 static PUBLIC_API_URL: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("PUBLIC_API_URL")
-        .unwrap_or_else(|_| "http://localhost:8001/api".to_string())
+    // 1. Env var override
+    if let Ok(url) = std::env::var("PUBLIC_API_URL") {
+        return url;
+    }
+
+    // 2. From connection config if set (for re-setup / self-hosted)
+    if let Some(config) = load_connection_config() {
+        if let Some(url) = config.public_api_url {
+            if !url.is_empty() {
+                return url;
+            }
+        }
+    }
+
+    // 3. Default — NordKraft.io cloud
+    "https://cloud.nordkraft.io/api".to_string()
 });
 
 // Persisted connection info (written by setup, read by connect/disconnect)
@@ -1057,6 +1086,12 @@ struct ConnectionConfig {
     server_public_key: String,
     server_endpoint: String,
     allowed_ips: Vec<String>,
+    /// Controller API endpoint via WireGuard. Default: http://172.20.0.254:8001/api
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_endpoint: Option<String>,
+    /// Public signup API endpoint. Default: https://cloud.nordkraft.io/api
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    public_api_url: Option<String>,
 }
 
 // Claim API types
@@ -3234,10 +3269,7 @@ async fn handle_events(
     if events.is_none() || events.unwrap().is_empty() {
         println!("{}", "No deploy events found.".dimmed());
         if container.is_some() {
-            println!(
-                "   Try without filter: {}",
-                "nordkraft events".cyan()
-            );
+            println!("   Try without filter: {}", "nordkraft events".cyan());
         }
         return Ok(());
     }
@@ -4987,6 +5019,8 @@ async fn handle_setup(token: String, json_output: bool) -> Result<(), Box<dyn st
         server_public_key: data.server_public_key,
         server_endpoint: data.server_endpoint,
         allowed_ips: data.allowed_ips,
+        api_endpoint: None,
+        public_api_url: None,
     };
     save_connection_config(&conn_config)?;
 

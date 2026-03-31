@@ -3,7 +3,7 @@
 // GET /api/events?container=NAME&limit=50
 //
 // Returns deploy lifecycle events for the authenticated user.
-// Events are stored per-user in SQLite by the controller's event collector.
+// Events are stored in PostgreSQL by the controller's NATS event collector.
 
 use crate::guards::AuthenticatedUser;
 use crate::services::event_store::EventStore;
@@ -20,7 +20,7 @@ pub async fn get_events(
     let limit = limit.unwrap_or(50).min(200);
     let user_id = &user.0.wireguard_public_key;
 
-    match event_store.query_events(user_id, container.as_deref(), limit) {
+    match event_store.query_events(user_id, container.as_deref(), limit).await {
         Ok(events) => Json(serde_json::json!({
             "events": events,
             "count": events.len(),

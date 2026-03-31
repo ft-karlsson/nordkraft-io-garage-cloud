@@ -23,9 +23,9 @@ use services::peer_resolver::{PeerCache, WgReconciler};
 use services::pfsense_client::{DummyPfSenseClient, PfSenseClient, PfSenseClientTrait};
 use services::route_manager::StaticRouteManager;
 
-use crate::services::event_store::{start_event_collector, EventStore};
 use crate::services::macvlan_manager::MacvlanManager;
 use crate::services::route_manager::RouteReconciler;
+use crate::services::event_store::{EventStore, start_event_collector};
 
 use rocket::serde::{json::Json, Deserialize};
 
@@ -880,13 +880,11 @@ async fn rocket() -> _ {
     }
 
     // =========================================================
-    // EVENT STORE — per-user SQLite deploy event persistence
+    // EVENT STORE — deploy lifecycle events in PostgreSQL
     // Controller subscribes to NATS deploy events and writes
-    // them to SQLite. CLI reads via GET /api/events.
+    // them to the deploy_events table. CLI reads via GET /api/events.
     // =========================================================
-    let events_dir = "/var/lib/nordkraft/events";
-    std::fs::create_dir_all(events_dir).ok();
-    let event_store = Arc::new(EventStore::new(events_dir));
+    let event_store = Arc::new(EventStore::new(db_pool.clone()));
 
     if let Some(nats) = &nats_service {
         if nats.is_controller() {
