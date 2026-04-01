@@ -1122,13 +1122,19 @@ fn render_container_list(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn status_icon_color(status: &str) -> (&'static str, Color) {
-    match status.to_lowercase().as_str() {
-        "running" | "up" => ("●", EMERALD),
-        "stopped" | "exited" => ("○", ROSE),
-        "starting" | "deploying" => ("◎", AMBER),
-        "failed" => ("✖", ROSE),
-        "paused" => ("⏸", INDIGO),
-        _ => ("?", MUTED),
+    let s = status.to_lowercase();
+    if s == "running" || s == "up" {
+        ("●", EMERALD)
+    } else if s == "stopped" || s == "exited" || s.starts_with("exited") {
+        ("○", ROSE)
+    } else if s == "starting" || s == "deploying" {
+        ("◎", AMBER)
+    } else if s.starts_with("failed") {
+        ("✖", ROSE)
+    } else if s == "paused" {
+        ("⏸", INDIGO)
+    } else {
+        ("?", MUTED)
     }
 }
 

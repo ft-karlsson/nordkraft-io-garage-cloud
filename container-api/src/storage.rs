@@ -559,10 +559,29 @@ pub async fn get_non_running_containers(
             // Build a display status string that includes the reason for failed
             let display_status = if status == "failed" {
                 if let Some(msg) = &status_message {
-                    // Take first line, truncate
-                    let first_line = msg.lines().next().unwrap_or(msg);
-                    let short: String = first_line.chars().take(80).collect();
-                    format!("failed: {}", short)
+                    // Extract clean error — find the fatal/error line from nerdctl output
+                    let clean = msg
+                        .lines()
+                        .filter(|l| l.contains("level=fatal") || l.contains("level=error") || l.contains("FATA"))
+                        .last()
+                        .map(|l| {
+                            // Strip nerdctl log prefix: time="..." level=fatal msg="..."
+                            if let Some(msg_start) = l.find("msg=\"") {
+                                l[msg_start + 5..].trim_end_matches('"').to_string()
+                            } else {
+                                l.to_string()
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            // Fallback: first non-empty line, truncated
+                            msg.lines()
+                                .find(|l| !l.trim().is_empty())
+                                .unwrap_or("Unknown error")
+                                .chars()
+                                .take(80)
+                                .collect()
+                        });
+                    format!("failed: {}", clean)
                 } else {
                     "failed".to_string()
                 }
