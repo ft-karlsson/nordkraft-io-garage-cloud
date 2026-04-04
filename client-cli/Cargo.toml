@@ -1,6 +1,6 @@
 [package]
 name = "nordkraft"
-version = "0.3.32"
+version = "0.3.33"
 edition = "2021"
 description = "Nordkraft Garage Cloud CLI - Secure Container Hosting"
 authors = ["Nordkraft.io"]
