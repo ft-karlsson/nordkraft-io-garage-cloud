@@ -18,7 +18,42 @@ use crate::services::macvlan_manager::MacvlanManager;
 use crate::services::nats_service::{NatsMessage, NatsService, NatsSubjects};
 use crate::services::persistence::PersistenceManager;
 use std::collections::HashMap;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+// ============= DEPLOY EVENT CHANNEL =============
+
+/// Lightweight deploy lifecycle event sent via mpsc channel.
+/// Non-blocking fire-and-forget — never slows down the deploy.
+#[derive(Debug, Clone)]
+pub struct DeployPhaseEvent {
+    pub container_name: String,
+    pub phase: String,
+    pub message: String,
+    pub success: bool,
+}
+
+/// Channel sender type for deploy events.
+/// 256 buffer = plenty for a full deploy lifecycle (~6-8 events).
+pub type DeployEventTx = mpsc::Sender<DeployPhaseEvent>;
+
+/// Emit a deploy event. Non-blocking — silently drops if channel is full or closed.
+fn emit(
+    tx: &Option<DeployEventTx>,
+    container_name: &str,
+    phase: &str,
+    message: &str,
+    success: bool,
+) {
+    if let Some(tx) = tx {
+        let _ = tx.try_send(DeployPhaseEvent {
+            container_name: container_name.to_string(),
+            phase: phase.to_string(),
+            message: message.to_string(),
+            success,
+        });
+    }
+}
 
 pub struct ContainerManager {
     runtime_binary: String, // "nerdctl" or "podman"
@@ -102,6 +137,7 @@ impl ContainerManager {
         allocated_ip: Option<String>, // IPv4 from controller
         container_name: Option<String>,
         enable_ipv6: bool,
+        event_tx: Option<DeployEventTx>,
     ) -> Result<
         (
             String,
@@ -120,6 +156,14 @@ impl ContainerManager {
                 &uuid::Uuid::new_v4().to_string()[..8]
             )
         });
+
+        emit(
+            &event_tx,
+            &container_name,
+            "network",
+            &format!("Setting up macvlan network for slot"),
+            true,
+        );
 
         // ========== MACVLAN NETWORK (DUAL-STACK) ==========
         // Ensure per-user macvlan network exists
@@ -313,6 +357,14 @@ impl ContainerManager {
 
         debug!("Running: {} {}", self.runtime_binary, args.join(" "));
 
+        emit(
+            &event_tx,
+            &container_name,
+            "pulling",
+            &format!("Pulling image: {}", image),
+            true,
+        );
+
         let output = tokio::process::Command::new(&self.runtime_binary)
             .args(&args)
             .output()
@@ -321,8 +373,43 @@ impl ContainerManager {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             error!("Container creation failed: {}", stderr);
+
+            // Extract clean error for events — nerdctl dumps progress bars + ANSI codes
+            let clean_error = stderr
+                .lines()
+                .filter(|l| {
+                    l.contains("level=fatal") || l.contains("level=error") || l.contains("FATA")
+                })
+                .last()
+                .map(|l| {
+                    // Strip nerdctl log prefix: time="..." level=fatal msg="..."
+                    if let Some(msg_start) = l.find("msg=\"") {
+                        let msg = &l[msg_start + 5..];
+                        msg.trim_end_matches('"').to_string()
+                    } else {
+                        l.to_string()
+                    }
+                })
+                .unwrap_or_else(|| {
+                    // Fallback: first meaningful line, truncated
+                    let first = stderr
+                        .lines()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("Unknown error");
+                    first.chars().take(200).collect()
+                });
+
+            emit(&event_tx, &container_name, "failed", &clean_error, false);
             return Err(stderr.into());
         }
+
+        emit(
+            &event_tx,
+            &container_name,
+            "created",
+            &format!("Container created, verifying network"),
+            true,
+        );
 
         // ========== IPv4 VERIFICATION ==========
         // Get container IPv4 from the macvlan network
@@ -330,6 +417,13 @@ impl ContainerManager {
             Some(ip) => ip,
             None => {
                 error!("Failed to get IPv4 from container. Removing...");
+                emit(
+                    &event_tx,
+                    &container_name,
+                    "failed",
+                    "IPv4 assignment failed",
+                    false,
+                );
                 let _ = tokio::process::Command::new(&self.runtime_binary)
                     .args(["rm", "-f", &container_name])
                     .output()
@@ -344,6 +438,16 @@ impl ContainerManager {
                 "🚨 IP MISMATCH! Expected {} but container got {}. \
                  This will break routing. Removing container.",
                 allocated_ip, container_ip
+            );
+            emit(
+                &event_tx,
+                &container_name,
+                "failed",
+                &format!(
+                    "IP mismatch: expected {} got {}",
+                    allocated_ip, container_ip
+                ),
+                false,
             );
             let _ = tokio::process::Command::new(&self.runtime_binary)
                 .args(["rm", "-f", &container_name])
@@ -391,6 +495,17 @@ impl ContainerManager {
         info!(
             "✅ Deployed container: {} with IPv4: {}, IPv6: {:?}, Kata: {}",
             container_name, container_ip, final_ipv6, self.use_kata
+        );
+
+        emit(
+            &event_tx,
+            &container_name,
+            "running",
+            &format!(
+                "Container running at {} (Kata: {})",
+                container_ip, self.use_kata
+            ),
+            true,
         );
 
         // Return (name, pod_id=None, ipv4, ports, ipv6)

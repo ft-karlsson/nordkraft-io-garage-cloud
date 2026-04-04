@@ -207,6 +207,18 @@ pub enum NatsMessage {
         timestamp: DateTime<Utc>,
     },
 
+    // Deploy lifecycle events — agent publishes per-user events
+    // so CLI can stream real-time feedback on deploy progress
+    DeployEvent {
+        container_name: String,
+        user_id: String,
+        node_id: String,
+        phase: String, // "pulling", "pulled", "creating", "starting", "running", "failed"
+        message: String,
+        success: bool,
+        timestamp: DateTime<Utc>,
+    },
+
     // Agent responds with actual IPv6 from container
     ContainerIPv6Response {
         query_id: String,
@@ -331,6 +343,11 @@ impl NatsSubjects {
 
     pub fn container_inspect_broadcast() -> String {
         "nordkraft.containers.inspect.request".to_string()
+    }
+
+    // Per-user deploy event stream: nordkraft.events.deploy.{user_id}
+    pub fn deploy_events_for_user(user_id: &str) -> String {
+        format!("nordkraft.events.deploy.{}", user_id)
     }
 }
 
@@ -624,6 +641,31 @@ impl NatsService {
             &message,
         )
         .await
+    }
+
+    /// Publish a deploy lifecycle event for a specific user.
+    /// Agent calls this at each phase of container deployment so the CLI
+    /// can stream real-time progress via `nordkraft events`.
+    pub async fn publish_deploy_event(
+        &self,
+        container_name: &str,
+        user_id: &str,
+        phase: &str,
+        message: &str,
+        success: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let event = NatsMessage::DeployEvent {
+            container_name: container_name.to_string(),
+            user_id: user_id.to_string(),
+            node_id: self.node_id.clone(),
+            phase: phase.to_string(),
+            message: message.to_string(),
+            success,
+            timestamp: Utc::now(),
+        };
+
+        let subject = NatsSubjects::deploy_events_for_user(user_id);
+        self.publish_message(subject, &event).await
     }
 
     // Container Query

@@ -1,5 +1,5 @@
 // tui.rs — nordkraft ui
-//
+// k9s-style terminal dashboard for NordKraft.io
 //
 // DEPS (Cargo.toml):
 //   ratatui  = "0.28"
@@ -24,7 +24,7 @@ use ratatui::{
 use reqwest::Client;
 use serde::Deserialize;
 use std::{
-    io, sync::LazyLock, time::{Duration, Instant}
+    io, time::{Duration, Instant}
 };
 use tokio::sync::mpsc;
 
@@ -42,10 +42,7 @@ const HEADER_BG: Color = Color::Rgb(5, 10, 20);
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-static API_BASE_URL: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("API_BASE_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8001/api".to_string())
-});
+use super::API_BASE_URL;
 
 const POLL_INTERVAL_SECS: u64 = 5;
 
@@ -856,7 +853,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "Nordkraft.io",
+                "NordKraft.io",
                 Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
             ),
             Span::styled("  ·  ", Style::default().fg(MUTED)),
@@ -1125,12 +1122,19 @@ fn render_container_list(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn status_icon_color(status: &str) -> (&'static str, Color) {
-    match status.to_lowercase().as_str() {
-        "running" | "up" => ("●", EMERALD),
-        "stopped" | "exited" => ("○", ROSE),
-        "starting" | "deploying" => ("◎", AMBER),
-        "paused" => ("⏸", INDIGO),
-        _ => ("?", MUTED),
+    let s = status.to_lowercase();
+    if s == "running" || s == "up" {
+        ("●", EMERALD)
+    } else if s == "stopped" || s == "exited" || s.starts_with("exited") {
+        ("○", ROSE)
+    } else if s == "starting" || s == "deploying" {
+        ("◎", AMBER)
+    } else if s.starts_with("failed") {
+        ("✖", ROSE)
+    } else if s == "paused" {
+        ("⏸", INDIGO)
+    } else {
+        ("?", MUTED)
     }
 }
 

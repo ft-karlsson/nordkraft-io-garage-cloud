@@ -210,6 +210,14 @@ enum Commands {
     Specs,
     /// Show plan usage vs. limits
     Usage,
+    /// Show deploy lifecycle events
+    Events {
+        /// Filter by container name or alias
+        container: Option<String>,
+        /// Number of events to show
+        #[arg(short = 'n', long, default_value = "20")]
+        limit: usize,
+    },
 }
 
 // ============= AUTH COMMANDS =============
@@ -1027,14 +1035,42 @@ const WG_CONFIG_FILE: &str = "wg.conf";
 const WG_INTERFACE: &str = "nordkraft";
 const CONNECTION_FILE: &str = "connection.json";
 
-static API_BASE_URL: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("API_BASE_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8001/api".to_string())
+pub(crate) static API_BASE_URL: LazyLock<String> = LazyLock::new(|| {
+    // 1. Env var override (dev/testing)
+    if let Ok(url) = std::env::var("API_BASE_URL") {
+        return url;
+    }
+
+    // 2. From connection config if set
+    if let Some(config) = load_connection_config() {
+        if let Some(endpoint) = config.api_endpoint {
+            if !endpoint.is_empty() {
+                return endpoint;
+            }
+        }
+    }
+
+    // 3. Default — matches open source controller default
+    "http://172.20.0.254:8001/api".to_string()
 });
 
 static PUBLIC_API_URL: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("PUBLIC_API_URL")
-        .unwrap_or_else(|_| "http://localhost:8001/api".to_string())
+    // 1. Env var override
+    if let Ok(url) = std::env::var("PUBLIC_API_URL") {
+        return url;
+    }
+
+    // 2. From connection config if set (for re-setup / self-hosted)
+    if let Some(config) = load_connection_config() {
+        if let Some(url) = config.public_api_url {
+            if !url.is_empty() {
+                return url;
+            }
+        }
+    }
+
+    // 3. Default — NordKraft.io cloud
+    "https://cloud.nordkraft.io/api".to_string()
 });
 
 // Persisted connection info (written by setup, read by connect/disconnect)
@@ -1049,6 +1085,12 @@ struct ConnectionConfig {
     server_public_key: String,
     server_endpoint: String,
     allowed_ips: Vec<String>,
+    /// Controller API endpoint via WireGuard. Default: http://172.20.0.254:8001/api
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_endpoint: Option<String>,
+    /// Public signup API endpoint. Default: https://cloud.nordkraft.io/api
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    public_api_url: Option<String>,
 }
 
 // Claim API types
@@ -1107,6 +1149,8 @@ struct ContainerInfo {
     name: String,
     image: String,
     status: String,
+    #[serde(default)]
+    status_message: Option<String>,
     pod_id: Option<String>,
     created_at: String,
     #[serde(default)]
@@ -1456,6 +1500,7 @@ async fn main() {
         Commands::Edit { container } => handle_edit_interactive(container, json_output).await,
         Commands::Specs => handle_specs_list(json_output).await,
         Commands::Usage => handle_usage(json_output).await,
+        Commands::Events { container, limit } => handle_events(container, limit, json_output).await,
 
         // Shortcuts with interactive selection
         Commands::Deploy(args) => handle_deploy(args, json_output).await,
@@ -1704,10 +1749,22 @@ async fn handle_container_list(json_output: bool) -> Result<(), Box<dyn std::err
     println!();
 
     for c in &data.containers {
-        let status_colored = if c.status.contains("Up") || c.status.contains("running") {
-            c.status.green()
+        let status_lower = c.status.to_lowercase();
+        let (status_colored, failure_reason) = if status_lower.contains("up") || status_lower == "running" {
+            ("Up".green().bold(), None)
+        } else if status_lower == "deploying" {
+            ("Deploying".yellow().bold(), None)
+        } else if status_lower.starts_with("failed") {
+            let reason = if status_lower.starts_with("failed: ") {
+                Some(c.status[8..].to_string())
+            } else {
+                c.status_message.clone()
+            };
+            ("Failed".red().bold(), reason)
+        } else if status_lower.contains("exited") || status_lower.contains("stopped") {
+            (c.status.red(), None)
         } else {
-            c.status.yellow()
+            (c.status.yellow(), None)
         };
 
         // Show alias as primary name if available
@@ -1723,6 +1780,17 @@ async fn handle_container_list(json_output: bool) -> Result<(), Box<dyn std::err
         }
         println!("    {} {}", "Image:".dimmed(), c.image);
         println!("    {} {}", "Status:".dimmed(), status_colored);
+
+        // Show failure reason
+        if let Some(reason) = failure_reason {
+            let truncated: String = reason.chars().take(120).collect();
+            println!("    {} {}", "Reason:".dimmed(), truncated.red());
+            println!(
+                "    {} {}",
+                "💡".dimmed(),
+                "Run 'nordkraft events' for full details".dimmed()
+            );
+        }
 
         if let Some(ip) = &c.container_ip {
             println!("    {} {}", "IPv4:".dimmed(), ip);
@@ -3182,6 +3250,125 @@ async fn handle_usage(json_output: bool) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+// ============= EVENTS HANDLER =============
+
+async fn handle_events(
+    container: Option<String>,
+    limit: usize,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = create_client()?;
+
+    // Resolve alias if provided
+    let container = container.map(|c| resolve_alias(&c));
+
+    let mut url = format!("{}/events?limit={}", *API_BASE_URL, limit);
+    if let Some(ref name) = container {
+        url = format!("{}&container={}", url, name);
+    }
+
+    let response = client.get(&url).send().await?;
+
+    if !response.status().is_success() {
+        let error: ApiError = response.json().await?;
+        return Err(format!("Failed to fetch events: {}", error.error).into());
+    }
+
+    let data: serde_json::Value = response.json().await?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&data)?);
+        return Ok(());
+    }
+
+    let events = data["events"].as_array();
+
+    if events.is_none() || events.unwrap().is_empty() {
+        println!("{}", "No deploy events found.".dimmed());
+        if container.is_some() {
+            println!(
+                "   Try without filter: {}",
+                "nordkraft events".cyan()
+            );
+        }
+        return Ok(());
+    }
+
+    let events = events.unwrap();
+
+    if let Some(ref name) = container {
+        println!(
+            "{}",
+            format!("📋 Deploy events for: {}", name).cyan().bold()
+        );
+    } else {
+        println!("{}", "📋 Deploy events".cyan().bold());
+    }
+    println!();
+
+    // Events come newest-first from API, reverse for chronological display
+    for event in events.iter().rev() {
+        let phase = event["phase"].as_str().unwrap_or("?");
+        let message = event["message"].as_str().unwrap_or("");
+        let success = event["success"].as_bool().unwrap_or(true);
+        let timestamp = event["created_at"].as_str().unwrap_or("");
+        let container_name = event["container_name"].as_str().unwrap_or("");
+
+        // Format timestamp to just time if today
+        let time_str = if timestamp.len() > 19 {
+            &timestamp[11..19]
+        } else {
+            timestamp
+        };
+
+        let phase_icon = match phase {
+            "network" => "🌐",
+            "pulling" => "⬇️ ",
+            "pulled" => "📦",
+            "created" => "🔧",
+            "starting" => "🚀",
+            "running" => "✅",
+            "upgrading" => "🔄",
+            "failed" => "❌",
+            _ => "  ",
+        };
+
+        let phase_colored = if success {
+            match phase {
+                "running" => phase.green().bold().to_string(),
+                "pulling" | "upgrading" => phase.cyan().to_string(),
+                _ => phase.white().to_string(),
+            }
+        } else {
+            phase.red().bold().to_string()
+        };
+
+        // Show container name only in unfiltered view
+        if container.is_none() {
+            println!(
+                "   {} {} {} {} {}",
+                time_str.dimmed(),
+                phase_icon,
+                phase_colored,
+                container_name.white().bold(),
+                message.dimmed()
+            );
+        } else {
+            println!(
+                "   {} {} {} {}",
+                time_str.dimmed(),
+                phase_icon,
+                phase_colored,
+                message.dimmed()
+            );
+        }
+    }
+
+    println!();
+
+    Ok(())
+}
+
 fn print_quota_error(error: &ApiError) {
     eprintln!("{}", "❌ Deploy blocked — plan quota exceeded".red().bold());
     eprintln!();
@@ -4309,7 +4496,7 @@ async fn handle_registry_push(
         println!("{}", format!("✅ Pushed {}", image).green().bold());
         println!();
         println!("   {} Deploy it:", "🎯".yellow());
-        println!("     nordkraft deploy {} --port <PORT>", image);
+        println!("     nordkraft deploy registry://{} --port <PORT>", image);
     } else {
         println!(
             "{}",
@@ -4853,6 +5040,8 @@ async fn handle_setup(token: String, json_output: bool) -> Result<(), Box<dyn st
         server_public_key: data.server_public_key,
         server_endpoint: data.server_endpoint,
         allowed_ips: data.allowed_ips,
+        api_endpoint: None,
+        public_api_url: None,
     };
     save_connection_config(&conn_config)?;
 
@@ -5129,7 +5318,7 @@ fn show_help() {
 
     println!("{}", "INGRESS (HTTPS):".yellow().bold());
     println!(
-        "   nordkraft ingress enable <name> -s myapp    Enable HTTPS at e.g. myapp.nordkraft.cloud"
+        "   nordkraft ingress enable <name> -s myapp    Enable HTTPS at myapp.nordkraft.cloud"
     );
     println!("   nordkraft ingress disable <name>            Disable ingress");
     println!("   nordkraft ingress status <name>             Show ingress status");

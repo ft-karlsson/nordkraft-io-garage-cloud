@@ -165,6 +165,7 @@ pub async fn deploy_container(
                 allocated_ip.clone(),
                 Some(container_name.clone()),
                 deploy_req.enable_ipv6, // Pass bool, not Option<String>
+                None, // event_tx — local deploy, response is synchronous
             )
             .await
         {
@@ -330,13 +331,32 @@ pub async fn list_containers_route(
     user: AuthenticatedUser,
     app_state: &rocket::State<AppState>,
     orchestrator: &rocket::State<OrchestratorService>,
+    pool: &rocket::State<sqlx::PgPool>,
 ) -> Json<serde_json::Value> {
     // Controller: aggregate from all nodes
     if let Some(nats) = &orchestrator.nats_service {
         if nats.is_controller() {
-            let containers = orchestrator
+            let mut containers = orchestrator
                 .query_all_nodes_for_containers(&user.0.wireguard_public_key)
                 .await;
+
+            // Merge deploying/failed containers from DB that aren't in agent response
+            // (they don't exist in nerdctl runtime, only in our DB)
+            let running_names: std::collections::HashSet<String> =
+                containers.iter().map(|c| c.name.clone()).collect();
+
+            if let Ok(db_containers) = get_non_running_containers(
+                pool.inner(),
+                &user.0.id,
+            )
+            .await
+            {
+                for db_c in db_containers {
+                    if !running_names.contains(&db_c.name) {
+                        containers.push(db_c);
+                    }
+                }
+            }
 
             return Json(serde_json::json!({
                 "containers": containers,
@@ -920,6 +940,7 @@ async fn upgrade_local(
             Some(container_ip.to_string()),   // preserve IP
             Some(container_name.to_string()), // preserve name
             merged.enable_ipv6,
+            None, // event_tx — local upgrade, response is synchronous
         )
         .await
     {

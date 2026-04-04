@@ -23,7 +23,9 @@ use services::peer_resolver::{PeerCache, WgReconciler};
 use services::pfsense_client::{DummyPfSenseClient, PfSenseClient, PfSenseClientTrait};
 use services::route_manager::StaticRouteManager;
 
+use crate::services::event_store::{start_event_collector, EventStore};
 use crate::services::macvlan_manager::MacvlanManager;
+use crate::services::route_manager::RouteReconciler;
 
 use rocket::serde::{json::Json, Deserialize};
 
@@ -811,10 +813,8 @@ async fn rocket() -> _ {
         config.mode,
         config::OperationMode::Controller | config::OperationMode::Hybrid
     ) {
-        let route_reconciler = RouteReconciler::new(
-            Arc::clone(&app_state.route_manager),
-            db_pool.clone(),
-        );
+        let route_reconciler =
+            RouteReconciler::new(Arc::clone(&app_state.route_manager), db_pool.clone());
         route_reconciler.start().await;
     }
 
@@ -880,6 +880,19 @@ async fn rocket() -> _ {
     }
 
     // =========================================================
+    // EVENT STORE — deploy lifecycle events in PostgreSQL
+    // Controller subscribes to NATS deploy events and writes
+    // them to the deploy_events table. CLI reads via GET /api/events.
+    // =========================================================
+    let event_store = Arc::new(EventStore::new(db_pool.clone()));
+
+    if let Some(nats) = &nats_service {
+        if nats.is_controller() {
+            start_event_collector(nats.get_client().clone(), Arc::clone(&event_store)).await;
+        }
+    }
+
+    // =========================================================
     // AGENT-SPECIFIC SETUP - CRITICAL FOR REBOOT SURVIVAL
     // =========================================================
 
@@ -887,6 +900,21 @@ async fn rocket() -> _ {
     if let Err(e) = ensure_agent_vpn_routes(&config).await {
         error!("❌ CRITICAL: Failed to setup agent VPN routes: {}", e);
         panic!("Agent cannot start without return routes - security requirement");
+    }
+
+    // =========================================================
+    // AGENT ROUTE RECONCILER - VPN return route + tenant routes
+    // =========================================================
+    if matches!(
+        config.mode,
+        config::OperationMode::Agent | config::OperationMode::Hybrid
+    ) {
+        let agent_reconciler = services::route_manager::AgentRouteReconciler::new(
+            &config.vpn_network,
+            &config.controller_internal_ip,
+            &config.agent_interface,
+        );
+        agent_reconciler.start().await;
     }
 
     // NEW: Setup macvlan shim + routes (so containers are reachable)
@@ -910,6 +938,7 @@ async fn rocket() -> _ {
         .manage(pfsense_client)
         .manage(haproxy_client)
         .manage(macvlan_manager)
+        .manage(event_store)
         .manage(db_pool);
 
     // Mount routes based on mode
@@ -959,6 +988,8 @@ async fn rocket() -> _ {
                     admin_tenants_status,
                     // usage
                     routes::containers::get_usage,
+                    // Deploy lifecycle events
+                    routes::events::get_events,
                 ],
             )
         }

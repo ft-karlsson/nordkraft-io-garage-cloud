@@ -1,4 +1,5 @@
 pub mod container_manager;
+pub mod event_store;
 pub mod haproxy_client;
 pub mod macvlan_manager;
 pub mod nats_service;
