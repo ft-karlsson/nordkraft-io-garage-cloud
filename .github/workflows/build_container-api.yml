@@ -1,0 +1,141 @@
+name: Release Container API to Public Repo
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            platform: linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            platform: linux-aarch64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: Install cross-compilation tools
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y gcc-x86-64-linux-gnu gcc-aarch64-linux-gnu
+
+    - name: Build binary
+      env:
+        CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: x86_64-linux-gnu-gcc
+        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      run: |
+        cd container-api
+        cargo build --release --target ${{ matrix.target }}
+
+        mkdir -p ../dist/${{ matrix.platform }}
+        cp target/${{ matrix.target }}/release/container-api ../dist/${{ matrix.platform }}/nordkraft
+
+        # Checksum
+        cd ../dist/${{ matrix.platform }}
+        sha256sum nordkraft > nordkraft.sha256
+
+        # Tarball
+        cd ..
+        tar -czf nordkraft-${{ matrix.platform }}.tar.gz -C ${{ matrix.platform }} nordkraft nordkraft.sha256
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: nordkraft-${{ matrix.platform }}
+        path: dist/nordkraft-${{ matrix.platform }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: dist/
+
+    - name: Prepare release assets
+      run: |
+        # download-artifact@v4 puts each artifact in its own subdir — flatten first
+        find dist/ -name "*.tar.gz" -exec mv {} dist/ \;
+
+        # Extract raw binaries from tarballs so install.sh can curl them directly
+        for f in dist/nordkraft-linux-*.tar.gz; do
+          [ -f "$f" ] || continue
+          platform=$(basename "$f" .tar.gz | sed 's/nordkraft-//')
+
+          # Extract to a temp dir to avoid clobbering other files
+          tmpdir=$(mktemp -d)
+          tar -xzf "$f" -C "$tmpdir"
+
+          # Binary may be at root or one level deep — find it
+          binary=$(find "$tmpdir" -name "nordkraft" -not -name "*.sha256" | head -1)
+          checksum=$(find "$tmpdir" -name "nordkraft.sha256" | head -1)
+
+          [ -f "$binary" ]   && cp "$binary"   "dist/nordkraft-${platform}"
+          [ -f "$checksum" ] && cp "$checksum" "dist/nordkraft-${platform}.sha256"
+
+          rm -rf "$tmpdir"
+        done
+
+        echo "=== dist/ contents ==="
+        ls -la dist/
+
+    - name: Copy schema.sql for install.sh
+      run: cp database/schema.sql dist/schema.sql || true
+
+    - name: Create Release on Public Repo
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ github.ref_name }}
+        name: NordKraft ${{ github.ref_name }}
+        body: |
+          ## NordKraft ${{ github.ref_name }}
+
+          Container orchestration API and server binary.
+
+          ### Server Installation
+
+          ```bash
+          curl -fsSL https://install.nordkraft.io/server | sudo bash
+          ```
+
+          ### Manual Download
+
+          | Platform | Binary | Checksum |
+          |----------|--------|----------|
+          | Linux x86_64 | nordkraft-linux-x86_64 | nordkraft-linux-x86_64.sha256 |
+          | Linux aarch64 (Pi/ARM) | nordkraft-linux-aarch64 | nordkraft-linux-aarch64.sha256 |
+
+          ### Updating an existing server
+
+          ```bash
+          sudo nordkraft-update
+          ```
+
+          Containers keep running during updates.
+        files: |
+          dist/nordkraft-*.tar.gz
+          dist/nordkraft-linux-x86_64
+          dist/nordkraft-linux-x86_64.sha256
+          dist/nordkraft-linux-aarch64
+          dist/nordkraft-linux-aarch64.sha256
+          dist/schema.sql
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
