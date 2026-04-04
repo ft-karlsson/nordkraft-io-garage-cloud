@@ -3909,7 +3909,7 @@ async fn handle_status(json_output: bool) -> Result<(), Box<dyn std::error::Erro
 
 // ============= UPDATE HANDLER =============
 
-const GITHUB_REPO: &str = "ft-karlsson/nordkraft-io";
+const GITHUB_REPO: &str = "ft-karlsson/nordkraft-io-garage-cloud";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Deserialize)]
