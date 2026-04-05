@@ -348,6 +348,17 @@ impl ContainerManager {
         }
 
         // Image
+        // Detect private/insecure registries (IP-based, not docker.io/ghcr.io)
+        if !image.starts_with("docker.io/")
+            && !image.starts_with("ghcr.io/")
+            && !image.starts_with("registry.k8s.io/")
+            && image.contains(':')
+            && image.split('/').next().map_or(false, |host| {
+                host.contains(':') || host.parse::<std::net::Ipv4Addr>().is_ok()
+            })
+        {
+            args.push("--insecure-registry".to_string());
+        }
         args.push(image.to_string());
 
         // Optional command override
