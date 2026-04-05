@@ -24,7 +24,8 @@ use ratatui::{
 use reqwest::Client;
 use serde::Deserialize;
 use std::{
-    io, time::{Duration, Instant}
+    io,
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 
