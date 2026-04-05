@@ -821,6 +821,18 @@ fn normalize_image(image: &str) -> String {
     s.to_string()
 }
 
+/// Resolve `registry://name:tag` to the user's private registry address.
+/// Returns the resolved image string, or the original if not a registry:// reference.
+fn resolve_registry_image(image: &str) -> Result<String, Box<dyn std::error::Error>> {
+    if !image.starts_with("registry://") {
+        return Ok(image.to_string());
+    }
+    let short_name = image.strip_prefix("registry://").unwrap();
+    let reg_config = load_registry_config()
+        .ok_or("Registry not initialized. Run 'nordkraft registry init' first.")?;
+    Ok(format!("{}/{}", reg_config.address, short_name))
+}
+
 fn compute_diff(spec: &DeploymentSpec, live: &DeploymentSpec) -> Vec<SpecDiff> {
     let mut diffs = Vec::new();
 
@@ -1878,10 +1890,7 @@ async fn handle_deploy(
     // Explicit private registry references: "registry://myapp:v1"
     // Resolves to the user's private registry address.
     if args.image.starts_with("registry://") {
-        let short_name = args.image.strip_prefix("registry://").unwrap();
-        let reg_config = load_registry_config()
-            .ok_or("Registry not initialized. Run 'nordkraft registry init' first.")?;
-        args.image = format!("{}/{}", reg_config.address, short_name);
+        args.image = resolve_registry_image(&args.image)?;
         if !json_output {
             println!("   {} Using private registry: {}", "→".dimmed(), args.image);
         }
@@ -2927,9 +2936,19 @@ async fn handle_upgrade_interactive(
         }
     }
 
+    // Resolve registry:// prefix in image (same as deploy path)
+    let resolved_image = resolve_registry_image(&spec.deployment.image)?;
+    if resolved_image != spec.deployment.image && !json_output {
+        println!(
+            "   {} Using private registry: {}",
+            "→".dimmed(),
+            resolved_image
+        );
+    }
+
     // Build upgrade request from the .nk spec (send full desired state)
     let upgrade = CliUpgradeRequest {
-        image: Some(spec.deployment.image.clone()),
+        image: Some(resolved_image),
         ports: if spec.network.ports.is_empty() {
             None
         } else {
@@ -4008,7 +4027,7 @@ async fn handle_status(json_output: bool) -> Result<(), Box<dyn std::error::Erro
 
 // ============= UPDATE HANDLER =============
 
-const GITHUB_REPO: &str = "ft-karlsson/nordkraft-io-garage-cloud";
+const GITHUB_REPO: &str = "ft-karlsson/nordkraft-io";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Deserialize)]
