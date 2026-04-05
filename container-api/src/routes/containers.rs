@@ -165,7 +165,7 @@ pub async fn deploy_container(
                 allocated_ip.clone(),
                 Some(container_name.clone()),
                 deploy_req.enable_ipv6, // Pass bool, not Option<String>
-                None, // event_tx — local deploy, response is synchronous
+                None,                   // event_tx — local deploy, response is synchronous
             )
             .await
         {
@@ -345,12 +345,7 @@ pub async fn list_containers_route(
             let running_names: std::collections::HashSet<String> =
                 containers.iter().map(|c| c.name.clone()).collect();
 
-            if let Ok(db_containers) = get_non_running_containers(
-                pool.inner(),
-                &user.0.id,
-            )
-            .await
-            {
+            if let Ok(db_containers) = get_non_running_containers(pool.inner(), &user.0.id).await {
                 for db_c in db_containers {
                     if !running_names.contains(&db_c.name) {
                         containers.push(db_c);

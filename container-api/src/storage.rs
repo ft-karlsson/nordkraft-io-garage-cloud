@@ -562,7 +562,11 @@ pub async fn get_non_running_containers(
                     // Extract clean error — find the fatal/error line from nerdctl output
                     let clean = msg
                         .lines()
-                        .filter(|l| l.contains("level=fatal") || l.contains("level=error") || l.contains("FATA"))
+                        .filter(|l| {
+                            l.contains("level=fatal")
+                                || l.contains("level=error")
+                                || l.contains("FATA")
+                        })
                         .last()
                         .map(|l| {
                             // Strip nerdctl log prefix: time="..." level=fatal msg="..."
@@ -595,7 +599,9 @@ pub async fn get_non_running_containers(
                 image: row.get("image"),
                 status: display_status,
                 pod_id: None,
-                created_at: row.get::<Option<String>, _>("created_at").unwrap_or_default(),
+                created_at: row
+                    .get::<Option<String>, _>("created_at")
+                    .unwrap_or_default(),
                 ports: vec![],
                 container_ip: row.get("internal_ip"),
                 ipv6_address: None,
