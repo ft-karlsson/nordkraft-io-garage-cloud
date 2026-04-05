@@ -6,8 +6,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 mod tui;
 
@@ -759,7 +759,8 @@ fn spec_from_inspect(c: &ContainerInspectResponse) -> DeploymentSpec {
     // Detect volume_path from real mounts
     let volume_path: Option<String> = c
         .volume_mounts
-        .iter().find(|m| !m.starts_with("tmpfs:"))
+        .iter()
+        .find(|m| !m.starts_with("tmpfs:"))
         .and_then(|m| {
             // Format is usually "host_path:container_path" or just container_path
             m.split(':')
@@ -1408,7 +1409,8 @@ struct LogsResponse {
 // Inspect - mirrors ContainerInspectData from server
 #[derive(Debug, Deserialize, Serialize)]
 struct ContainerInspectResponse {
-    container_id: String,
+    #[serde(default)]
+    container_id: Option<String>,
     name: String,
     image: String,
     image_digest: Option<String>,
@@ -1750,22 +1752,23 @@ async fn handle_container_list(json_output: bool) -> Result<(), Box<dyn std::err
 
     for c in &data.containers {
         let status_lower = c.status.to_lowercase();
-        let (status_colored, failure_reason) = if status_lower.contains("up") || status_lower == "running" {
-            ("Up".green().bold(), None)
-        } else if status_lower == "deploying" {
-            ("Deploying".yellow().bold(), None)
-        } else if status_lower.starts_with("failed") {
-            let reason = if status_lower.starts_with("failed: ") {
-                Some(c.status[8..].to_string())
+        let (status_colored, failure_reason) =
+            if status_lower.contains("up") || status_lower == "running" {
+                ("Up".green().bold(), None)
+            } else if status_lower == "deploying" {
+                ("Deploying".yellow().bold(), None)
+            } else if status_lower.starts_with("failed") {
+                let reason = if status_lower.starts_with("failed: ") {
+                    Some(c.status[8..].to_string())
+                } else {
+                    c.status_message.clone()
+                };
+                ("Failed".red().bold(), reason)
+            } else if status_lower.contains("exited") || status_lower.contains("stopped") {
+                (c.status.red(), None)
             } else {
-                c.status_message.clone()
+                (c.status.yellow(), None)
             };
-            ("Failed".red().bold(), reason)
-        } else if status_lower.contains("exited") || status_lower.contains("stopped") {
-            (c.status.red(), None)
-        } else {
-            (c.status.yellow(), None)
-        };
 
         // Show alias as primary name if available
         if let Some(alias) = reverse_aliases.get(&c.name) {
@@ -2601,7 +2604,11 @@ async fn handle_container_inspect(
         println!();
 
         // ── Identity ──────────────────────────────────────────────
-        println!("   {} {}", "ID:".cyan(), c.container_id.dimmed());
+        println!(
+            "   {} {}",
+            "ID:".cyan(),
+            c.container_id.as_deref().unwrap_or("n/a").dimmed()
+        );
         println!("   {} {}", "Image:".cyan(), c.image);
         if let Some(ver) = oci_version {
             println!("   {} {}", "Version:".cyan(), ver.dimmed());
@@ -2779,7 +2786,28 @@ async fn handle_diff_interactive(
     };
 
     // Fetch live state via inspect
-    let live = fetch_live_spec(&name).await?;
+    let live = match fetch_live_spec(&name).await? {
+        Some(live) => live,
+        None => {
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({"status": "no_live_state", "message": "Container has no live state (never started or failed)"})
+                );
+            } else {
+                println!(
+                    "{} Container '{}' has no live state (never started or failed deployment).",
+                    "⚠".yellow(),
+                    name
+                );
+                println!(
+                    "   Run '{}' to apply the spec.",
+                    format!("nordkraft upgrade {}", name).cyan()
+                );
+            }
+            return Ok(());
+        }
+    };
 
     if json_output {
         let diffs = compute_diff(&spec, &live);
@@ -2829,32 +2857,58 @@ async fn handle_upgrade_interactive(
         }
     };
 
-    // Fetch live state
+    // Fetch live state — may be None for failed/never-started containers
     let live = fetch_live_spec(&name).await?;
-    let diffs = compute_diff(&spec, &live);
-    let changes: Vec<&SpecDiff> = diffs.iter().filter(|d| d.kind != DiffKind::Same).collect();
+    let is_failed = live.is_none();
 
-    if changes.is_empty() {
-        if !json_output {
-            println!(
-                "{}",
-                format!("✅ {} is already up to date", name).green().bold()
-            );
+    // If we have live state, compute diff; otherwise skip diff and apply directly
+    if let Some(ref live) = live {
+        let diffs = compute_diff(&spec, live);
+        let changes: Vec<&SpecDiff> = diffs.iter().filter(|d| d.kind != DiffKind::Same).collect();
+
+        if changes.is_empty() {
+            if !json_output {
+                println!(
+                    "{}",
+                    format!("✅ {} is already up to date", name).green().bold()
+                );
+            }
+            return Ok(());
         }
-        return Ok(());
+
+        if !json_output {
+            display_diff(&diffs, &name);
+            println!();
+        }
     }
 
     if !json_output {
-        display_diff(&diffs, &name);
-        println!();
-
-        if !skip_confirm {
+        if is_failed {
             println!(
-                "   {} This will restart the container. Volumes will be preserved.",
+                "   {} Container never started — will redeploy from spec.",
                 "⚠".yellow()
             );
+            println!(
+                "   {}",
+                format!("Image: {}", spec.deployment.image).dimmed()
+            );
+            println!();
+        }
+
+        if !skip_confirm {
+            let prompt = if is_failed {
+                "Redeploy from spec?"
+            } else {
+                "Apply changes?"
+            };
+            if !is_failed {
+                println!(
+                    "   {} This will restart the container. Volumes will be preserved.",
+                    "⚠".yellow()
+                );
+            }
             let confirm = Confirm::with_theme(&ColorfulTheme::default())
-                .with_prompt("Apply changes?")
+                .with_prompt(prompt)
                 .default(false)
                 .interact()
                 .unwrap_or(false);
@@ -2866,7 +2920,11 @@ async fn handle_upgrade_interactive(
         }
 
         println!();
-        println!("{}", format!("⏸️  Stopping {}...", name).cyan());
+        if is_failed {
+            println!("{}", format!("🚀 Redeploying {}...", name).cyan());
+        } else {
+            println!("{}", format!("⏸️  Stopping {}...", name).cyan());
+        }
     }
 
     // Build upgrade request from the .nk spec (send full desired state)
@@ -2973,7 +3031,27 @@ async fn handle_init_interactive(
         println!("{}", format!("🔍 Inspecting {}...", name).cyan());
     }
 
-    let live = fetch_live_spec(&name).await?;
+    let live = match fetch_live_spec(&name).await? {
+        Some(live) => live,
+        None => {
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({"error": "Container has no live state (never started or failed)"})
+                );
+            } else {
+                eprintln!(
+                    "{} Container '{}' has no live state — cannot generate spec from a failed deployment.",
+                    "⚠".yellow(), name
+                );
+                eprintln!(
+                    "   Edit the existing .nk spec directly with '{}'.",
+                    format!("nordkraft edit {}", name).cyan()
+                );
+            }
+            return Ok(());
+        }
+    };
 
     // Check if spec already exists
     if let Some(existing) = load_deployment_spec(&name) {
@@ -3110,17 +3188,26 @@ async fn handle_specs_list(json_output: bool) -> Result<(), Box<dyn std::error::
         return Ok(());
     }
 
+    // Build reverse alias map: container_name → alias
+    let aliases = load_aliases();
+    let reverse_aliases: std::collections::HashMap<&String, &String> =
+        aliases.iter().map(|(alias, name)| (name, alias)).collect();
+
     if json_output {
         let items: Vec<serde_json::Value> = specs
             .iter()
             .filter_map(|name| {
                 load_deployment_spec(name).map(|s| {
-                    serde_json::json!({
+                    let mut item = serde_json::json!({
                         "name": s.deployment.name,
                         "image": s.deployment.image,
                         "revision": s.deployment.revision,
                         "updated": s.deployment.updated,
-                    })
+                    });
+                    if let Some(alias) = reverse_aliases.get(&s.deployment.name) {
+                        item["alias"] = serde_json::json!(alias);
+                    }
+                    item
                 })
             })
             .collect();
@@ -3133,9 +3220,14 @@ async fn handle_specs_list(json_output: bool) -> Result<(), Box<dyn std::error::
 
     for name in &specs {
         if let Some(spec) = load_deployment_spec(name) {
+            let display_name = if let Some(alias) = reverse_aliases.get(&spec.deployment.name) {
+                format!("{} ({})", alias, spec.deployment.name)
+            } else {
+                spec.deployment.name.clone()
+            };
             println!(
                 "   {} {} {} {}",
-                spec.deployment.name.white().bold(),
+                display_name.white().bold(),
                 format!("r{}", spec.deployment.revision).dimmed(),
                 spec.deployment.image.dimmed(),
                 format!("({})", spec.resources.memory).dimmed()
@@ -3286,10 +3378,7 @@ async fn handle_events(
     if events.is_none() || events.unwrap().is_empty() {
         println!("{}", "No deploy events found.".dimmed());
         if container.is_some() {
-            println!(
-                "   Try without filter: {}",
-                "nordkraft events".cyan()
-            );
+            println!("   Try without filter: {}", "nordkraft events".cyan());
         }
         return Ok(());
     }
@@ -3407,8 +3496,10 @@ fn print_colored_bar((filled, empty): &(usize, usize), color: &str) {
     }
 }
 
-/// Fetch live container state as a DeploymentSpec via the inspect endpoint
-async fn fetch_live_spec(name: &str) -> Result<DeploymentSpec, Box<dyn std::error::Error>> {
+/// Fetch live container state as a DeploymentSpec via the inspect endpoint.
+/// Returns Ok(None) if the container exists in DB but has no live runtime state
+/// (e.g. Failed deployment where container never started).
+async fn fetch_live_spec(name: &str) -> Result<Option<DeploymentSpec>, Box<dyn std::error::Error>> {
     let client = create_client()?;
     let url = format!("{}/containers/{}", *API_BASE_URL, name);
     let response = client.get(&url).send().await?;
@@ -3419,10 +3510,18 @@ async fn fetch_live_spec(name: &str) -> Result<DeploymentSpec, Box<dyn std::erro
     }
 
     let body = response.text().await?;
+
+    // Check if the response is an error JSON (container not running / never started)
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body) {
+        if val.get("error").is_some() {
+            return Ok(None);
+        }
+    }
+
     let inspect: ContainerInspectResponse = serde_json::from_str(&body)
         .map_err(|e| format!("Failed to parse inspect response: {}", e))?;
 
-    Ok(spec_from_inspect(&inspect))
+    Ok(Some(spec_from_inspect(&inspect)))
 }
 
 // ============= INGRESS HANDLERS =============
