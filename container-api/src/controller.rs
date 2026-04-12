@@ -117,13 +117,22 @@ impl OrchestratorService {
         let query_id = uuid::Uuid::new_v4().to_string();
         let response_subject = format!("nordkraft.query.{}.response", query_id);
 
-        let mut subscriber = match nats.get_client().subscribe(response_subject.clone()).await {
+        let client = nats.get_client();
+        let mut subscriber = match client.subscribe(response_subject.clone()).await {
             Ok(sub) => sub,
             Err(e) => {
                 error!("Failed to subscribe to query responses: {}", e);
                 return vec![];
             }
         };
+
+        // CRITICAL: flush so the SUB frame reaches the NATS server BEFORE we publish.
+        // Without this, agent responses can arrive before our subscription is
+        // registered server-side and get dropped — causing empty results on the
+        // first call after a cold start.
+        if let Err(e) = client.flush().await {
+            warn!("NATS flush before container query failed: {}", e);
+        }
 
         // Publish query
         let query_msg = NatsMessage::ContainerQuery {
@@ -140,8 +149,8 @@ impl OrchestratorService {
             return vec![];
         }
 
-        // Collect responses with timeout
-        self.collect_query_responses(&mut subscriber, Duration::from_millis(500))
+        // Collect responses with timeout (bumped from 500ms → 1500ms for cold-path safety)
+        self.collect_query_responses(&mut subscriber, Duration::from_millis(1500))
             .await
     }
 
@@ -151,20 +160,22 @@ impl OrchestratorService {
         timeout: Duration,
     ) -> Vec<ContainerInfo> {
         let mut containers = Vec::new();
-        let start = tokio::time::Instant::now();
 
-        while start.elapsed() < timeout {
-            tokio::select! {
-                Some(msg) = subscriber.next() => {
-                    if let Ok(NatsMessage::ContainerQueryResponse { containers: node_containers, .. }) =
-                        serde_json::from_slice::<NatsMessage>(&msg.payload)
-                    {
-                        containers.extend(node_containers);
-                    }
+        // Wait up to `timeout` for responses to stream in. We don't know in advance
+        // how many nodes will reply, so we drain the subscriber until the deadline.
+        let _ = tokio::time::timeout(timeout, async {
+            while let Some(msg) = subscriber.next().await {
+                if let Ok(NatsMessage::ContainerQueryResponse {
+                    containers: node_containers,
+                    ..
+                }) = serde_json::from_slice::<NatsMessage>(&msg.payload)
+                {
+                    containers.extend(node_containers);
                 }
-                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
             }
-        }
+        })
+        .await;
+
         containers
     }
 
