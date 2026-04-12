@@ -9,7 +9,9 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::Duration;
 
+mod spinner;
 mod tui;
+use spinner::Spinner;
 
 // ============= ALIAS MANAGEMENT =============
 
@@ -1722,19 +1724,27 @@ async fn handle_remove_interactive(
 async fn handle_container_list(json_output: bool) -> Result<(), Box<dyn std::error::Error>> {
     let client = create_client()?;
 
-    if !json_output {
-        println!("{}", "📦 Fetching containers...".cyan());
-    }
+    let sp = if json_output {
+        None
+    } else {
+        Some(Spinner::start(spinner::LIST_MESSAGES))
+    };
 
     let url = format!("{}/containers", *API_BASE_URL);
     let response = client.get(&url).send().await?;
 
     if !response.status().is_success() {
+        if let Some(s) = sp {
+            s.stop();
+        }
         let error: ApiError = response.json().await?;
         return Err(error.error.into());
     }
 
     let data: ContainerListResponse = response.json().await?;
+    if let Some(s) = sp {
+        s.stop();
+    }
 
     if json_output {
         println!("{}", serde_json::to_string_pretty(&data.containers)?);
@@ -2386,6 +2396,12 @@ async fn handle_container_logs(
     // Resolve alias to full name
     let container = resolve_alias(container);
 
+    let sp = if json_output {
+        None
+    } else {
+        Some(Spinner::start(spinner::LOGS_MESSAGES))
+    };
+
     let url = format!(
         "{}/containers/{}/logs?lines={}",
         *API_BASE_URL, container, lines
@@ -2393,12 +2409,18 @@ async fn handle_container_logs(
     let response = client.get(&url).send().await?;
 
     if !response.status().is_success() {
+        if let Some(s) = sp {
+            s.stop();
+        }
         let error: ApiError = response.json().await?;
         return Err(error.error.into());
     }
 
     // Try to parse logs response — if it fails, the container may not be ready yet
     let body = response.text().await?;
+    if let Some(s) = sp {
+        s.stop();
+    }
     let logs_result: Result<LogsResponse, _> = serde_json::from_str(&body);
 
     match logs_result {
@@ -2517,15 +2539,27 @@ async fn handle_container_inspect(
     let container = resolve_alias(container);
     let client = create_client()?;
 
+    let sp = if json_output {
+        None
+    } else {
+        Some(Spinner::start(spinner::INSPECT_MESSAGES))
+    };
+
     let url = format!("{}/containers/{}", *API_BASE_URL, container);
     let response = client.get(&url).send().await?;
 
     if !response.status().is_success() {
+        if let Some(s) = sp {
+            s.stop();
+        }
         let error: ApiError = response.json().await?;
         return Err(error.error.into());
     }
 
     let body = response.text().await?;
+    if let Some(s) = sp {
+        s.stop();
+    }
 
     // Try to parse as rich inspect data
     if let Ok(c) = serde_json::from_str::<ContainerInspectResponse>(&body) {
