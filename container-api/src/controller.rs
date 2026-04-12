@@ -191,7 +191,15 @@ impl OrchestratorService {
         let query_id = uuid::Uuid::new_v4().to_string();
         let response_subject = NatsSubjects::logs_response_for_query(&query_id);
 
-        let mut sub = nats.get_client().subscribe(response_subject).await.ok()?;
+        let client = nats.get_client();
+        let mut sub = client.subscribe(response_subject).await.ok()?;
+
+        // Flush so the SUB frame reaches the NATS server before we send the
+        // request — otherwise a fast agent reply can arrive before our
+        // subscription is registered server-side and get dropped.
+        if let Err(e) = client.flush().await {
+            warn!("NATS flush before logs request failed: {}", e);
+        }
 
         let req = NatsMessage::ContainerLogsRequest {
             query_id: query_id.clone(),
@@ -213,8 +221,8 @@ impl OrchestratorService {
             }
         }
 
-        // Wait for response
-        self.wait_for_logs_response(&mut sub, Duration::from_millis(800))
+        // Wait for response (bumped 800ms → 1500ms for cold-path safety)
+        self.wait_for_logs_response(&mut sub, Duration::from_millis(1500))
             .await
     }
 
@@ -223,26 +231,26 @@ impl OrchestratorService {
         sub: &mut async_nats::Subscriber,
         timeout: Duration,
     ) -> Option<String> {
-        let deadline = tokio::time::Instant::now() + timeout;
-
-        while tokio::time::Instant::now() < deadline {
-            tokio::select! {
-                maybe_msg = sub.next() => {
-                    if let Some(msg) = maybe_msg {
-                        if let Ok(NatsMessage::ContainerLogsResponse { success, logs, error, .. }) =
-                            serde_json::from_slice::<NatsMessage>(&msg.payload)
-                        {
-                            if success {
-                                return logs;
-                            }
-                            error!("Logs error: {:?}", error);
-                        }
+        tokio::time::timeout(timeout, async {
+            while let Some(msg) = sub.next().await {
+                if let Ok(NatsMessage::ContainerLogsResponse {
+                    success,
+                    logs,
+                    error,
+                    ..
+                }) = serde_json::from_slice::<NatsMessage>(&msg.payload)
+                {
+                    if success {
+                        return logs;
                     }
+                    error!("Logs error: {:?}", error);
                 }
-                _ = tokio::time::sleep(Duration::from_millis(30)) => {}
             }
-        }
-        None
+            None
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Request rich inspect data from the node that owns the container.
@@ -256,7 +264,15 @@ impl OrchestratorService {
         let query_id = uuid::Uuid::new_v4().to_string();
         let response_subject = NatsSubjects::container_inspect_response(&query_id);
 
-        let mut sub = nats.get_client().subscribe(response_subject).await.ok()?;
+        let client = nats.get_client();
+        let mut sub = client.subscribe(response_subject).await.ok()?;
+
+        // Flush so the SUB frame reaches the NATS server before we broadcast —
+        // otherwise a fast agent reply can arrive before our subscription is
+        // registered server-side and get dropped.
+        if let Err(e) = client.flush().await {
+            warn!("NATS flush before inspect request failed: {}", e);
+        }
 
         let req = NatsMessage::ContainerInspectRequest {
             query_id: query_id.clone(),
@@ -277,26 +293,27 @@ impl OrchestratorService {
         }
 
         // Wait for first successful response (1.5s timeout)
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
-        while tokio::time::Instant::now() < deadline {
-            tokio::select! {
-                maybe_msg = sub.next() => {
-                    if let Some(msg) = maybe_msg {
-                        if let Ok(NatsMessage::ContainerInspectResponse { success, data, error, .. }) =
-                            serde_json::from_slice::<NatsMessage>(&msg.payload)
-                        {
-                            if success {
-                                return data.map(|b| *b);
-                            }
-                            error!("Inspect error from agent: {:?}", error);
-                            return None;
-                        }
+        tokio::time::timeout(Duration::from_millis(1500), async {
+            while let Some(msg) = sub.next().await {
+                if let Ok(NatsMessage::ContainerInspectResponse {
+                    success,
+                    data,
+                    error,
+                    ..
+                }) = serde_json::from_slice::<NatsMessage>(&msg.payload)
+                {
+                    if success {
+                        return data.map(|b| *b);
                     }
+                    error!("Inspect error from agent: {:?}", error);
+                    return None;
                 }
-                _ = tokio::time::sleep(Duration::from_millis(30)) => {}
             }
-        }
-        None
+            None
+        })
+        .await
+        .ok()
+        .flatten()
     }
 }
 
