@@ -76,8 +76,18 @@ impl Spinner {
     /// Stop the spinner and clear its line. Idempotent.
     pub fn stop(mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
+
+        // Clear the spinner line SYNCHRONOUSLY before returning, so the
+        // caller's next println! doesn't race against the background task.
+        // \r returns to line start, ANSI 2K clears the entire line.
+        if self.handle.is_some() {
+            print!("\r\x1b[2K");
+            let _ = stdout().flush();
+        }
+
+        // Detach the background task — it'll notice the stop flag and exit
+        // on its next tick. We don't wait for it; the line is already clear.
         if let Some(h) = self.handle.take() {
-            // Best-effort: give the task one tick to clear the line.
             tokio::spawn(async move {
                 let _ = h.await;
             });
