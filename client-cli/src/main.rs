@@ -130,7 +130,7 @@ enum Commands {
 
     // ===== SHORTCUTS =====
     /// Deploy a container (shortcut for 'container deploy')
-    Deploy(DeployArgs),
+    Deploy(Box<DeployArgs>),
     /// Push a local image to your private registry
     Push {
         /// Image to push (e.g., myapp:v1)
@@ -1566,7 +1566,7 @@ async fn main() {
         Commands::Events { container, limit } => handle_events(container, limit, json_output).await,
 
         // Shortcuts with interactive selection
-        Commands::Deploy(args) => handle_deploy(args, json_output).await,
+        Commands::Deploy(args) => handle_deploy(*args, json_output).await,
         Commands::Push { image } => handle_registry_push(&image, json_output).await,
         Commands::List => handle_container_list(json_output).await,
         Commands::Logs { container, lines } => {
@@ -2003,9 +2003,13 @@ async fn handle_deploy(
                 || img.contains("traefik")
             {
                 Some(80)
-            } else if img.contains("node") || img.contains("express") || img.contains("next") {
-                Some(3000)
-            } else if img.contains("rails") || img.contains("campfire") || img.contains("ruby") {
+            } else if img.contains("node")
+                || img.contains("express")
+                || img.contains("next")
+                || img.contains("rails")
+                || img.contains("campfire")
+                || img.contains("ruby")
+            {
                 Some(3000)
             } else if img.contains("django")
                 || img.contains("flask")
@@ -2013,9 +2017,12 @@ async fn handle_deploy(
                 || img.contains("python")
             {
                 Some(8000)
-            } else if img.contains("spring") || img.contains("java") || img.contains("tomcat") {
-                Some(8080)
-            } else if img.contains("go") || img.contains("golang") {
+            } else if img.contains("spring")
+                || img.contains("java")
+                || img.contains("tomcat")
+                || img.contains("go")
+                || img.contains("golang")
+            {
                 Some(8080)
             } else if img.contains("postgres")
                 || img.contains("mysql")
@@ -2653,8 +2660,8 @@ async fn handle_container_inspect(
             let mut days = y * 365 + leap_days;
 
             // Add days for each completed month this year
-            for m in 0..(month - 1) as usize {
-                days += days_per_month[m];
+            for month_days in days_per_month.iter().take((month - 1) as usize) {
+                days += *month_days;
             }
             days += day - 1;
 
