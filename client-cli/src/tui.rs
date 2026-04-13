@@ -74,7 +74,7 @@ struct LogsResponse {
 
 #[derive(Debug, Deserialize)]
 struct ApiResponse {
-    status: Option<String>,
+    // status: Option<String>,
     error: Option<String>,
 }
 
@@ -82,7 +82,7 @@ struct ApiResponse {
 
 #[derive(Debug, Deserialize, Clone)]
 struct IngressRoute {
-    container_id: String,
+    // container_id: String,
     subdomain: String,
     url: String,
     target_port: u16,

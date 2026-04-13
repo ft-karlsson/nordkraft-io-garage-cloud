@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::Duration;
 
+mod spec_ops;
 mod spinner;
 mod tui;
 use spinner::Spinner;
@@ -210,6 +211,40 @@ enum Commands {
     },
     /// List all saved deployment specs
     Specs,
+    /// Set a value in a .nk spec (e.g. `nordkraft spec-set web resources.cpu 2`)
+    ///
+    /// Use `+value` to append to an array, `-value` to remove from one.
+    /// Examples:
+    ///   nordkraft spec-set web deployment.image nginx:1.27
+    ///   nordkraft spec-set web network.ports +8080:80
+    ///   nordkraft spec-set web network.ports -8080:80
+    SpecSet {
+        /// Container name or alias
+        container: String,
+        /// Dotted key path (e.g. `resources.cpu`, `deployment.image`)
+        key: String,
+        /// New value (prefix with + to append / - to remove from arrays)
+        #[arg(allow_hyphen_values = true)]
+        value: String,
+        /// Apply to running container immediately (runs `upgrade --yes`)
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Remove a field from a .nk spec
+    SpecUnset {
+        /// Container name or alias
+        container: String,
+        /// Dotted key path (e.g. `network.ipv6`)
+        key: String,
+    },
+    /// Delete a .nk spec file (does NOT destroy the running container)
+    SpecDelete {
+        /// Container name or alias
+        container: String,
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Show plan usage vs. limits
     Usage,
     /// Show deploy lifecycle events
@@ -1470,8 +1505,8 @@ struct ApiError {
     error: String,
     #[serde(default)]
     plan: Option<String>,
-    #[serde(default)]
-    plan_id: Option<String>,
+    // #[serde(default)]
+    // plan_id: Option<String>,
     #[serde(default)]
     usage: Option<serde_json::Value>,
 }
@@ -1515,6 +1550,18 @@ async fn main() {
         Commands::Init { container } => handle_init_interactive(container, json_output).await,
         Commands::Edit { container } => handle_edit_interactive(container, json_output).await,
         Commands::Specs => handle_specs_list(json_output).await,
+        Commands::SpecSet {
+            container,
+            key,
+            value,
+            apply,
+        } => spec_ops::handle_spec_set(container, key, value, apply, json_output).await,
+        Commands::SpecUnset { container, key } => {
+            spec_ops::handle_spec_unset(container, key, json_output).await
+        }
+        Commands::SpecDelete { container, yes } => {
+            spec_ops::handle_spec_delete(container, yes, json_output).await
+        }
         Commands::Usage => handle_usage(json_output).await,
         Commands::Events { container, limit } => handle_events(container, limit, json_output).await,
 
@@ -3268,43 +3315,171 @@ async fn handle_specs_list(json_output: bool) -> Result<(), Box<dyn std::error::
         return Ok(());
     }
 
-    println!("{}", "📋 Deployment specs".cyan().bold());
+    // Shorten a raw container id like `app-51d83cde-cf29-4739-a057-35a088e2f4ad`
+    // to `app-51d83cde…f4ad` so it fits a narrow name column.
+    fn short_id(id: &str) -> String {
+        if id.len() <= 18 {
+            return id.to_string();
+        }
+        let head: String = id.chars().take(12).collect();
+        let tail: String = id
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        format!("{}…{}", head, tail)
+    }
+
+    // Truncate long image names from the left, keeping the tag visible.
+    fn short_image(img: &str) -> String {
+        const MAX: usize = 44;
+        if img.len() <= MAX {
+            return img.to_string();
+        }
+        format!("…{}", &img[img.len() - (MAX - 1)..])
+    }
+
+    // Pick a status dot based on the spec's revision.
+    // r0   → green  (fresh / never upgraded)
+    // r1+  → cyan   (has been upgraded at least once)
+    fn spec_icon(revision: u64) -> colored::ColoredString {
+        if revision == 0 {
+            "●".bright_green().bold()
+        } else {
+            "●".bright_cyan().bold()
+        }
+    }
+
+    // Load all rows up front so we can compute column widths.
+    let rows: Vec<(String, DeploymentSpec)> = specs
+        .iter()
+        .filter_map(|name| load_deployment_spec(name).map(|s| (name.clone(), s)))
+        .collect();
+
+    // Primary display name for each row: alias if present, else shortened id.
+    let display_names: Vec<String> = rows
+        .iter()
+        .map(|(_, s)| {
+            reverse_aliases
+                .get(&s.deployment.name)
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| short_id(&s.deployment.name))
+        })
+        .collect();
+
+    // Tight, capped column width — no single row gets to stretch the whole table.
+    const NAME_CAP: usize = 20;
+    let name_width = display_names
+        .iter()
+        .map(|n| n.len())
+        .max()
+        .unwrap_or(12)
+        .clamp(12, NAME_CAP);
+
+    println!();
+    println!(
+        "   📋 {}",
+        format!("Saved deployment specs (.nk files) — {} total", rows.len())
+            .cyan()
+            .bold()
+    );
+    println!(
+        "   {}",
+        "These are on-disk manifests. Use 'nordkraft list' to see running containers.".dimmed()
+    );
+    println!(
+        "   {}  {}   {}  {}",
+        "●".bright_green().bold(),
+        "new".dimmed(),
+        "●".bright_cyan().bold(),
+        "upgraded".dimmed()
+    );
     println!();
 
-    for name in &specs {
-        if let Some(spec) = load_deployment_spec(name) {
-            let display_name = if let Some(alias) = reverse_aliases.get(&spec.deployment.name) {
-                format!("{} ({})", alias, spec.deployment.name)
-            } else {
-                spec.deployment.name.clone()
-            };
-            println!(
-                "   {} {} {} {}",
-                display_name.white().bold(),
-                format!("r{}", spec.deployment.revision).dimmed(),
-                spec.deployment.image.dimmed(),
-                format!("({})", spec.resources.memory).dimmed()
-            );
+    for ((_, spec), display) in rows.iter().zip(display_names.iter()) {
+        let has_alias = reverse_aliases.contains_key(&spec.deployment.name);
+        let secondary: Option<String> = if has_alias || spec.deployment.name.len() > display.len() {
+            Some(spec.deployment.name.clone())
         } else {
-            println!("   {} {}", name.white().bold(), "(invalid .nk file)".red());
+            None
+        };
+
+        let icon = spec_icon(spec.deployment.revision.into());
+
+        // Line 1: icon · name (aligned) · revision · image
+        println!(
+            "   {}  {:<width$}  {}  {}",
+            icon,
+            display.white().bold(),
+            format!("r{}", spec.deployment.revision).yellow(),
+            short_image(&spec.deployment.image).cyan(),
+            width = name_width
+        );
+
+        // Line 2: dimmed metadata — cpu, mem, ports, ipv6; full id appended if available.
+        // Four leading spaces to align under the name (past the icon + its padding).
+        let ports_str = if spec.network.ports.is_empty() {
+            "no ports".to_string()
+        } else {
+            spec.network
+                .ports
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let mut meta = format!(
+            "{} cpu · {} mem · {} · ipv6={}",
+            spec.resources.cpu, spec.resources.memory, ports_str, spec.network.ipv6
+        );
+        if let Some(id) = secondary {
+            meta.push_str(&format!("  ·  {}", id));
+        }
+        println!(
+            "       {:<width$}  {}",
+            "",
+            meta.dimmed(),
+            width = name_width
+        );
+    }
+
+    // Flag invalid .nk files that didn't load.
+    for name in &specs {
+        if !rows.iter().any(|(n, _)| n == name) {
+            println!(
+                "   {}  {} {}",
+                "●".bright_red().bold(),
+                name.white().bold(),
+                "(invalid .nk file)".red()
+            );
         }
     }
 
     println!();
     println!(
-        "   {} nordkraft diff <name>    {}",
+        "   {} {}   {}",
         "→".dimmed(),
-        "Compare spec vs live".dimmed()
+        "nordkraft diff <name>".cyan(),
+        "compare spec vs live".dimmed()
     );
     println!(
-        "   {} nordkraft edit <name>    {}",
+        "   {} {}   {}",
         "→".dimmed(),
-        "Edit spec in $EDITOR".dimmed()
+        "nordkraft edit <name>".cyan(),
+        "open in $EDITOR".dimmed()
+    );
+    println!(
+        "   {} {}   {}",
+        "→".dimmed(),
+        "nordkraft spec-set <name> <key> <val>".cyan(),
+        "edit a field".dimmed()
     );
 
     Ok(())
 }
-
 // ============= PLAN USAGE =============
 
 async fn handle_usage(json_output: bool) -> Result<(), Box<dyn std::error::Error>> {
