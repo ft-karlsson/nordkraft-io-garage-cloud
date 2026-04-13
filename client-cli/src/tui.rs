@@ -74,7 +74,7 @@ struct LogsResponse {
 
 #[derive(Debug, Deserialize)]
 struct ApiResponse {
-    status: Option<String>,
+    // status: Option<String>,
     error: Option<String>,
 }
 
@@ -82,7 +82,7 @@ struct ApiResponse {
 
 #[derive(Debug, Deserialize, Clone)]
 struct IngressRoute {
-    container_id: String,
+    // container_id: String,
     subdomain: String,
     url: String,
     target_port: u16,
@@ -109,6 +109,7 @@ enum BgMsg {
     Ingress(Vec<IngressRoute>),
     IngressFailed(String),
     Logs {
+        #[allow(dead_code)]
         name: String,
         lines: Vec<String>,
     },
@@ -130,7 +131,11 @@ enum BgMsg {
 
 // ─── Cluster Snapshot ────────────────────────────────────────────────────────
 
+/// Snapshot of cluster-wide state shown in the TUI header/footer.
+/// Some fields are populated but not yet surfaced in the UI — they're
+/// reserved for upcoming metrics work (MARK II observability + Energinet).
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 struct ClusterSnapshot {
     garage: String,
     node_count: usize,

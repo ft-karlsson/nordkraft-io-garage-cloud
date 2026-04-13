@@ -57,7 +57,7 @@ impl Spinner {
 
                 tokio::time::sleep(Duration::from_millis(80)).await;
                 tick += 1;
-                if tick % rotate_every == 0 {
+                if tick.is_multiple_of(rotate_every) {
                     msg_idx += 1;
                 }
             }
