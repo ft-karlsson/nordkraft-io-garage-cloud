@@ -22,7 +22,7 @@ fn get_config_dir() -> PathBuf {
         .join(CONFIG_DIR)
 }
 
-fn load_aliases() -> HashMap<String, String> {
+pub(crate) fn load_aliases() -> HashMap<String, String> {
     let path = get_config_dir().join(ALIASES_FILE);
     if path.exists() {
         if let Ok(contents) = std::fs::read_to_string(&path) {
@@ -636,7 +636,7 @@ fn get_deployments_dir() -> PathBuf {
     get_config_dir().join(DEPLOYMENTS_DIR)
 }
 
-fn nk_path(name: &str) -> PathBuf {
+pub(crate) fn nk_path(name: &str) -> PathBuf {
     get_deployments_dir().join(format!("{}.nk", name))
 }
 
@@ -662,7 +662,7 @@ fn load_deployment_spec(name: &str) -> Option<DeploymentSpec> {
     toml::from_str(&contents).ok()
 }
 
-fn list_deployment_specs() -> Vec<String> {
+pub(crate) fn list_deployment_specs() -> Vec<String> {
     let dir = get_deployments_dir();
     if !dir.exists() {
         return vec![];
@@ -850,12 +850,23 @@ fn spec_from_inspect(c: &ContainerInspectResponse) -> DeploymentSpec {
 /// Normalize Docker image names for comparison.
 /// containerd resolves short names: nginx:alpine → docker.io/library/nginx:alpine
 /// This strips the prefix so both sides compare equal.
-fn normalize_image(image: &str) -> String {
-    let s = image
+pub(crate) fn normalize_image(image: &str) -> String {
+    // Resolve `registry://name:tag` shorthand to the fully-qualified private
+    // registry address. This is important for diff: the live container stores
+    // the resolved address (what containerd pulled, e.g.
+    // `172.21.1.3:5001/app:v9`) while the spec typically stores the
+    // shorthand (`registry://app:v9`). Normalizing both sides lets them
+    // compare equal when they're semantically the same image.
+    //
+    // If the registry isn't initialized (so we can't resolve) or the image
+    // isn't a registry:// reference, this is a no-op.
+    let resolved = resolve_registry_image(image).unwrap_or_else(|_| image.to_string());
+    let s = resolved
         .strip_prefix("docker.io/library/")
-        .or_else(|| image.strip_prefix("docker.io/"))
-        .unwrap_or(image);
-    s.to_string()
+        .or_else(|| resolved.strip_prefix("docker.io/"))
+        .unwrap_or(&resolved)
+        .to_string();
+    s
 }
 
 /// Resolve `registry://name:tag` to the user's private registry address.
@@ -1082,7 +1093,7 @@ const CONFIG_DIR: &str = ".nordkraft";
 const ALIASES_FILE: &str = "aliases.json";
 const DEPLOYMENTS_DIR: &str = "deployments";
 const WG_CONFIG_FILE: &str = "wg.conf";
-const WG_INTERFACE: &str = "nordkraft";
+pub(crate) const WG_INTERFACE: &str = "nordkraft";
 const CONNECTION_FILE: &str = "connection.json";
 
 pub(crate) static API_BASE_URL: LazyLock<String> = LazyLock::new(|| {
@@ -1125,22 +1136,22 @@ static PUBLIC_API_URL: LazyLock<String> = LazyLock::new(|| {
 
 // Persisted connection info (written by setup, read by connect/disconnect)
 #[derive(Debug, Deserialize, Serialize)]
-struct ConnectionConfig {
-    user_id: String,
-    full_name: String,
-    email: String,
-    plan_id: String,
-    assigned_garage: String,
-    wireguard_ip: String,
-    server_public_key: String,
-    server_endpoint: String,
-    allowed_ips: Vec<String>,
+pub(crate) struct ConnectionConfig {
+    pub(crate) user_id: String,
+    pub(crate) full_name: String,
+    pub(crate) email: String,
+    pub(crate) plan_id: String,
+    pub(crate) assigned_garage: String,
+    pub(crate) wireguard_ip: String,
+    pub(crate) server_public_key: String,
+    pub(crate) server_endpoint: String,
+    pub(crate) allowed_ips: Vec<String>,
     /// Controller API endpoint via WireGuard. Default: http://172.20.0.254:8001/api
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    api_endpoint: Option<String>,
+    pub(crate) api_endpoint: Option<String>,
     /// Public signup API endpoint. Default: https://cloud.nordkraft.io/api
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    public_api_url: Option<String>,
+    pub(crate) public_api_url: Option<String>,
 }
 
 // Claim API types
@@ -3220,9 +3231,32 @@ async fn handle_edit_interactive(
             if specs.is_empty() {
                 return Err("No .nk specs found. Run 'nordkraft init <container>' first.".into());
             }
+
+            // Build reverse alias map: container_name → alias, so the picker
+            // shows friendly aliases (e.g. "nginx") instead of raw container
+            // IDs (e.g. "app-b0060a56-85f1-44e3-...").
+            let aliases = load_aliases();
+            let reverse_aliases: std::collections::HashMap<&String, &String> =
+                aliases.iter().map(|(alias, name)| (name, alias)).collect();
+
+            let display_items: Vec<String> = specs
+                .iter()
+                .map(|name| match reverse_aliases.get(name) {
+                    Some(alias) => {
+                        let short = if name.len() > 30 {
+                            format!("{}…", &name[..29])
+                        } else {
+                            name.clone()
+                        };
+                        format!("{}  ({})", alias, short)
+                    }
+                    None => name.clone(),
+                })
+                .collect();
+
             let selection = Select::with_theme(&ColorfulTheme::default())
                 .with_prompt("Select spec to edit")
-                .items(&specs)
+                .items(&display_items)
                 .default(0)
                 .interact()?;
             specs[selection].clone()
@@ -5070,7 +5104,7 @@ fn get_connection_config_path() -> PathBuf {
     get_config_dir().join(CONNECTION_FILE)
 }
 
-fn load_connection_config() -> Option<ConnectionConfig> {
+pub(crate) fn load_connection_config() -> Option<ConnectionConfig> {
     let path = get_connection_config_path();
     if path.exists() {
         if let Ok(contents) = std::fs::read_to_string(&path) {
