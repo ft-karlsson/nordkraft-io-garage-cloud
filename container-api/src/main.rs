@@ -115,8 +115,11 @@ impl AppState {
 fn init_pfsense_client() -> Arc<dyn PfSenseClientTrait> {
     let pfsense_url = std::env::var("PFSENSE_API_URL").ok();
     let pfsense_key = std::env::var("PFSENSE_API_KEY").ok();
-    // print key to ensure envs are set
-    println!("{:?}", pfsense_key);
+    // Log whether the key is configured — never log the value itself.
+    info!(
+        "pfSense API key configured: {}",
+        pfsense_key.as_deref().is_some_and(|k| !k.is_empty())
+    );
     let pfsense_interface =
         std::env::var("PFSENSE_WAN_INTERFACE").unwrap_or_else(|_| "wan".to_string());
     let pfsense_verify_ssl = std::env::var("PFSENSE_VERIFY_SSL")
