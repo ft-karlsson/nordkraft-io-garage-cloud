@@ -332,6 +332,379 @@ pub async fn release_tcp_port(
     Ok(())
 }
 
+// ============= CUSTOM DOMAINS (BYO domain) =============
+
+/// One row per verified customer hostname. Mirrors the custom_domains table
+/// (see setup/migration_custom_domains.sql). Driven by the domain_reconciler.
+#[derive(Debug, Clone)]
+pub struct CustomDomainDb {
+    pub id: i32,
+    pub user_id: String,
+    pub container_id: String,
+    pub domain: String,
+    pub target_port: i32,
+    pub status: String,
+    pub verification_token: String,
+    pub dns_check_successes: i32,
+    pub verified_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub degraded_since: Option<chrono::DateTime<chrono::Utc>>,
+    pub cert_refid: Option<String>,
+    pub cert_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub haproxy_backend_name: Option<String>,
+    pub haproxy_acl_name: Option<String>,
+    #[allow(dead_code)] // stored for operability/debugging; not read in code paths
+    pub haproxy_server_name: Option<String>,
+    pub static_route_created: bool,
+    pub target_ip: Option<String>,
+    pub last_checked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_error: Option<String>,
+    pub retry_count: i32,
+    #[allow(dead_code)] // enforced in SQL (get_custom_domains_needing_work)
+    pub next_retry_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+const CUSTOM_DOMAIN_COLUMNS: &str = r#"
+    id, user_id, container_id, domain, target_port, status,
+    verification_token, dns_check_successes, verified_at, degraded_since,
+    cert_refid, cert_expires_at,
+    haproxy_backend_name, haproxy_acl_name, haproxy_server_name,
+    static_route_created, target_ip,
+    last_checked_at, last_error, retry_count, next_retry_at, created_at
+"#;
+
+fn map_custom_domain(r: sqlx::postgres::PgRow) -> CustomDomainDb {
+    CustomDomainDb {
+        id: r.get("id"),
+        user_id: r.get("user_id"),
+        container_id: r.get("container_id"),
+        domain: r.get("domain"),
+        target_port: r.get("target_port"),
+        status: r.get("status"),
+        verification_token: r.get("verification_token"),
+        dns_check_successes: r.get("dns_check_successes"),
+        verified_at: r.get("verified_at"),
+        degraded_since: r.get("degraded_since"),
+        cert_refid: r.get("cert_refid"),
+        cert_expires_at: r.get("cert_expires_at"),
+        haproxy_backend_name: r.get("haproxy_backend_name"),
+        haproxy_acl_name: r.get("haproxy_acl_name"),
+        haproxy_server_name: r.get("haproxy_server_name"),
+        static_route_created: r.get("static_route_created"),
+        target_ip: r.get("target_ip"),
+        last_checked_at: r.get("last_checked_at"),
+        last_error: r.get("last_error"),
+        retry_count: r.get("retry_count"),
+        next_retry_at: r.get("next_retry_at"),
+        created_at: r.get("created_at"),
+    }
+}
+
+/// Insert a new custom domain in pending_dns. The UNIQUE(domain) constraint
+/// is the hard isolation guarantee — a hostname can only ever belong to one
+/// row, hence one user. A constraint violation surfaces as Err.
+pub async fn insert_custom_domain(
+    pool: &PgPool,
+    user_id: &str,
+    container_id: &str,
+    domain: &str,
+    target_port: i32,
+    verification_token: &str,
+) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    let id: i32 = sqlx::query_scalar(
+        r#"
+        INSERT INTO custom_domains (user_id, container_id, domain, target_port, verification_token, status)
+        VALUES ($1, $2, $3, $4, $5, 'pending_dns')
+        RETURNING id
+        "#,
+    )
+    .bind(user_id)
+    .bind(container_id)
+    .bind(domain)
+    .bind(target_port)
+    .bind(verification_token)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(id)
+}
+
+pub async fn get_custom_domain_with_owner(
+    pool: &PgPool,
+    domain: &str,
+    user_id: &str,
+) -> Result<Option<CustomDomainDb>, Box<dyn std::error::Error + Send + Sync>> {
+    let query = format!(
+        "SELECT {} FROM custom_domains WHERE domain = $1 AND user_id = $2",
+        CUSTOM_DOMAIN_COLUMNS
+    );
+    let row = sqlx::query(&query)
+        .bind(domain)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+
+    Ok(row.map(map_custom_domain))
+}
+
+pub async fn custom_domain_exists(
+    pool: &PgPool,
+    domain: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM custom_domains WHERE domain = $1")
+        .bind(domain)
+        .fetch_one(pool)
+        .await?;
+    Ok(count > 0)
+}
+
+pub async fn count_custom_domains_for_user(
+    pool: &PgPool,
+    user_id: &str,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM custom_domains WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(count)
+}
+
+pub async fn list_custom_domains_for_user(
+    pool: &PgPool,
+    user_id: &str,
+) -> Result<Vec<CustomDomainDb>, Box<dyn std::error::Error + Send + Sync>> {
+    let query = format!(
+        "SELECT {} FROM custom_domains WHERE user_id = $1 ORDER BY created_at DESC",
+        CUSTOM_DOMAIN_COLUMNS
+    );
+    let rows = sqlx::query(&query).bind(user_id).fetch_all(pool).await?;
+    Ok(rows.into_iter().map(map_custom_domain).collect())
+}
+
+/// Domains the reconciler should look at this pass:
+/// - anything not disabled whose retry backoff has elapsed, AND
+/// - either not yet active, or active/degraded and due for a periodic re-check.
+pub async fn get_custom_domains_needing_work(
+    pool: &PgPool,
+    active_recheck_seconds: i64,
+) -> Result<Vec<CustomDomainDb>, Box<dyn std::error::Error + Send + Sync>> {
+    let query = format!(
+        r#"
+        SELECT {} FROM custom_domains
+        WHERE status != 'disabled'
+          AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+          AND (
+            status NOT IN ('active')
+            OR last_checked_at IS NULL
+            OR last_checked_at < NOW() - ($1 * INTERVAL '1 second')
+          )
+        ORDER BY id
+        LIMIT 20
+        "#,
+        CUSTOM_DOMAIN_COLUMNS
+    );
+    let rows = sqlx::query(&query)
+        .bind(active_recheck_seconds)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(map_custom_domain).collect())
+}
+
+pub async fn update_custom_domain_status(
+    pool: &PgPool,
+    id: i32,
+    status: &str,
+    last_error: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    sqlx::query(
+        "UPDATE custom_domains SET status = $2, last_error = $3, last_checked_at = NOW() WHERE id = $1",
+    )
+    .bind(id)
+    .bind(status)
+    .bind(last_error)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Record a DNS check outcome. On the 2nd consecutive success the caller
+/// advances the status; on failure the counter resets to zero.
+pub async fn update_custom_domain_dns_progress(
+    pool: &PgPool,
+    id: i32,
+    successes: i32,
+    verified: bool,
+    detail: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if verified {
+        sqlx::query(
+            r#"UPDATE custom_domains
+               SET dns_check_successes = $2, status = 'dns_verified', verified_at = NOW(),
+                   last_error = NULL, last_checked_at = NOW(), retry_count = 0, next_retry_at = NULL
+               WHERE id = $1"#,
+        )
+        .bind(id)
+        .bind(successes)
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query(
+            r#"UPDATE custom_domains
+               SET dns_check_successes = $2, last_error = $3, last_checked_at = NOW()
+               WHERE id = $1"#,
+        )
+        .bind(id)
+        .bind(successes)
+        .bind(detail)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Push the next retry out with exponential backoff and record the error.
+pub async fn schedule_custom_domain_retry(
+    pool: &PgPool,
+    id: i32,
+    retry_count: i32,
+    backoff_seconds: i64,
+    last_error: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    sqlx::query(
+        r#"UPDATE custom_domains
+           SET retry_count = $2, next_retry_at = NOW() + ($3 * INTERVAL '1 second'),
+               last_error = $4, last_checked_at = NOW()
+           WHERE id = $1"#,
+    )
+    .bind(id)
+    .bind(retry_count)
+    .bind(backoff_seconds)
+    .bind(last_error)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn set_custom_domain_cert(
+    pool: &PgPool,
+    id: i32,
+    cert_refid: &str,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    sqlx::query(
+        r#"UPDATE custom_domains
+           SET cert_refid = $2, cert_expires_at = $3, status = 'cert_ready',
+               last_error = NULL, last_checked_at = NOW(), retry_count = 0, next_retry_at = NULL
+           WHERE id = $1"#,
+    )
+    .bind(id)
+    .bind(cert_refid)
+    .bind(expires_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn set_custom_domain_routing(
+    pool: &PgPool,
+    id: i32,
+    backend_name: &str,
+    acl_name: &str,
+    server_name: &str,
+    target_ip: &str,
+    static_route_created: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    sqlx::query(
+        r#"UPDATE custom_domains
+           SET haproxy_backend_name = $2, haproxy_acl_name = $3, haproxy_server_name = $4,
+               target_ip = $5, static_route_created = $6, last_checked_at = NOW()
+           WHERE id = $1"#,
+    )
+    .bind(id)
+    .bind(backend_name)
+    .bind(acl_name)
+    .bind(server_name)
+    .bind(target_ip)
+    .bind(static_route_created)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn mark_custom_domain_active(
+    pool: &PgPool,
+    id: i32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    sqlx::query(
+        r#"UPDATE custom_domains
+           SET status = 'active', degraded_since = NULL, last_error = NULL,
+               retry_count = 0, next_retry_at = NULL, last_checked_at = NOW()
+           WHERE id = $1"#,
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn mark_custom_domain_degraded(
+    pool: &PgPool,
+    id: i32,
+    reason: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    sqlx::query(
+        r#"UPDATE custom_domains
+           SET status = 'degraded',
+               degraded_since = COALESCE(degraded_since, NOW()),
+               last_error = $2, last_checked_at = NOW()
+           WHERE id = $1"#,
+    )
+    .bind(id)
+    .bind(reason)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Is a container-IP static route still needed by anything OTHER than the
+/// given custom-domain row? Static routes are per-container-IP and shared
+/// between platform ingress and custom domains — only remove one when no
+/// sibling still references the same IP.
+pub async fn ip_still_routed(
+    pool: &PgPool,
+    target_ip: &str,
+    exclude_custom_domain_id: i32,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let custom: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM custom_domains
+           WHERE target_ip = $1 AND id != $2 AND status NOT IN ('disabled')"#,
+    )
+    .bind(target_ip)
+    .bind(exclude_custom_domain_id)
+    .fetch_one(pool)
+    .await?;
+
+    let ingress: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ingress_routes WHERE target_ip = $1 AND is_active = true",
+    )
+    .bind(target_ip)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(custom + ingress > 0)
+}
+
+pub async fn delete_custom_domain(
+    pool: &PgPool,
+    id: i32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    sqlx::query("DELETE FROM custom_domains WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Allocate next available container IP from user's subnet
 pub async fn allocate_container_ip(
     pool: &PgPool,

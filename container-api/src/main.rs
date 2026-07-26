@@ -204,6 +204,124 @@ fn init_haproxy_client(_config: &AppConfig) -> Arc<dyn HAProxyClientTrait> {
     }
 }
 
+// ============= CUSTOM DOMAINS INIT =============
+
+struct CustomDomainsInit {
+    routes_config: routes::domains::CustomDomainsConfig,
+    challenge_store: services::acme_manager::ChallengeStore,
+    dns_verifier: Arc<dyn services::dns_verifier::DnsVerifierTrait>,
+    acme_manager: Option<Arc<services::acme_manager::AcmeManager>>,
+    reconciler_settings: services::domain_reconciler::DomainReconcilerSettings,
+    challenge_addr: String,
+}
+
+/// Resolve custom-domain (BYO domain) configuration from the environment.
+/// Enabled only when CUSTOM_DOMAINS_ENABLED=true AND ingress is configured
+/// AND an ACME contact email is set — anything less runs disabled rather
+/// than half-working.
+fn init_custom_domains(config: &AppConfig) -> CustomDomainsInit {
+    let requested = std::env::var("CUSTOM_DOMAINS_ENABLED")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    let ingress_enabled = std::env::var("INGRESS_ENABLED")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    let base_domain =
+        std::env::var("INGRESS_BASE_DOMAIN").unwrap_or_else(|_| "example.dk".to_string());
+    let public_ip =
+        std::env::var("INGRESS_PUBLIC_IP").unwrap_or_else(|_| "203.0.113.1".to_string());
+    let contact_email = std::env::var("ACME_CONTACT_EMAIL").unwrap_or_default();
+    let staging = std::env::var("ACME_STAGING")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    let mut enabled = requested;
+    if requested && !ingress_enabled && !config.dev_mode {
+        error!("❌ CUSTOM_DOMAINS_ENABLED=true requires INGRESS_ENABLED=true — custom domains DISABLED");
+        enabled = false;
+    }
+    if requested && contact_email.is_empty() && !config.dev_mode {
+        error!(
+            "❌ CUSTOM_DOMAINS_ENABLED=true requires ACME_CONTACT_EMAIL — custom domains DISABLED"
+        );
+        enabled = false;
+    }
+
+    let challenge_store = services::acme_manager::ChallengeStore::new();
+
+    let dns_verifier: Arc<dyn services::dns_verifier::DnsVerifierTrait> = if config.dev_mode {
+        Arc::new(services::dns_verifier::DummyDnsVerifier)
+    } else {
+        Arc::new(services::dns_verifier::DnsVerifier::new())
+    };
+
+    let acme_manager = if enabled {
+        Some(Arc::new(services::acme_manager::AcmeManager::new(
+            contact_email,
+            staging,
+            challenge_store.clone(),
+        )))
+    } else {
+        None
+    };
+
+    let max_domains_per_user = std::env::var("CUSTOM_DOMAINS_MAX_PER_USER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+
+    let reconciler_settings = services::domain_reconciler::DomainReconcilerSettings {
+        interval_seconds: std::env::var("CUSTOM_DOMAINS_RECONCILE_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60),
+        public_ip: public_ip.clone(),
+        degraded_grace_days: std::env::var("CUSTOM_DOMAINS_GRACE_DAYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(7),
+        renew_before_days: std::env::var("CUSTOM_DOMAINS_RENEW_BEFORE_DAYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
+        active_recheck_seconds: std::env::var("CUSTOM_DOMAINS_RECHECK_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(86_400),
+    };
+
+    // Where HAProxy forwards ACME HTTP-01 challenges: container-api's own
+    // Rocket listener, reachable from pfSense via the controller's LAN/VPN IP.
+    let challenge_addr = std::env::var("CUSTOM_DOMAINS_CHALLENGE_ADDR")
+        .unwrap_or_else(|_| format!("{}:{}", config.controller_internal_ip, config.bind_port));
+
+    if enabled {
+        info!(
+            "🌍 Custom domains enabled (ACME: {}, max/user: {}, challenge addr: {})",
+            if staging { "STAGING" } else { "production" },
+            max_domains_per_user,
+            challenge_addr
+        );
+    } else {
+        info!("🌍 Custom domains disabled");
+    }
+
+    CustomDomainsInit {
+        routes_config: routes::domains::CustomDomainsConfig {
+            enabled,
+            max_domains_per_user,
+            public_ip,
+            base_domain,
+        },
+        challenge_store,
+        dns_verifier,
+        acme_manager,
+        reconciler_settings,
+        challenge_addr,
+    }
+}
+
 // ============= AGENT NETWORK SETUP =============
 
 /// Ensure agent has all necessary routes for VPN traffic
@@ -896,6 +1014,48 @@ async fn rocket() -> _ {
     }
 
     // =========================================================
+    // CUSTOM DOMAINS (BYO domain) — controller/hybrid only
+    // 1. Bootstrap the shared ACME challenge routing on HAProxy
+    //    (idempotent; safe on every boot).
+    // 2. Spawn the domain reconciler state machine.
+    // =========================================================
+    let custom_domains = init_custom_domains(&config);
+
+    if custom_domains.routes_config.enabled
+        && matches!(
+            config.mode,
+            config::OperationMode::Controller | config::OperationMode::Hybrid
+        )
+    {
+        match haproxy_client
+            .ensure_acme_challenge_route(&custom_domains.challenge_addr)
+            .await
+        {
+            Ok(_) => info!("✅ ACME challenge routing bootstrapped"),
+            Err(e) => {
+                // Don't crash the API — domains simply stay pending until
+                // the reconciler's next activation attempt or a restart.
+                error!(
+                    "❌ ACME challenge bootstrap failed (custom domains will not activate until this is fixed): {}",
+                    e
+                );
+            }
+        }
+
+        if let Some(acme_manager) = &custom_domains.acme_manager {
+            let reconciler = Arc::new(services::domain_reconciler::DomainReconciler::new(
+                db_pool.clone(),
+                Arc::clone(&haproxy_client),
+                Arc::clone(&pfsense_client),
+                Arc::clone(&custom_domains.dns_verifier),
+                Arc::clone(acme_manager),
+                custom_domains.reconciler_settings.clone(),
+            ));
+            reconciler.start();
+        }
+    }
+
+    // =========================================================
     // AGENT-SPECIFIC SETUP - CRITICAL FOR REBOOT SURVIVAL
     // =========================================================
 
@@ -942,7 +1102,10 @@ async fn rocket() -> _ {
         .manage(haproxy_client)
         .manage(macvlan_manager)
         .manage(event_store)
-        .manage(db_pool);
+        .manage(db_pool)
+        .manage(custom_domains.routes_config)
+        .manage(custom_domains.challenge_store)
+        .manage(custom_domains.dns_verifier);
 
     // Mount routes based on mode
     match config.mode {
@@ -955,47 +1118,58 @@ async fn rocket() -> _ {
         }
         _ => {
             // Controller/Hybrid: full functionality
-            rocket.mount(
-                "/api",
-                routes![
-                    // Container operations
-                    routes::containers::deploy_container,
-                    routes::containers::list_containers_route,
-                    routes::containers::delete_container,
-                    routes::containers::start_container,
-                    routes::containers::stop_container,
-                    routes::containers::get_container_logs,
-                    routes::containers::inspect_container,
-                    routes::containers::get_container_config_route,
-                    routes::containers::upgrade_container,
-                    // Node operations
-                    routes::nodes::list_nodes,
-                    routes::nodes::register_node,
-                    // Status & auth
-                    routes::status::get_status,
-                    routes::status::verify_auth,
-                    routes::status::get_network_info,
-                    // IPv6 firewall management
-                    routes::ipv6::open_ipv6_firewall,
-                    routes::ipv6::close_ipv6_firewall,
-                    routes::ipv6::get_ipv6_status,
-                    routes::ipv6::list_ipv6_allocations,
-                    routes::ipv6::update_ipv6_ports,
-                    // Ingress routes (HAProxy + ACME)
-                    routes::ingress::enable_ingress,
-                    routes::ingress::disable_ingress,
-                    routes::ingress::get_ingress_status,
-                    routes::ingress::list_ingress,
-                    // Admin endpoints (signup-api → container-api provisioning)
-                    admin_provision_tenant,
-                    admin_deprovision_tenant,
-                    admin_tenants_status,
-                    // usage
-                    routes::containers::get_usage,
-                    // Deploy lifecycle events
-                    routes::events::get_events,
-                ],
-            )
+            rocket
+                .mount(
+                    "/api",
+                    routes![
+                        // Container operations
+                        routes::containers::deploy_container,
+                        routes::containers::list_containers_route,
+                        routes::containers::delete_container,
+                        routes::containers::start_container,
+                        routes::containers::stop_container,
+                        routes::containers::get_container_logs,
+                        routes::containers::inspect_container,
+                        routes::containers::get_container_config_route,
+                        routes::containers::upgrade_container,
+                        // Node operations
+                        routes::nodes::list_nodes,
+                        routes::nodes::register_node,
+                        // Status & auth
+                        routes::status::get_status,
+                        routes::status::verify_auth,
+                        routes::status::get_network_info,
+                        // IPv6 firewall management
+                        routes::ipv6::open_ipv6_firewall,
+                        routes::ipv6::close_ipv6_firewall,
+                        routes::ipv6::get_ipv6_status,
+                        routes::ipv6::list_ipv6_allocations,
+                        routes::ipv6::update_ipv6_ports,
+                        // Ingress routes (HAProxy + ACME)
+                        routes::ingress::enable_ingress,
+                        routes::ingress::disable_ingress,
+                        routes::ingress::get_ingress_status,
+                        routes::ingress::list_ingress,
+                        // Custom domains (BYO domain)
+                        routes::domains::add_domain,
+                        routes::domains::domain_status,
+                        routes::domains::verify_domain_now,
+                        routes::domains::list_domains,
+                        routes::domains::remove_domain,
+                        // Admin endpoints (signup-api → container-api provisioning)
+                        admin_provision_tenant,
+                        admin_deprovision_tenant,
+                        admin_tenants_status,
+                        // usage
+                        routes::containers::get_usage,
+                        // Deploy lifecycle events
+                        routes::events::get_events,
+                    ],
+                )
+                // ACME HTTP-01 challenge — must live at the root path because
+                // Let's Encrypt always requests /.well-known/acme-challenge/…
+                // (reached via the HAProxy path ACL, see haproxy_client).
+                .mount("/", routes![routes::domains::acme_challenge])
         }
     }
 }

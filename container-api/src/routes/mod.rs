@@ -1,5 +1,6 @@
 // routes/mod.rs
 pub mod containers;
+pub mod domains;
 pub mod events;
 pub mod ingress;
 pub mod ipv6;

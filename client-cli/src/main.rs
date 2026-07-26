@@ -99,6 +99,11 @@ enum Commands {
         #[command(subcommand)]
         command: IngressCommands,
     },
+    /// Use your own domain (e.g. customer1.net) with a container
+    Domain {
+        #[command(subcommand)]
+        command: DomainCommands,
+    },
     /// IPv6 direct access (global addresses)
     Ipv6 {
         #[command(subcommand)]
@@ -421,6 +426,44 @@ enum IngressCommands {
     /// List all your ingress routes
     #[command(alias = "ls")]
     List,
+}
+
+// ============= DOMAIN COMMANDS =============
+
+#[derive(Subcommand)]
+enum DomainCommands {
+    /// Register your own domain for a container (returns DNS instructions)
+    Add {
+        /// Your domain or hostname (e.g. customer1.net or www.customer1.net)
+        domain: String,
+        /// Container name, ID, or alias
+        #[arg(short, long)]
+        container: String,
+        /// Container port to forward decrypted HTTPS traffic to (default: 80)
+        #[arg(short, long, default_value = "80")]
+        port: u16,
+    },
+    /// Show verification/TLS/routing progress for a domain
+    Status {
+        /// The domain to inspect
+        domain: String,
+    },
+    /// Ask the platform to re-check DNS records right away
+    Verify {
+        /// The domain to verify
+        domain: String,
+    },
+    /// List all your custom domains
+    #[command(alias = "ls")]
+    List,
+    /// Remove a custom domain (tears down routing + certificate)
+    Remove {
+        /// The domain to remove
+        domain: String,
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+    },
 }
 
 // ============= IPV6 COMMANDS =============
@@ -1544,6 +1587,7 @@ async fn main() {
         Commands::Auth { command } => handle_auth(command, json_output).await,
         Commands::Container { command } => handle_container(command, json_output).await,
         Commands::Ingress { command } => handle_ingress(command, json_output).await,
+        Commands::Domain { command } => handle_domain(command, json_output).await,
         Commands::Ipv6 { command } => handle_ipv6(command, json_output).await,
         Commands::Network { command } => handle_network(command, json_output).await,
         Commands::Nodes => handle_nodes(json_output).await,
@@ -4145,6 +4189,303 @@ async fn handle_ingress(
     Ok(())
 }
 
+// ============= DOMAIN HANDLERS =============
+
+/// Pretty-print the DNS instructions block returned by the API.
+fn print_dns_instructions(instructions: &serde_json::Value) {
+    let get = |key: &str| {
+        instructions
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    println!();
+    println!("   {}", "Add these records at your DNS provider:".bold());
+    println!();
+    println!(
+        "   {}  {}",
+        "TXT".cyan().bold(),
+        get("txt_record_name").white()
+    );
+    println!("        value: {}", get("txt_record_value").yellow());
+    println!();
+    println!(
+        "   {}    {}",
+        "A".cyan().bold(),
+        get("a_record_name").white()
+    );
+    println!("        value: {}", get("a_record_value").yellow());
+    if !get("cname_alternative").is_empty() {
+        println!("        ({})", get("cname_alternative").dimmed());
+    }
+    println!();
+    if !get("note").is_empty() {
+        println!("   {}", get("note").dimmed());
+    }
+}
+
+fn domain_status_color(status: &str) -> colored::ColoredString {
+    match status {
+        "active" => status.green().bold(),
+        "degraded" | "error" => status.red().bold(),
+        "disabled" => status.dimmed(),
+        _ => status.yellow(),
+    }
+}
+
+async fn handle_domain(
+    command: DomainCommands,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = create_client()?;
+
+    match command {
+        DomainCommands::Add {
+            domain,
+            container,
+            port,
+        } => {
+            let container = resolve_alias(&container);
+            if !json_output {
+                println!(
+                    "{}",
+                    format!("🌍 Registering {} for {}...", domain, container).cyan()
+                );
+            }
+
+            let url = format!("{}/domains/add", *API_BASE_URL);
+            let response = client
+                .post(&url)
+                .json(&serde_json::json!({
+                    "domain": domain,
+                    "container_id": container,
+                    "target_port": port,
+                }))
+                .send()
+                .await?;
+
+            let result: serde_json::Value = response.json().await?;
+            if let Some(error) = result.get("error").and_then(|v| v.as_str()) {
+                return Err(error.to_string().into());
+            }
+
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                let normalized = result
+                    .get("domain")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&domain);
+                println!("{}", "✅ Domain registered!".green().bold());
+                if let Some(instructions) = result.get("dns_instructions") {
+                    print_dns_instructions(instructions);
+                }
+                println!();
+                println!(
+                    "   Track progress: {}",
+                    format!("nordkraft domain status {}", normalized)
+                        .white()
+                        .bold()
+                );
+            }
+        }
+
+        DomainCommands::Status { domain } => {
+            let url = format!("{}/domains/{}/status", *API_BASE_URL, domain);
+            let response = client.get(&url).send().await?;
+            let result: serde_json::Value = response.json().await?;
+
+            if let Some(error) = result.get("error").and_then(|v| v.as_str()) {
+                return Err(error.to_string().into());
+            }
+
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                let status = result.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                println!("{}", format!("🌍 {}", domain).cyan().bold());
+                println!();
+                println!("   {} {}", "Status:".cyan(), domain_status_color(status));
+                if let Some(explanation) = result.get("explanation").and_then(|v| v.as_str()) {
+                    println!("   {}", explanation.dimmed());
+                }
+                if status == "active" {
+                    if let Some(url) = result.get("url").and_then(|v| v.as_str()) {
+                        println!();
+                        println!("   {} {}", "URL:".cyan(), url.white().bold());
+                    }
+                    if let Some(expires) = result.get("cert_expires_at").and_then(|v| v.as_str()) {
+                        println!("   {} valid until {} (auto-renews)", "TLS:".cyan(), expires);
+                    }
+                }
+                if let Some(last_error) = result.get("last_error").and_then(|v| v.as_str()) {
+                    println!();
+                    println!("   {} {}", "Last check:".cyan(), last_error.yellow());
+                }
+                if status == "pending_dns" {
+                    if let Some(instructions) = result.get("dns_instructions") {
+                        print_dns_instructions(instructions);
+                        println!();
+                        println!(
+                            "   Re-check now: {}",
+                            format!("nordkraft domain verify {}", domain).white()
+                        );
+                    }
+                }
+            }
+        }
+
+        DomainCommands::Verify { domain } => {
+            if !json_output {
+                println!("{}", format!("🔍 Checking DNS for {}...", domain).cyan());
+            }
+
+            let url = format!("{}/domains/{}/verify", *API_BASE_URL, domain);
+            let response = client.post(&url).send().await?;
+            let result: serde_json::Value = response.json().await?;
+
+            if let Some(error) = result.get("error").and_then(|v| v.as_str()) {
+                return Err(error.to_string().into());
+            }
+
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                let txt_ok = result
+                    .get("txt_record_found")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let a_ok = result
+                    .get("a_record_points_here")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let mark = |ok: bool| if ok { "✓".green() } else { "✗".red() };
+                println!();
+                println!("   {} TXT verification record", mark(txt_ok));
+                println!("   {} A/CNAME points at the platform", mark(a_ok));
+                if let Some(detail) = result.get("detail").and_then(|v| v.as_str()) {
+                    println!();
+                    println!("   {}", detail.dimmed());
+                }
+                println!();
+                if txt_ok && a_ok {
+                    println!(
+                        "{}",
+                        "✅ Records look good — activation continues automatically (TLS issuance takes a few minutes)."
+                            .green()
+                    );
+                } else {
+                    println!(
+                        "{}",
+                        "DNS changes can take a while to propagate — try again in a few minutes."
+                            .yellow()
+                    );
+                }
+            }
+        }
+
+        DomainCommands::List => {
+            let url = format!("{}/domains/list", *API_BASE_URL);
+            let response = client.get(&url).send().await?;
+            let result: serde_json::Value = response.json().await?;
+
+            if let Some(error) = result.get("error").and_then(|v| v.as_str()) {
+                return Err(error.to_string().into());
+            }
+
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                return Ok(());
+            }
+
+            let empty = vec![];
+            let domains = result
+                .get("domains")
+                .and_then(|v| v.as_array())
+                .unwrap_or(&empty);
+
+            if domains.is_empty() {
+                println!("{}", "No custom domains configured.".yellow());
+                println!("   Add one: nordkraft domain add customer1.net --container <name>");
+            } else {
+                println!(
+                    "{}",
+                    format!("🌍 {} custom domain(s):", domains.len())
+                        .green()
+                        .bold()
+                );
+                println!();
+                for d in domains {
+                    let name = d.get("domain").and_then(|v| v.as_str()).unwrap_or("?");
+                    let status = d.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                    let container = d
+                        .get("container_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    let port = d.get("target_port").and_then(|v| v.as_i64()).unwrap_or(80);
+                    println!(
+                        "   {} [{}]",
+                        name.cyan().bold(),
+                        domain_status_color(status)
+                    );
+                    println!("     Container: {} | Port: {}", container.dimmed(), port);
+                    if let Some(last_error) = d.get("last_error").and_then(|v| v.as_str()) {
+                        if status != "active" {
+                            println!("     {}", last_error.yellow());
+                        }
+                    }
+                    println!();
+                }
+            }
+        }
+
+        DomainCommands::Remove { domain, yes } => {
+            if !yes && !json_output {
+                let confirmed = Confirm::with_theme(&ColorfulTheme::default())
+                    .with_prompt(format!(
+                        "Remove {} ? Routing and its TLS certificate will be torn down.",
+                        domain
+                    ))
+                    .default(false)
+                    .interact()?;
+                if !confirmed {
+                    println!("Cancelled.");
+                    return Ok(());
+                }
+            }
+
+            if !json_output {
+                println!("{}", format!("🗑️ Removing {}...", domain).cyan());
+            }
+
+            let url = format!("{}/domains/{}", *API_BASE_URL, domain);
+            let response = client.delete(&url).send().await?;
+            let result: serde_json::Value = response.json().await?;
+
+            if let Some(error) = result.get("error").and_then(|v| v.as_str()) {
+                return Err(error.to_string().into());
+            }
+
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("{} Domain removed", "✅".green().bold());
+                if let Some(warnings) = result.get("warnings").and_then(|v| v.as_array()) {
+                    for w in warnings {
+                        if let Some(w) = w.as_str() {
+                            println!("   {} {}", "warning:".yellow(), w);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ============= IPV6 HANDLERS =============
 
 async fn handle_ipv6(
@@ -5906,6 +6247,16 @@ fn show_help() {
     println!("   nordkraft ingress disable <name>            Disable ingress");
     println!("   nordkraft ingress status <name>             Show ingress status");
     println!("   nordkraft ingress list                      List all routes");
+    println!();
+
+    println!("{}", "CUSTOM DOMAINS (your own domain):".yellow().bold());
+    println!(
+        "   nordkraft domain add customer1.net -c <name>  Use your own domain for a container"
+    );
+    println!("   nordkraft domain status customer1.net         Show verification/TLS progress");
+    println!("   nordkraft domain verify customer1.net         Re-check DNS records now");
+    println!("   nordkraft domain list                         List your custom domains");
+    println!("   nordkraft domain remove customer1.net         Remove domain + certificate");
     println!();
 
     println!("{}", "IPV6 DIRECT ACCESS:".yellow().bold());
