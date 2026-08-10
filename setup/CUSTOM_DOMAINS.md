@@ -70,14 +70,22 @@ refid + expiry.
 
 1. Working platform ingress per [INGRESS_PFSENSE.md](INGRESS_PFSENSE.md)
    (frontends, wildcard cert, REST API v2).
-2. **Spike checklist below verified once on your pfSense box** (two endpoint
-   shapes could differ between REST API package versions).
-3. Port 80 open — Let's Encrypt HTTP-01 validation arrives there.
+2. Port 80 open — Let's Encrypt HTTP-01 validation arrives there.
 
-## Spike checklist (run once before first deploy)
+## API surface verification (done — optional re-check)
 
-The custom-domain code uses two pfSense REST API v2 surfaces that were not
-exercised by the existing ingress code. Verify both against your Netgate
+The two REST API v2 surfaces the custom-domain code depends on have been
+**confirmed against the official OpenAPI spec (pfrest.org) and the package
+source**:
+
+- `POST /api/v2/system/certificate` — fields `descr`, `type` (`server`),
+  `crt`, `prv`; `crt`/`prv` are `Base64Field`s (base64-encoded PEM — what
+  the code sends); response carries `data.refid`.
+- `POST/DELETE /api/v2/services/haproxy/frontend/certificate` — child object
+  with `parent_id` + `ssl_certificate` (cert refid); the frontend's
+  additional-certs array is `ha_certificates`.
+
+If you ever upgrade the REST API package and want to re-verify by hand
 (replace key/host):
 
 ```bash

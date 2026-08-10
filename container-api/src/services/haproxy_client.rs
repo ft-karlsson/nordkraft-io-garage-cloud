@@ -604,11 +604,13 @@ impl HAProxyClient {
 
     // ============= CUSTOM DOMAIN HELPERS =============
     //
-    // NOTE on endpoint/field names for frontend certificate binding:
-    // the child-object pattern mirrors /frontend/acl and /frontend/action.
-    // Verify once on your pfSense box with the spike checklist in
-    // setup/CUSTOM_DOMAINS.md; if the field differs, adjust the two
-    // constants below — nothing else references them.
+    // Endpoint/field names for frontend certificate binding are CONFIRMED
+    // against the pfSense REST API v2 OpenAPI spec (pfrest.org):
+    //   POST/DELETE /api/v2/services/haproxy/frontend/certificate
+    //   HAProxyFrontendCertificate.ssl_certificate = cert refid
+    //   HAProxyFrontend.ha_certificates = additional-certs array
+    // If a future package version renames them, adjust the two constants
+    // below — nothing else references them.
     const FRONTEND_CERT_ENDPOINT: &'static str = "/api/v2/services/haproxy/frontend/certificate";
     const FRONTEND_CERT_FIELD: &'static str = "ssl_certificate";
 
@@ -1004,8 +1006,12 @@ impl HAProxyClientTrait for HAProxyClient {
         use base64::Engine;
         let engine = base64::engine::general_purpose::STANDARD;
 
+        // Fields per pfSense REST API v2 Certificate model: crt/prv are
+        // Base64Fields (base64-encoded PEM); type "server" marks the cert as
+        // usable by services (it is also the API default — set explicitly).
         let request = serde_json::json!({
             "descr": name,
+            "type": "server",
             "crt": engine.encode(cert_chain_pem),
             "prv": engine.encode(private_key_pem),
         });
