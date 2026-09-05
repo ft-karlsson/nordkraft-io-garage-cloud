@@ -13,10 +13,10 @@ Velkommen til dokumentationen for nordkraft.io Garage Cloud - en dansk open sour
     - ✅ **Deklarative deployments** - `.nk` specs med `diff` og `upgrade` fra CLI'en
     - ✅ **Privat image-registry** - `nordkraft push` og `registry://` i dine deploys
     - ✅ **Genskab din opsætning** - `nordkraft init --from-server` henter specs fra serveren
-    - ✅ **Rigtige ressourcegrænser** - aflæst fra runtime, ikke gættet
+    - ✅ **Rigtige ressourcegrænser** - aflæst fra runtime, ingen gætværk :)
     - ✅ **Aliaser** - korte navne i stedet for UUID'er
-    - ✅ **Robust installation** - virker på en frisk maskine uden håndholdning
-    - ✅ **Samlet dokumentation** - bor nu sammen med koden, inkl. guide til maskinskifte
+    - ✅ **Robust installation** - virker på en frisk computer (uden lag)
+    - ✅ **Samlet dokumentation** - bor nu sammen med koden, inkl. guide til skift af computer
 
     Se hele listen i [Hvad er nyt](changelog.md).
     
