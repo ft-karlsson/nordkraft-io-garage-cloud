@@ -1,0 +1,104 @@
+site_name: NordKraft Docs
+site_url: https://docs.nordkraft.io
+site_description: Documentation for NordKraft Garage Cloud - Simple. Green. Secure.
+site_author: NordKraft.io
+
+repo_url: https://github.com/ft-karlsson/nordkraft-io-garage-cloud
+repo_name: ft-karlsson/nordkraft-io-garage-cloud
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  language: da
+  palette:
+    - scheme: slate
+      primary: green
+      accent: light green
+      toggle:
+        icon: material/brightness-4
+        name: Skift til lys tilstand
+    - scheme: default
+      primary: green
+      accent: light green
+      toggle:
+        icon: material/brightness-7
+        name: Skift til mørk tilstand
+  font:
+    text: Inter
+    code: JetBrains Mono
+  logo: assets/nk_icon.png
+  favicon: assets/nk_icon.png
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+
+nav:
+  - Hjem: index.md
+  - Kom i gang:
+    - Din første container: getting-started.md
+    - Installation: installation.md
+  - Guides:
+    - Deploy din egen app: guides/webapp.md
+    - Chat-server (Campfire / Mattermost): guides/chat.md
+    - Overvågning (Uptime Kuma): guides/monitoring.md
+    - Databaser: guides/databases.md
+    - Environment variabler: guides/environment.md
+    - Persistent storage: guides/storage.md
+    - Custom domæner: guides/domains.md
+  - Reference:
+    - CLI kommandoer: reference/cli.md
+    - API: reference/api.md
+    - NordKraft til AI-assistenter: reference/llm.md
+  - Koncepter:
+    - Hvordan virker det?: concepts/how-it-works.md
+    - Sikkerhed: concepts/security.md
+    - Netværk: concepts/networking.md
+  - Troubleshooting:
+    - Ny maskine / mistet config: troubleshooting/recovery.md
+    - Kendte problemer: troubleshooting/known-issues.md
+    - VPN problemer: troubleshooting/vpn.md
+    - Container fejl: troubleshooting/containers.md
+    - FAQ: troubleshooting/faq.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - attr_list
+  - md_in_html
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search:
+      lang: da
+  - minify:
+      minify_html: true
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/ft-karlsson/nordkraft-io-garage-cloud
+    - icon: fontawesome/solid/envelope
+      link: mailto:frederikkarlsson@me.com
+  generator: false
+
+extra_css:
+  - stylesheets/extra.css
+
+copyright: Copyright &copy; 2026 NordKraft.io - Bygget på genbrugt hardware i Danmark 🇩🇰
