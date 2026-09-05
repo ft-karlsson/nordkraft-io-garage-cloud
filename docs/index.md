@@ -19,6 +19,16 @@ Velkommen til dokumentationen for nordkraft.io Garage Cloud - en dansk open sour
     - ✅ **Multi-node orchestration** - NATS-baseret message passing
     
     
+!!! tip "Nyt siden Mark I"
+    Platformen har ikke stået stille siden januar:
+
+    - **Deklarative deployments** — beskriv din container i en `.nk` spec og kør `diff` og `upgrade` fra CLI'en
+    - **Privat image-registry** — `nordkraft push` og `registry://` direkte i dine deploys
+    - **Genskab din opsætning** — `nordkraft init --from-server` bygger dine specs ud fra serveren
+    - Mere robust installation, opdatering og fejlfinding
+
+    Se hele listen i [Hvad er nyt](changelog.md).
+
 ---
 
 ## Hvad er så en Garage Cloud?
