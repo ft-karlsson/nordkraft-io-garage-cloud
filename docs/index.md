@@ -7,18 +7,6 @@ Velkommen til dokumentationen for nordkraft.io Garage Cloud - en dansk open sour
 !!! note "Under udvikling"
     Platformen er stadig under aktiv udvikling og signup kun tilgængelig via invitation - smid mig en mail hvis du er interesseret
     
-!!! success "Mark I Testing færdig (January 2026)"
-    Kernefeatures er testet og virker:
-    
-    - ✅ **Zero-trust authentication** - WireGuard VPN integration
-    - ✅ **Kata VM isolation** - Hardware-level container security
-    - ✅ **Dual-stack networking** - IPv4 + IPv6 via SLAAC
-    - ✅ **Persistent storage** - Data overlever genstart (lidt sjovere)
-    - ✅ **HTTPS ingress** - Automatisk Let's Encrypt TLS
-    - ✅ **Environment variables** - Fuld konfiguration support
-    - ✅ **Multi-node orchestration** - NATS-baseret message passing
-    
-    
 !!! success "Mark I ½ færdig (September 2026)"
     Ikke Mark II endnu — men listen er blevet længere:
 
@@ -31,6 +19,18 @@ Velkommen til dokumentationen for nordkraft.io Garage Cloud - en dansk open sour
     - ✅ **Samlet dokumentation** - bor nu sammen med koden, inkl. guide til maskinskifte
 
     Se hele listen i [Hvad er nyt](changelog.md).
+    
+    
+!!! success "Mark I Testing færdig (January 2026)"
+    Kernefeatures er testet og virker:
+    
+    - ✅ **Zero-trust authentication** - WireGuard VPN integration
+    - ✅ **Kata VM isolation** - Hardware-level container security
+    - ✅ **Dual-stack networking** - IPv4 + IPv6 via SLAAC
+    - ✅ **Persistent storage** - Data overlever genstart (lidt sjovere)
+    - ✅ **HTTPS ingress** - Automatisk Let's Encrypt TLS
+    - ✅ **Environment variables** - Fuld konfiguration support
+    - ✅ **Multi-node orchestration** - NATS-baseret message passing
 
 ---
 
