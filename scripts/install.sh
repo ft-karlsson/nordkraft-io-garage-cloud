@@ -17,26 +17,34 @@ BINARY_NAME="nordkraft"
 BASE_URL="https://github.com/${GITHUB_REPO}/releases/latest/download"
 INVITE_TOKEN=""
 
+# Print with escape sequences interpreted.
+# NOT `echo -e`: the documented one-liner pipes this script into `sh`, which
+# ignores the shebang above. macOS /bin/sh is bash in POSIX mode, where echo
+# has no -e flag and prints it literally. printf behaves the same everywhere.
+say() {
+    printf '%b\n' "$1"
+}
+
 # Banner
-echo -e "${CYAN}🚀 Nordkraft CLI Installer${NC}"
-echo -e "${CYAN}Zero-Trust Container Cloud${NC}"
+say "${CYAN}🚀 Nordkraft CLI Installer${NC}"
+say "${CYAN}Zero-Trust Container Cloud${NC}"
 echo ""
 
 # Function to print colored output
 print_status() {
-    echo -e "${GREEN}✓${NC} $1"
+    say "${GREEN}✓${NC} $1"
 }
 
 print_warning() {
-    echo -e "${YELLOW}⚠${NC} $1"
+    say "${YELLOW}⚠${NC} $1"
 }
 
 print_error() {
-    echo -e "${RED}✗${NC} $1" >&2
+    say "${RED}✗${NC} $1" >&2
 }
 
 print_info() {
-    echo -e "${BLUE}ℹ${NC} $1"
+    say "${BLUE}ℹ${NC} $1"
 }
 
 # Function to detect OS and architecture
@@ -160,13 +168,26 @@ install_nordkraft() {
     
     chmod +x "$binary_path"
     
-    # Install
-    if [ -w "${INSTALL_DIR}" ]; then
-        cp "$binary_path" "${INSTALL_DIR}/${BINARY_NAME}"
+    # Install.
+    # A fresh Apple Silicon Mac has no /usr/local/bin at all (Homebrew lives in
+    # /opt/homebrew), so the directory must be created before anything is copied
+    # into it — otherwise cp fails with ENOENT on the destination.
+    if [ -d "${INSTALL_DIR}" ] && [ -w "${INSTALL_DIR}" ]; then
+        install -m 755 "$binary_path" "${INSTALL_DIR}/${BINARY_NAME}"
     else
         print_warning "Need sudo to install to ${INSTALL_DIR}"
-        sudo cp "$binary_path" "${INSTALL_DIR}/${BINARY_NAME}"
-        sudo chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+        if ! command_exists sudo; then
+            print_error "sudo not available and ${INSTALL_DIR} is not writable"
+            exit 1
+        fi
+        if ! sudo mkdir -p "${INSTALL_DIR}"; then
+            print_error "Could not create ${INSTALL_DIR}"
+            exit 1
+        fi
+        if ! sudo install -m 755 "$binary_path" "${INSTALL_DIR}/${BINARY_NAME}"; then
+            print_error "Could not install to ${INSTALL_DIR}/${BINARY_NAME}"
+            exit 1
+        fi
     fi
     
     # Cleanup
@@ -183,6 +204,8 @@ verify_installation() {
         return 0
     else
         print_error "Verification failed - nordkraft not found in PATH"
+        print_info "The binary is at ${INSTALL_DIR}/${BINARY_NAME} — add it to your PATH:"
+        print_info "  echo 'export PATH=\"${INSTALL_DIR}:\$PATH\"' >> ~/.zshrc && source ~/.zshrc"
         return 1
     fi
 }
@@ -190,18 +213,18 @@ verify_installation() {
 # Function to show next steps
 show_next_steps() {
     echo ""
-    echo -e "${GREEN}🎉 Installation Complete!${NC}"
+    say "${GREEN}🎉 Installation Complete!${NC}"
     echo ""
 
     if [ -n "${INVITE_TOKEN}" ]; then
-        echo -e "${CYAN}Running setup with your invite token...${NC}"
+        say "${CYAN}Running setup with your invite token...${NC}"
         echo ""
         nordkraft setup "${INVITE_TOKEN}"
     else
-        echo -e "${CYAN}Next step:${NC}"
+        say "${CYAN}Next step:${NC}"
         echo "  Run the setup command from your signup page:"
         echo ""
-        echo -e "   ${YELLOW}nordkraft setup NKINVITE-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx${NC}"
+        say "   ${YELLOW}nordkraft setup NKINVITE-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx${NC}"
         echo ""
         echo "  This will configure WireGuard and connect you automatically."
         echo ""
@@ -232,14 +255,14 @@ main() {
             # Already installed but got a token — skip install, run setup
             install_wireguard_tools
             echo ""
-            echo -e "${CYAN}Running setup with your invite token...${NC}"
+            say "${CYAN}Running setup with your invite token...${NC}"
             echo ""
             nordkraft setup "${INVITE_TOKEN}"
             exit 0
         else
             echo ""
-            echo -e "${CYAN}To update to latest version:${NC}"
-            echo -e "   ${YELLOW}nordkraft update${NC}"
+            say "${CYAN}To update to latest version:${NC}"
+            say "   ${YELLOW}nordkraft update${NC}"
             echo ""
             exit 0
         fi
@@ -256,6 +279,6 @@ main() {
     fi
 }
 
-trap 'echo -e "\n${RED}Cancelled${NC}"; exit 1' INT
+trap 'say "\n${RED}Cancelled${NC}"; exit 1' INT
 
 main "$@"
