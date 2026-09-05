@@ -5176,6 +5176,53 @@ PersistentKeepalive = 25"#
     Ok(path)
 }
 
+/// Build a `sudo wg-quick <action> <interface>` command.
+///
+/// On macOS wg-quick(8) is `#!/usr/bin/env bash` and refuses bash < 4, while the
+/// system bash at /bin/bash is 3.2 and will stay there (Apple froze it at the
+/// last GPLv2 release). Homebrew's bash therefore has to win the PATH lookup that
+/// happens *inside* the script, and sudo may drop the Homebrew prefix from PATH
+/// altogether (secure_path), which would hide wg-quick itself. Pin PATH for the
+/// child process so neither lookup depends on how the user's shell is ordered.
+fn wg_quick_command(action: &str) -> std::process::Command {
+    use std::process::Command;
+
+    let mut cmd = Command::new("sudo");
+
+    if cfg!(target_os = "macos") {
+        let brew_bin = Command::new("brew")
+            .arg("--prefix")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| format!("{}/bin", String::from_utf8_lossy(&o.stdout).trim()))
+            .unwrap_or_else(|| "/opt/homebrew/bin".to_string());
+        cmd.args(["env", &format!("PATH={brew_bin}:/usr/local/bin:/usr/bin:/bin")]);
+    }
+
+    cmd.args(["wg-quick", action, WG_INTERFACE]);
+    cmd
+}
+
+/// Turn wg-quick's raw stderr into something the user can act on.
+fn explain_wg_quick_error(stderr: &str) -> String {
+    let stderr = stderr.trim();
+
+    if stderr.contains("bash 4+ required") || stderr.contains("Version mismatch") {
+        return format!(
+            "{stderr}\n   → wg-quick requires bash 4+, but macOS ships bash 3.2.\n     Install a newer one with: brew install bash"
+        );
+    }
+
+    if stderr.contains("command not found") {
+        return format!(
+            "{stderr}\n   → wg-quick was not found.\n     Install it with: brew install wireguard-tools"
+        );
+    }
+
+    stderr.to_string()
+}
+
 /// Bring WireGuard up using wg-quick
 /// Copies config to /etc/wireguard/nordkraft.conf (root-owned) to avoid
 /// permission issues with uutils/Rust coreutils stat + AppArmor on newer Ubuntu.
@@ -5245,8 +5292,7 @@ fn wg_up(config_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>
     }
 
     // Use interface name instead of file path — wg-quick looks up /etc/wireguard/<name>.conf
-    let output = Command::new("sudo")
-        .args(["wg-quick", "up", WG_INTERFACE])
+    let output = wg_quick_command("up")
         .output()
         .map_err(|e| format!("Failed to run wg-quick up: {e}"))?;
 
@@ -5255,7 +5301,7 @@ fn wg_up(config_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>
         if stderr.contains("already exists") {
             return Ok(());
         }
-        return Err(format!("wg-quick up failed: {stderr}").into());
+        return Err(format!("wg-quick up failed: {}", explain_wg_quick_error(&stderr)).into());
     }
 
     Ok(())
@@ -5265,8 +5311,7 @@ fn wg_up(config_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>
 fn wg_down(_config_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     use std::process::Command;
 
-    let output = Command::new("sudo")
-        .args(["wg-quick", "down", WG_INTERFACE])
+    let output = wg_quick_command("down")
         .output()
         .map_err(|e| format!("Failed to run wg-quick down: {e}"))?;
 
@@ -5276,7 +5321,7 @@ fn wg_down(_config_path: &std::path::Path) -> Result<(), Box<dyn std::error::Err
         if stderr.contains("is not a WireGuard interface") {
             return Ok(());
         }
-        return Err(format!("wg-quick down failed: {stderr}").into());
+        return Err(format!("wg-quick down failed: {}", explain_wg_quick_error(&stderr)).into());
     }
 
     // Clean up system config (macOS: wg-quick checks both paths)
