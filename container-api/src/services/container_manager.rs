@@ -889,6 +889,63 @@ impl ContainerManager {
         Ok(logs)
     }
 
+    /// Read cpu and memory limits from `nerdctl inspect --mode=native`, whose OCI
+    /// runtime spec carries the limits the runtime actually enforces:
+    ///
+    ///   Spec.linux.resources.memory.limit          → bytes
+    ///   Spec.linux.resources.cpu.quota / .period   → cores
+    ///
+    /// Returns (cpu_cores, memory_bytes); either may be None. Best effort by design:
+    /// a limit we cannot read stays None so callers can say "unknown" instead of
+    /// inventing a value.
+    async fn inspect_native_limits(&self, container_id: &str) -> (Option<f64>, Option<i64>) {
+        let output = match tokio::process::Command::new(&self.runtime_binary)
+            .args(["inspect", "--mode=native", container_id])
+            .output()
+            .await
+        {
+            Ok(o) if o.status.success() => o,
+            Ok(o) => {
+                warn!(
+                    "native inspect failed for {}: {}",
+                    container_id,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                return (None, None);
+            }
+            Err(e) => {
+                warn!("could not run native inspect for {}: {}", container_id, e);
+                return (None, None);
+            }
+        };
+
+        let raw: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("unparseable native inspect for {}: {}", container_id, e);
+                return (None, None);
+            }
+        };
+
+        let null = serde_json::Value::Null;
+        let first = raw.as_array().and_then(|arr| arr.first()).unwrap_or(&null);
+        let resources = &first["Spec"]["linux"]["resources"];
+
+        let memory = resources["memory"]["limit"].as_i64().filter(|&m| m > 0);
+
+        let cpu = match (
+            resources["cpu"]["quota"].as_i64(),
+            resources["cpu"]["period"].as_i64(),
+        ) {
+            (Some(quota), Some(period)) if quota > 0 && period > 0 => {
+                Some(quota as f64 / period as f64)
+            }
+            _ => None,
+        };
+
+        (cpu, memory)
+    }
+
     /// Inspect a single container — calls `nerdctl inspect` and extracts rich data.
     /// Only succeeds if the container is owned by owner_pubkey (label check).
     pub async fn inspect_container(
@@ -949,6 +1006,19 @@ impl ContainerManager {
 
         // Memory limit in bytes (0 = unlimited)
         let memory_limit = host_config["Memory"].as_i64().filter(|&m| m > 0);
+
+        // nerdctl's dockercompat inspect omits HostConfig entirely on some builds
+        // (observed with containerd + Kata), so NanoCpus/Memory read as null even
+        // though cgroup limits are enforced and `nerdctl stats` reports them. Fall
+        // back to the native view, whose OCI spec carries what the runtime applies.
+        // Without this the CLI receives null and substitutes 0.5 cpu / 512m, which
+        // silently writes wrong limits into every generated .nk spec.
+        let (cpu_limit, memory_limit) = if cpu_limit.is_none() || memory_limit.is_none() {
+            let (native_cpu, native_memory) = self.inspect_native_limits(container_id).await;
+            (cpu_limit.or(native_cpu), memory_limit.or(native_memory))
+        } else {
+            (cpu_limit, memory_limit)
+        };
 
         // Environment variables
         let env_vars: Vec<String> = config["Env"]

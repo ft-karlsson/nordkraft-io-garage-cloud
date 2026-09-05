@@ -692,6 +692,47 @@ pub async fn inspect_container(
     }
 }
 
+// ============= STORED CONFIG =============
+
+/// GET /containers/<name>/config — the config this container was deployed with.
+///
+/// `nordkraft init` otherwise rebuilds a spec from `inspect`, which cannot see
+/// every field (volume_size is never exposed by the runtime at all) and fills in
+/// defaults for the ones it misses. This returns what was actually requested at
+/// deploy time, straight from container_config, so a lost .nk can be restored
+/// exactly rather than approximately.
+#[get("/containers/<container_name>/config")]
+pub async fn get_container_config_route(
+    container_name: String,
+    user: AuthenticatedUser,
+    pool: &rocket::State<sqlx::PgPool>,
+) -> Json<serde_json::Value> {
+    let config = match get_container_config(pool.inner(), &container_name, &user.0.id).await {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            return Json(serde_json::json!({
+                "error": format!(
+                    "No stored config for '{}'. It was deployed before config tracking, \
+                     so only 'nordkraft init {}' can rebuild its spec.",
+                    container_name, container_name
+                )
+            }));
+        }
+        Err(e) => {
+            warn!("stored config lookup failed for {}: {}", container_name, e);
+            return Json(serde_json::json!({
+                "error": format!("Container '{}' not found or access denied", container_name)
+            }));
+        }
+    };
+
+    let revision = get_container_config_revision(pool.inner(), &container_name)
+        .await
+        .unwrap_or(0);
+
+    Json(serde_json::json!({ "config": config, "revision": revision }))
+}
+
 // ============= UPGRADE =============
 
 /// PUT /containers/<name>/upgrade — in-place upgrade preserving IP + volumes.

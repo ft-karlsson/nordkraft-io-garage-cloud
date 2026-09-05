@@ -203,6 +203,9 @@ enum Commands {
     Init {
         /// Container name, alias, or omit for interactive selection
         container: Option<String>,
+        /// Rebuild from the config stored at deploy time instead of from the running container
+        #[arg(long = "from-server")]
+        from_server: bool,
     },
     /// Open .nk spec in $EDITOR
     Edit {
@@ -780,6 +783,25 @@ fn spec_from_inspect(c: &ContainerInspectResponse) -> DeploymentSpec {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
         })
         .collect();
+
+    // The API returns None when it could not read a limit from the runtime. The
+    // defaults below keep the spec valid, but say so out loud — a silent 0.5/512m
+    // is how a spec ends up capping a container below what it actually runs with.
+    let mut unread: Vec<&str> = Vec::new();
+    if c.cpu_limit.is_none() {
+        unread.push("cpu");
+    }
+    if c.memory_limit.is_none() {
+        unread.push("memory");
+    }
+    if !unread.is_empty() {
+        eprintln!(
+            "{} Could not read {} from the running container — wrote defaults (0.5 cpu / 512m).",
+            "⚠".yellow(),
+            unread.join(" and ")
+        );
+        eprintln!("   Verify against the node before running 'nordkraft upgrade' on this container.");
+    }
 
     // Parse memory from bytes to human string
     let memory = c
@@ -1547,7 +1569,10 @@ async fn main() {
         Commands::Upgrade { container, yes } => {
             handle_upgrade_interactive(container, yes, json_output).await
         }
-        Commands::Init { container } => handle_init_interactive(container, json_output).await,
+        Commands::Init {
+            container,
+            from_server,
+        } => handle_init_interactive(container, from_server, json_output).await,
         Commands::Edit { container } => handle_edit_interactive(container, json_output).await,
         Commands::Specs => handle_specs_list(json_output).await,
         Commands::SpecSet {
@@ -3124,6 +3149,7 @@ async fn handle_upgrade_interactive(
 
 async fn handle_init_interactive(
     container: Option<String>,
+    from_server: bool,
     json_output: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let name = match container {
@@ -3133,6 +3159,10 @@ async fn handle_init_interactive(
             select_container_interactive(&client).await?
         }
     };
+
+    if from_server {
+        return init_from_server(&name, json_output).await;
+    }
 
     if !json_output {
         println!("{}", format!("🔍 Inspecting {}...", name).cyan());
@@ -3734,6 +3764,180 @@ fn print_colored_bar((filled, empty): &(usize, usize), color: &str) {
 /// Fetch live container state as a DeploymentSpec via the inspect endpoint.
 /// Returns Ok(None) if the container exists in DB but has no live runtime state
 /// (e.g. Failed deployment where container never started).
+#[derive(Debug, Deserialize)]
+struct StoredConfigResponse {
+    config: StoredContainerConfig,
+    #[serde(default)]
+    revision: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredContainerConfig {
+    container_name: String,
+    image: String,
+    #[serde(default)]
+    ports: Vec<StoredPort>,
+    command: Option<Vec<String>>,
+    #[serde(default)]
+    env_vars: HashMap<String, String>,
+    cpu_limit: f32,
+    memory_limit: String,
+    #[serde(default)]
+    enable_persistence: bool,
+    volume_path: Option<String>,
+    #[serde(default = "default_volume_size")]
+    volume_size: String,
+    #[serde(default)]
+    enable_ipv6: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredPort {
+    port: u16,
+}
+
+/// Fetch the deploy-time config the controller stored for this container and turn
+/// it into a spec. Ok(None) means the container predates config tracking, so no
+/// stored config exists and only the inspect path can rebuild it.
+async fn fetch_stored_spec(
+    name: &str,
+) -> Result<Option<DeploymentSpec>, Box<dyn std::error::Error>> {
+    let client = create_client()?;
+    let url = format!("{}/containers/{}/config", *API_BASE_URL, name);
+    let response = client.get(&url).send().await?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Failed to fetch stored config for '{}': HTTP {}",
+            name,
+            response.status()
+        )
+        .into());
+    }
+
+    let body = response.text().await?;
+
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body) {
+        if val.get("error").is_some() {
+            return Ok(None);
+        }
+    }
+
+    let stored: StoredConfigResponse = serde_json::from_str(&body)
+        .map_err(|e| format!("Failed to parse stored config: {}", e))?;
+
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let c = stored.config;
+
+    Ok(Some(DeploymentSpec {
+        deployment: DeploymentMeta {
+            name: c.container_name,
+            image: c.image,
+            revision: stored.revision,
+            command: c.command.map(|parts| parts.join(" ")),
+            created: now.clone(),
+            updated: now,
+        },
+        resources: ResourceSpec {
+            cpu: c.cpu_limit,
+            memory: c.memory_limit,
+        },
+        network: NetworkSpec {
+            ports: c.ports.iter().map(|p| p.port).collect(),
+            ipv6: c.enable_ipv6,
+        },
+        storage: StorageSpec {
+            persistence: c.enable_persistence,
+            volume_path: c.volume_path,
+            volume_size: c.volume_size,
+        },
+        env: c.env_vars,
+        // Placement is not part of the stored deploy config. Left unset rather
+        // than guessed — an empty PlacementSpec is skipped when serialising.
+        placement: PlacementSpec {
+            garage: None,
+            hardware: None,
+        },
+    }))
+}
+
+/// `nordkraft init <name> --from-server`
+///
+/// Rebuilds the .nk from what was requested at deploy time instead of from the
+/// running container, so nothing is approximated and the spec keeps the server's
+/// revision rather than resetting to 0.
+async fn init_from_server(name: &str, json_output: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if !json_output {
+        println!(
+            "{}",
+            format!("🗄  Fetching stored config for {}...", name).cyan()
+        );
+    }
+
+    let stored = match fetch_stored_spec(name).await? {
+        Some(spec) => spec,
+        None => {
+            let msg = format!(
+                "No stored config for '{}' — deployed before config tracking. \
+                 Rebuild from the running container with 'nordkraft init {}'.",
+                name, name
+            );
+            if json_output {
+                println!("{}", serde_json::json!({ "error": msg }));
+            } else {
+                eprintln!("{} {}", "⚠".yellow(), msg);
+            }
+            return Ok(());
+        }
+    };
+
+    if let Some(existing) = load_deployment_spec(name) {
+        if !json_output {
+            let overwrite = Confirm::with_theme(&ColorfulTheme::default())
+                .with_prompt(format!(
+                    "{}.nk already exists (revision {}). Overwrite from server?",
+                    name, existing.deployment.revision
+                ))
+                .default(false)
+                .interact()
+                .unwrap_or(false);
+            if !overwrite {
+                println!("{}", "   Cancelled.".dimmed());
+                return Ok(());
+            }
+        }
+    }
+
+    let revision = stored.deployment.revision;
+    save_deployment_spec(&stored)?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "ok",
+                "spec": nk_path(name).to_string_lossy(),
+                "revision": revision,
+                "source": "server"
+            }))?
+        );
+    } else {
+        println!();
+        println!(
+            "   {} Generated {}",
+            "💾".green(),
+            format!("~/.nordkraft/deployments/{}.nk", name).cyan()
+        );
+        println!(
+            "   {} revision {} (from stored deploy config)",
+            "→".dimmed(),
+            revision
+        );
+    }
+
+    Ok(())
+}
+
 async fn fetch_live_spec(name: &str) -> Result<Option<DeploymentSpec>, Box<dyn std::error::Error>> {
     let client = create_client()?;
     let url = format!("{}/containers/{}", *API_BASE_URL, name);

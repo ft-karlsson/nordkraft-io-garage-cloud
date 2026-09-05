@@ -966,6 +966,7 @@ async fn rocket() -> _ {
                     routes::containers::stop_container,
                     routes::containers::get_container_logs,
                     routes::containers::inspect_container,
+                    routes::containers::get_container_config_route,
                     routes::containers::upgrade_container,
                     // Node operations
                     routes::nodes::list_nodes,
