@@ -41,6 +41,7 @@ theme:
 
 nav:
   - Hjem: index.md
+  - Hvad er nyt: changelog.md
   - Kom i gang:
     - Din første container: getting-started.md
     - Installation: installation.md
