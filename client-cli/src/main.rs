@@ -781,6 +781,25 @@ fn spec_from_inspect(c: &ContainerInspectResponse) -> DeploymentSpec {
         })
         .collect();
 
+    // The API returns None when it could not read a limit from the runtime. The
+    // defaults below keep the spec valid, but say so out loud — a silent 0.5/512m
+    // is how a spec ends up capping a container below what it actually runs with.
+    let mut unread: Vec<&str> = Vec::new();
+    if c.cpu_limit.is_none() {
+        unread.push("cpu");
+    }
+    if c.memory_limit.is_none() {
+        unread.push("memory");
+    }
+    if !unread.is_empty() {
+        eprintln!(
+            "{} Could not read {} from the running container — wrote defaults (0.5 cpu / 512m).",
+            "⚠".yellow(),
+            unread.join(" and ")
+        );
+        eprintln!("   Verify against the node before running 'nordkraft upgrade' on this container.");
+    }
+
     // Parse memory from bytes to human string
     let memory = c
         .memory_limit
