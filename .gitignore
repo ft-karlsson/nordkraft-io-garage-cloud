@@ -2,3 +2,7 @@ deploy.sh
 .claude/launch.json
 container-api/.DS_Store
 Claude outputs/
+# DB dumps contain customer data — must never reach the public repo
+database-backups-dev/
+*.dump
+*.sql.gz
