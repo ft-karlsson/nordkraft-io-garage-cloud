@@ -121,13 +121,45 @@ nothing else references them.
 
 ## Setup
 
-### 1. Apply the database migration
+### 1. Back up the database
+
+Take a full dump of `garage_cloud` before touching the schema. The migration
+is purely additive (one new table, one trigger — it does not modify existing
+tables), but a backup makes every next step reversible:
+
+```bash
+# Custom-format dump (compressed, restorable table-by-table with pg_restore)
+sudo -u postgres pg_dump -F c -d garage_cloud \
+  -f /var/backups/garage_cloud_$(date +%Y%m%d_%H%M%S).dump
+```
+
+Verify the file exists and has a plausible size before continuing:
+
+```bash
+ls -lh /var/backups/garage_cloud_*.dump | tail -1
+```
+
+To restore (worst case — this recreates the DB as it was at dump time):
+
+```bash
+sudo -u postgres pg_restore --clean --if-exists -d garage_cloud \
+  /var/backups/garage_cloud_<timestamp>.dump
+```
+
+To undo *only* this migration, no restore is needed:
+
+```bash
+psql -U garage_user -d garage_cloud \
+  -c "DROP TABLE IF EXISTS custom_domains CASCADE;"
+```
+
+### 2. Apply the database migration
 
 ```bash
 psql -U garage_user -d garage_cloud -f setup/migration_custom_domains.sql
 ```
 
-### 2. Configure container-api
+### 3. Configure container-api
 
 ```bash
 # Enable the feature (requires INGRESS_ENABLED=true)
@@ -172,7 +204,7 @@ journalctl -u nordkraft -n 50 | grep -E "(Custom domains|ACME|Domain reconciler)
 > HAProxy is `/.well-known/acme-challenge/<token>`, which serves in-memory
 > tokens that exist only while an order is in flight.
 
-### 3. Customer flow
+### 4. Customer flow
 
 ```bash
 # Customer registers their domain
