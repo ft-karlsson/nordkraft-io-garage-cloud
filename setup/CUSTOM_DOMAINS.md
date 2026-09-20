@@ -128,22 +128,27 @@ is purely additive (one new table, one trigger — it does not modify existing
 tables), but a backup makes every next step reversible:
 
 ```bash
-# Custom-format dump (compressed, restorable table-by-table with pg_restore)
+# Custom-format dump (compressed, restorable table-by-table with pg_restore).
+# NOTE: redirect (>) rather than -f: pg_dump runs as the postgres user, which
+# cannot write into your home directory — the redirect is performed by YOUR
+# shell, so the file is created with your ownership.
 sudo -u postgres pg_dump -F c -d garage_cloud \
-  -f /var/backups/garage_cloud_$(date +%Y%m%d_%H%M%S).dump
+  > ~/garage_cloud_$(date +%Y%m%d_%H%M%S).dump
 ```
 
 Verify the file exists and has a plausible size before continuing:
 
 ```bash
-ls -lh /var/backups/garage_cloud_*.dump | tail -1
+ls -lh ~/garage_cloud_*.dump | tail -1
 ```
 
 To restore (worst case — this recreates the DB as it was at dump time):
 
 ```bash
+# Same trick in reverse: postgres cannot read your home dir, so feed the
+# dump via stdin (<) from your own shell.
 sudo -u postgres pg_restore --clean --if-exists -d garage_cloud \
-  /var/backups/garage_cloud_<timestamp>.dump
+  < ~/garage_cloud_<timestamp>.dump
 ```
 
 To undo *only* this migration, no restore is needed:
