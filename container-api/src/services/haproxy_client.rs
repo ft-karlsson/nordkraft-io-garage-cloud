@@ -1026,6 +1026,51 @@ impl HAProxyClientTrait for HAProxyClient {
                 } else {
                     debug!("ACME challenge backend already exists (no health check)");
                 }
+
+                // Self-heal the server address too, so changing
+                // CUSTOM_DOMAINS_CHALLENGE_ADDR takes effect on restart
+                // instead of silently keeping the old target.
+                if let (Some(backend_id), Some(servers)) = (
+                    backend.get("id").and_then(|v| v.as_i64()),
+                    backend.get("servers").and_then(|v| v.as_array()),
+                ) {
+                    for server in servers {
+                        if server.get("name").and_then(|v| v.as_str())
+                            != Some(ACME_CHALLENGE_SERVER)
+                        {
+                            continue;
+                        }
+                        let cur_addr = server.get("address").and_then(|v| v.as_str()).unwrap_or("");
+                        let cur_port = server
+                            .get("port")
+                            .map(|v| match v {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            })
+                            .unwrap_or_default();
+                        if cur_addr != addr || cur_port != port.to_string() {
+                            if let Some(server_id) = server.get("id").and_then(|v| v.as_i64()) {
+                                warn!(
+                                    "ACME challenge server points at {}:{} — updating to {}:{}",
+                                    cur_addr, cur_port, addr, port
+                                );
+                                let patch = serde_json::json!({
+                                    "parent_id": backend_id,
+                                    "id": server_id,
+                                    "address": addr,
+                                    "port": port.to_string(),
+                                });
+                                self.api_request(
+                                    "PATCH",
+                                    "/api/v2/services/haproxy/backend/server",
+                                    Some(&patch),
+                                )
+                                .await?;
+                                info!("✅ ACME challenge server updated → {}:{}", addr, port);
+                            }
+                        }
+                    }
+                }
             }
         }
 

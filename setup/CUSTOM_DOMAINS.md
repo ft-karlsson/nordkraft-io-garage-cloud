@@ -174,10 +174,13 @@ export CUSTOM_DOMAINS_ENABLED=true
 export ACME_CONTACT_EMAIL=you@example.dk   # required
 export ACME_STAGING=false                  # true = LE staging CA (testing; untrusted certs)
 
-# Where HAProxy forwards ACME HTTP-01 challenges: container-api's listener,
-# reachable FROM pfSense (controller LAN/VPN IP + BIND_PORT).
-# Default: CONTROLLER_INTERNAL_IP:BIND_PORT
-export CUSTOM_DOMAINS_CHALLENGE_ADDR=10.0.0.200:8001
+# Bind address of the DEDICATED ACME challenge listener — a second socket
+# inside the same container-api process, serving exactly one route
+# (GET /.well-known/acme-challenge/<token>). Bind it on the controller's
+# LAN IP so pfSense/HAProxy reaches it directly; the main API keeps its
+# WireGuard-only BIND_ADDRESS untouched.
+# Default: CONTROLLER_INTERNAL_IP:8801
+export CUSTOM_DOMAINS_CHALLENGE_ADDR=10.0.0.200:8801
 
 # Optional tuning (defaults shown)
 export CUSTOM_DOMAINS_MAX_PER_USER=5
@@ -203,11 +206,19 @@ journalctl -u nordkraft -n 50 | grep -E "(Custom domains|ACME|Domain reconciler)
 #         "🌍 Domain reconciler started …"
 ```
 
-> **Note:** `BIND_ADDRESS` must make the API reachable from pfSense (not
-> `127.0.0.1`) for the challenge forwarding to work. The API itself remains
-> WireGuard-only for authenticated endpoints; the only route exposed through
-> HAProxy is `/.well-known/acme-challenge/<token>`, which serves in-memory
-> tokens that exist only while an order is in flight.
+> **Security model:** the main API keeps its WireGuard-only bind — nothing
+> about it changes, and no pfSense static route is needed. The challenge
+> listener is a separate LAN-facing socket in the same process whose entire
+> surface is one read-only route serving in-memory tokens that exist only
+> while an order is in flight. There is nothing to enumerate and no
+> authenticated endpoint reachable from the LAN.
+>
+> The startup bootstrap self-heals the pfSense objects: if
+> `CUSTOM_DOMAINS_CHALLENGE_ADDR` changes, the existing HAProxy backend
+> server is PATCHed to the new address on the next restart, and the
+> backend's health check is kept disabled (the listener answers 404 to
+> anything but a live token, which an HTTP health check would misread as
+> "down").
 
 ### 4. Customer flow
 

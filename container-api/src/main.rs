@@ -291,10 +291,13 @@ fn init_custom_domains(config: &AppConfig) -> CustomDomainsInit {
             .unwrap_or(86_400),
     };
 
-    // Where HAProxy forwards ACME HTTP-01 challenges: container-api's own
-    // Rocket listener, reachable from pfSense via the controller's LAN/VPN IP.
+    // Address of the DEDICATED challenge listener: a second socket in this
+    // same process, bound on the LAN side so pfSense/HAProxy can reach it
+    // directly, serving exactly one route (the ACME challenge). The main
+    // API keeps its WireGuard-only bind untouched. This value is both the
+    // listener's bind address and the HAProxy backend target.
     let challenge_addr = std::env::var("CUSTOM_DOMAINS_CHALLENGE_ADDR")
-        .unwrap_or_else(|_| format!("{}:{}", config.controller_internal_ip, config.bind_port));
+        .unwrap_or_else(|_| format!("{}:8801", config.controller_internal_ip));
 
     if enabled {
         info!(
@@ -320,6 +323,20 @@ fn init_custom_domains(config: &AppConfig) -> CustomDomainsInit {
         reconciler_settings,
         challenge_addr,
     }
+}
+
+/// Split "ip:port" for the dedicated challenge listener.
+fn parse_challenge_addr(addr: &str) -> Result<(String, u16), String> {
+    let (ip, port_str) = addr
+        .rsplit_once(':')
+        .ok_or_else(|| "expected ip:port".to_string())?;
+    if ip.is_empty() {
+        return Err("empty address".to_string());
+    }
+    let port: u16 = port_str
+        .parse()
+        .map_err(|e| format!("invalid port '{}': {}", port_str, e))?;
+    Ok((ip.to_string(), port))
 }
 
 // ============= AGENT NETWORK SETUP =============
@@ -1015,9 +1032,12 @@ async fn rocket() -> _ {
 
     // =========================================================
     // CUSTOM DOMAINS (BYO domain) — controller/hybrid only
-    // 1. Bootstrap the shared ACME challenge routing on HAProxy
+    // 1. Spawn the dedicated ACME challenge listener (second socket in
+    //    THIS process — one binary, two binds; the main API stays
+    //    WireGuard-only).
+    // 2. Bootstrap the shared ACME challenge routing on HAProxy
     //    (idempotent; safe on every boot).
-    // 2. Spawn the domain reconciler state machine.
+    // 3. Spawn the domain reconciler state machine.
     // =========================================================
     let custom_domains = init_custom_domains(&config);
 
@@ -1027,6 +1047,39 @@ async fn rocket() -> _ {
             config::OperationMode::Controller | config::OperationMode::Hybrid
         )
     {
+        // Dedicated challenge listener: exposes exactly ONE route
+        // (GET /.well-known/acme-challenge/<token>) on the LAN side,
+        // sharing the in-memory ChallengeStore with the ACME manager.
+        match parse_challenge_addr(&custom_domains.challenge_addr) {
+            Ok((ip, port)) => {
+                let figment = rocket::Config::figment()
+                    .merge(("address", ip))
+                    .merge(("port", port));
+                let challenge_rocket = rocket::custom(figment)
+                    .manage(custom_domains.challenge_store.clone())
+                    .mount("/", routes![routes::domains::acme_challenge]);
+                let addr = custom_domains.challenge_addr.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = challenge_rocket.launch().await {
+                        error!(
+                            "❌ ACME challenge listener on {} failed: {} — custom-domain certificate issuance will NOT work until this is fixed",
+                            addr, e
+                        );
+                    }
+                });
+                info!(
+                    "🔏 ACME challenge listener bound on {} (single route, LAN-facing)",
+                    custom_domains.challenge_addr
+                );
+            }
+            Err(e) => {
+                error!(
+                    "❌ Invalid CUSTOM_DOMAINS_CHALLENGE_ADDR '{}': {} — challenge listener NOT started",
+                    custom_domains.challenge_addr, e
+                );
+            }
+        }
+
         match haproxy_client
             .ensure_acme_challenge_route(&custom_domains.challenge_addr)
             .await
@@ -1118,58 +1171,57 @@ async fn rocket() -> _ {
         }
         _ => {
             // Controller/Hybrid: full functionality
-            rocket
-                .mount(
-                    "/api",
-                    routes![
-                        // Container operations
-                        routes::containers::deploy_container,
-                        routes::containers::list_containers_route,
-                        routes::containers::delete_container,
-                        routes::containers::start_container,
-                        routes::containers::stop_container,
-                        routes::containers::get_container_logs,
-                        routes::containers::inspect_container,
-                        routes::containers::get_container_config_route,
-                        routes::containers::upgrade_container,
-                        // Node operations
-                        routes::nodes::list_nodes,
-                        routes::nodes::register_node,
-                        // Status & auth
-                        routes::status::get_status,
-                        routes::status::verify_auth,
-                        routes::status::get_network_info,
-                        // IPv6 firewall management
-                        routes::ipv6::open_ipv6_firewall,
-                        routes::ipv6::close_ipv6_firewall,
-                        routes::ipv6::get_ipv6_status,
-                        routes::ipv6::list_ipv6_allocations,
-                        routes::ipv6::update_ipv6_ports,
-                        // Ingress routes (HAProxy + ACME)
-                        routes::ingress::enable_ingress,
-                        routes::ingress::disable_ingress,
-                        routes::ingress::get_ingress_status,
-                        routes::ingress::list_ingress,
-                        // Custom domains (BYO domain)
-                        routes::domains::add_domain,
-                        routes::domains::domain_status,
-                        routes::domains::verify_domain_now,
-                        routes::domains::list_domains,
-                        routes::domains::remove_domain,
-                        // Admin endpoints (signup-api → container-api provisioning)
-                        admin_provision_tenant,
-                        admin_deprovision_tenant,
-                        admin_tenants_status,
-                        // usage
-                        routes::containers::get_usage,
-                        // Deploy lifecycle events
-                        routes::events::get_events,
-                    ],
-                )
-                // ACME HTTP-01 challenge — must live at the root path because
-                // Let's Encrypt always requests /.well-known/acme-challenge/…
-                // (reached via the HAProxy path ACL, see haproxy_client).
-                .mount("/", routes![routes::domains::acme_challenge])
+            rocket.mount(
+                "/api",
+                routes![
+                    // Container operations
+                    routes::containers::deploy_container,
+                    routes::containers::list_containers_route,
+                    routes::containers::delete_container,
+                    routes::containers::start_container,
+                    routes::containers::stop_container,
+                    routes::containers::get_container_logs,
+                    routes::containers::inspect_container,
+                    routes::containers::get_container_config_route,
+                    routes::containers::upgrade_container,
+                    // Node operations
+                    routes::nodes::list_nodes,
+                    routes::nodes::register_node,
+                    // Status & auth
+                    routes::status::get_status,
+                    routes::status::verify_auth,
+                    routes::status::get_network_info,
+                    // IPv6 firewall management
+                    routes::ipv6::open_ipv6_firewall,
+                    routes::ipv6::close_ipv6_firewall,
+                    routes::ipv6::get_ipv6_status,
+                    routes::ipv6::list_ipv6_allocations,
+                    routes::ipv6::update_ipv6_ports,
+                    // Ingress routes (HAProxy + ACME)
+                    routes::ingress::enable_ingress,
+                    routes::ingress::disable_ingress,
+                    routes::ingress::get_ingress_status,
+                    routes::ingress::list_ingress,
+                    // Custom domains (BYO domain)
+                    routes::domains::add_domain,
+                    routes::domains::domain_status,
+                    routes::domains::verify_domain_now,
+                    routes::domains::list_domains,
+                    routes::domains::remove_domain,
+                    // Admin endpoints (signup-api → container-api provisioning)
+                    admin_provision_tenant,
+                    admin_deprovision_tenant,
+                    admin_tenants_status,
+                    // usage
+                    routes::containers::get_usage,
+                    // Deploy lifecycle events
+                    routes::events::get_events,
+                ],
+            )
+            // NOTE: the ACME challenge route is deliberately NOT mounted on
+            // this (WireGuard-only) listener — it lives on the dedicated
+            // LAN-facing listener spawned earlier, keeping this listener's
+            // surface to authenticated endpoints exactly.
         }
     }
 }
