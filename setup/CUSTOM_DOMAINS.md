@@ -110,8 +110,10 @@ The two REST API v2 surfaces the custom-domain code depends on have been
 source**:
 
 - `POST /api/v2/system/certificate` — fields `descr`, `type` (`server`),
-  `crt`, `prv`; `crt`/`prv` are `Base64Field`s (base64-encoded PEM — what
-  the code sends); response carries `data.refid`.
+  `crt`, `prv`; `crt`/`prv` take **raw PEM** (the API base64-encodes for
+  config.xml itself — sending base64 fails `X509_VALIDATOR_INVALID_VALUE`;
+  verified on hardware). A full chain in `crt` is accepted. Response
+  carries `data.refid`.
 - `POST/DELETE /api/v2/services/haproxy/frontend/certificate` — child object
   with `parent_id` + `ssl_certificate` (cert refid); the frontend's
   additional-certs array is `ha_certificates`.

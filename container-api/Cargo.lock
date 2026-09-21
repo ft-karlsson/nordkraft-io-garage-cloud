@@ -400,7 +400,6 @@ version = "0.3.38"
 dependencies = [
  "async-nats",
  "async-trait",
- "base64 0.22.1",
  "chrono",
  "dotenv",
  "futures",

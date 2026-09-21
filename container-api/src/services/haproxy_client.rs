@@ -1093,17 +1093,16 @@ impl HAProxyClientTrait for HAProxyClient {
         cert_chain_pem: &str,
         private_key_pem: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        use base64::Engine;
-        let engine = base64::engine::general_purpose::STANDARD;
-
-        // Fields per pfSense REST API v2 Certificate model: crt/prv are
-        // Base64Fields (base64-encoded PEM); type "server" marks the cert as
-        // usable by services (it is also the API default — set explicitly).
+        // crt/prv take RAW PEM strings — the API base64-encodes internally
+        // for config.xml (its "Base64Field" describes storage, not the API
+        // contract; base64 input fails X509_VALIDATOR_INVALID_VALUE —
+        // verified empirically against a Netgate 4200). A full chain
+        // (leaf + intermediates) in one crt is accepted.
         let request = serde_json::json!({
             "descr": name,
             "type": "server",
-            "crt": engine.encode(cert_chain_pem),
-            "prv": engine.encode(private_key_pem),
+            "crt": cert_chain_pem,
+            "prv": private_key_pem,
         });
 
         let response = self
