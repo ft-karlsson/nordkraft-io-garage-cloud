@@ -386,6 +386,77 @@ nordkraft ingress list
 
 ---
 
+## Domain kommandoer (dit eget domæne)
+
+!!! info "På vej"
+    Klar i næste release. Se guiden [Custom domæner & HTTPS](../guides/domains.md).
+
+### domain add
+
+Registrér dit eget domæne til en container. Svarer med det samme og viser
+de DNS-records, du skal oprette hos din udbyder.
+
+```bash
+nordkraft domain add DOMÆNE --container CONTAINER [FLAG]
+```
+
+**Flag:**
+
+| Flag | Påkrævet | Beskrivelse |
+|------|----------|-------------|
+| `--container`, `-c` | Ja | Container, navn eller alias |
+| `--port`, `-p` | Nej | Containerens port (default: 80) |
+
+**Eksempel:**
+
+```bash
+nordkraft domain add mitfirma.dk --container myapp
+# → viser TXT + A record · derefter automatisk verificering, HTTPS og redirect
+```
+
+---
+
+### domain status
+
+Vis hvor langt et domæne er: verificering, certifikat, routing.
+
+```bash
+nordkraft domain status DOMÆNE
+```
+
+---
+
+### domain verify
+
+Tjek dine DNS-records med det samme (mod domænets autoritative
+navneservere) i stedet for at vente på næste automatiske tjek.
+
+```bash
+nordkraft domain verify DOMÆNE
+```
+
+---
+
+### domain list
+
+Vis alle dine domæner og deres status.
+
+```bash
+nordkraft domain list
+```
+
+---
+
+### domain remove
+
+Fjern et domæne — routing, certifikat og registrering ryddes op.
+
+```bash
+nordkraft domain remove DOMÆNE [--yes]
+```
+
+---
+
 ## IPv6 kommandoer
 
 ### ipv6 open

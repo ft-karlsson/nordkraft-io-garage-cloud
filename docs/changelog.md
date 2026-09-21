@@ -4,6 +4,31 @@
 
 ---
 
+## På vej — brug dit eget domæne
+
+**`nordkraft domain add mitfirma.dk --container myapp`**
+
+Peg dit eget domæne direkte på en container. Du opretter to DNS-records hos
+din udbyder — resten sker automatisk: ejerskabet bekræftes mod domænets
+autoritative navneservere, et rigtigt Let's Encrypt-certifikat udstedes og
+fornys af sig selv, `http://` omdirigeres til `https://`, og platformen
+holder løbende øje med at routing og certifikat er som de skal være.
+
+```bash
+nordkraft domain add mitfirma.dk --container myapp
+nordkraft domain status mitfirma.dk   # følg med: pending_dns → … → active
+```
+
+Domænet matches præcist (aldrig wildcards), intet routes før ejerskabet er
+bevist, og holder domænet op med at pege på platformen, ryddes der
+automatisk op. Typisk live 5–30 minutter efter dine DNS-records er oprettet.
+
+Ny guide: [Custom domæner & HTTPS](guides/domains.md). Første domæne i
+drift: [garagecloud.dk](https://garagecloud.dk) — som selvfølgelig selv
+kører på platformen.
+
+---
+
 ## September 2026 — v0.3.38 → v0.3.40
 
 **Genskab din opsætning fra serveren**
