@@ -20,11 +20,10 @@
 
 use instant_acme::{
     Account, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
-    OrderStatus,
+    OrderStatus, RetryPolicy,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
@@ -110,62 +109,60 @@ impl AcmeManager {
         );
 
         let contact = format!("mailto:{}", self.contact_email);
-        let (account, _credentials) = Account::create(
-            &NewAccount {
-                contact: &[contact.as_str()],
-                terms_of_service_agreed: true,
-                only_return_existing: false,
-            },
-            self.directory_url(),
-            None,
-        )
-        .await?;
-
-        let identifier = Identifier::Dns(domain.to_string());
-        let mut order = account
-            .new_order(&NewOrder {
-                identifiers: &[identifier],
-            })
+        let (account, _credentials) = Account::builder()?
+            .create(
+                &NewAccount {
+                    contact: &[contact.as_str()],
+                    terms_of_service_agreed: true,
+                    only_return_existing: false,
+                },
+                self.directory_url().to_string(),
+                None,
+            )
             .await?;
 
-        let authorizations = order.authorizations().await?;
+        let identifier = Identifier::Dns(domain.to_string());
+        let mut order = account.new_order(&NewOrder::new(&[identifier])).await?;
+
+        // Stage every pending HTTP-01 challenge in the in-memory store,
+        // then tell the CA each one is ready.
         let mut tokens: Vec<String> = Vec::new();
-
-        for authz in &authorizations {
-            match authz.status {
-                AuthorizationStatus::Pending => {}
-                AuthorizationStatus::Valid => continue,
-                status => {
-                    return Err(format!(
-                        "ACME authorization for {} in unexpected state: {:?}",
-                        domain, status
-                    )
-                    .into());
+        {
+            let mut authorizations = order.authorizations();
+            while let Some(result) = authorizations.next().await {
+                let mut authz = result?;
+                match authz.status {
+                    AuthorizationStatus::Pending => {}
+                    AuthorizationStatus::Valid => continue,
+                    status => {
+                        return Err(format!(
+                            "ACME authorization for {} in unexpected state: {:?}",
+                            domain, status
+                        )
+                        .into());
+                    }
                 }
+
+                let mut challenge = authz
+                    .challenge(ChallengeType::Http01)
+                    .ok_or("CA offered no HTTP-01 challenge")?;
+
+                let token = challenge.token.clone();
+                let key_auth = challenge.key_authorization();
+                self.challenge_store.put(&token, key_auth.as_str()).await;
+                tokens.push(token.clone());
+
+                info!(
+                    "🔏 ACME: challenge staged for {} (token {}…)",
+                    domain,
+                    &token[..8.min(token.len())]
+                );
+
+                challenge.set_ready().await?;
             }
-
-            let challenge = authz
-                .challenges
-                .iter()
-                .find(|c| c.r#type == ChallengeType::Http01)
-                .ok_or("CA offered no HTTP-01 challenge")?;
-
-            let key_auth = order.key_authorization(challenge);
-            self.challenge_store
-                .put(&challenge.token, key_auth.as_str())
-                .await;
-            tokens.push(challenge.token.clone());
-
-            info!(
-                "🔏 ACME: challenge staged for {} (token {}…)",
-                domain,
-                &challenge.token[..8.min(challenge.token.len())]
-            );
-
-            order.set_challenge_ready(&challenge.url).await?;
         }
 
-        // Poll the order until it leaves the validation phase.
+        // Poll the order until validated, then finalize + fetch the chain.
         // Slow is fine — bulletproof beats fast.
         let result = self.poll_and_finalize(&mut order, domain).await;
 
@@ -182,65 +179,25 @@ impl AcmeManager {
         order: &mut instant_acme::Order,
         domain: &str,
     ) -> Result<IssuedCertificate, AcmeError> {
-        let mut delay = Duration::from_secs(2);
-        let mut attempts = 0u32;
+        // poll_ready handles the retry/backoff loop internally.
+        let status = order.poll_ready(&RetryPolicy::default()).await?;
 
-        let state = loop {
-            tokio::time::sleep(delay).await;
-            let state = order.refresh().await?;
-            match state.status {
-                OrderStatus::Ready | OrderStatus::Invalid | OrderStatus::Valid => break state,
-                _ => {
-                    attempts += 1;
-                    if attempts >= 15 {
-                        return Err(format!(
-                            "ACME order for {} did not become ready after {} polls",
-                            domain, attempts
-                        )
-                        .into());
-                    }
-                    delay = (delay * 2).min(Duration::from_secs(30));
-                }
-            }
-        };
-
-        if state.status == OrderStatus::Invalid {
+        if status != OrderStatus::Ready {
             return Err(format!(
-                "ACME order for {} became invalid — the CA could not validate the HTTP-01 challenge. \
-                 Check that the domain points at the ingress IP and port 80 reaches HAProxy.",
-                domain
+                "ACME order for {} did not become ready (status {:?}) — the CA could not validate \
+                 the HTTP-01 challenge. Check that the domain points at the ingress IP and port 80 \
+                 reaches HAProxy.",
+                domain, status
             )
             .into());
         }
 
-        // Generate key + CSR for exactly this hostname.
-        let mut params = rcgen::CertificateParams::new(vec![domain.to_string()])?;
-        params.distinguished_name = rcgen::DistinguishedName::new();
-        let key_pair = rcgen::KeyPair::generate()?;
-        let csr = params.serialize_request(&key_pair)?;
+        // finalize() generates the private key + CSR for the order's
+        // identifiers and returns the key as PEM.
+        let private_key_pem = order.finalize().await?;
 
-        order.finalize(csr.der()).await?;
-
-        // Fetch the certificate (may need a few polls).
-        let cert_chain_pem = {
-            let mut attempts = 0u32;
-            loop {
-                match order.certificate().await? {
-                    Some(chain) => break chain,
-                    None => {
-                        attempts += 1;
-                        if attempts >= 10 {
-                            return Err(format!(
-                                "ACME finalize succeeded but certificate for {} never appeared",
-                                domain
-                            )
-                            .into());
-                        }
-                        tokio::time::sleep(Duration::from_secs(3)).await;
-                    }
-                }
-            }
-        };
+        // poll_certificate waits out the processing state and returns the chain.
+        let cert_chain_pem = order.poll_certificate(&RetryPolicy::default()).await?;
 
         let expires_at = leaf_not_after(&cert_chain_pem).unwrap_or_else(|e| {
             warn!(
@@ -257,7 +214,7 @@ impl AcmeManager {
 
         Ok(IssuedCertificate {
             cert_chain_pem,
-            private_key_pem: key_pair.serialize_pem(),
+            private_key_pem,
             expires_at,
         })
     }

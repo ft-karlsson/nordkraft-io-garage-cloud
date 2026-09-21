@@ -71,6 +71,37 @@ refid + expiry.
 1. Working platform ingress per [INGRESS_PFSENSE.md](INGRESS_PFSENSE.md)
    (frontends, wildcard cert, REST API v2).
 2. Port 80 open — Let's Encrypt HTTP-01 validation arrives there.
+3. A controller firewall rule allowing pfSense to reach the challenge
+   listener (see Setup step 4).
+4. If the pfSense **ACME package** also issues certificates via HTTP-01 on
+   this box, its HAProxy rule must be host-scoped first — see
+   "Coexistence with the pfSense ACME package" below, or every
+   custom-domain challenge will be swallowed by the package's responder
+   (symptom: permanent 503 on `/.well-known/acme-challenge/*`).
+
+## Coexistence with the pfSense ACME package
+
+The ACME package's HTTP-01 setup typically adds a path ACL (often named
+`is_acme`, matching `/.well-known/acme-challenge/`) with a `use_backend`
+action to its own validation backend, **evaluated before** any action
+container-api appends. Unscoped, it captures challenge traffic for *every*
+hostname — including customer domains — and returns 503 whenever the
+package's responder isn't mid-issuance.
+
+Fix (one-time, in Services → HAProxy → Frontend, wherever that action
+exists — usually only the HTTP frontend):
+
+1. Add one ACL row per platform hostname the package issues certificates
+   for, all with the **same name** so they OR together:
+   `is_platform_host` / *Host matches* / `cloud.example.dk` (repeat per host)
+2. Edit the package's `use_backend <acme validation>` action: change its
+   condition from `is_acme` to `is_acme is_platform_host` (space = AND).
+3. Apply.
+
+Result: platform-host challenges → the package's responder; every other
+hostname falls through to container-api's challenge route (which the
+startup bootstrap appends after existing actions, keeping this priority).
+Package renewals and custom-domain issuance then coexist safely.
 
 ## API surface verification (done — optional re-check)
 
@@ -220,7 +251,31 @@ journalctl -u nordkraft -n 50 | grep -E "(Custom domains|ACME|Domain reconciler)
 > anything but a live token, which an HTTP health check would misread as
 > "down").
 
-### 4. Customer flow
+### 4. Open the controller firewall for the challenge listener
+
+The controller's nftables input chain is default-drop; pfSense must be
+allowed to reach the challenge port. Add the rule live:
+
+```bash
+sudo nft insert rule inet filter input ip saddr <pfsense-lan-ip> tcp dport 8801 accept comment \"acme-challenge-from-pfsense\"
+```
+
+…and persist it by adding the same line to your base ruleset (typically
+`/etc/nftables.conf`, next to the existing API-port rule). Validate the
+file without applying it (`nft -f` would flush runtime tenant rules):
+
+```bash
+sudo nft -c -f /etc/nftables.conf
+```
+
+Verify from pfSense (Diagnostics → Command Prompt):
+
+```bash
+curl -s -o /dev/null -w "%{http_code}" http://<challenge-addr>/.well-known/acme-challenge/test
+# expect 404
+```
+
+### 5. Customer flow
 
 ```bash
 # Customer registers their domain

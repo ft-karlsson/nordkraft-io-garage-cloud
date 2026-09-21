@@ -26,8 +26,9 @@ toml = "0.8"
 
 # Custom domains (BYO-domain ingress): DNS verification + ACME issuance
 hickory-resolver = "0.24"
-instant-acme = "0.7"
-rcgen = "0.13"
+# 0.8.5+ required: 0.7 fails to deserialize Let's Encrypt challenge types
+# without a token (e.g. dns-persist-01) — hit in production Sep 2026.
+instant-acme = "0.8.5"
 x509-parser = "0.16"
 idna = "1"
 psl = "2"
