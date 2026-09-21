@@ -4,9 +4,9 @@
 
 ---
 
-## På vej — brug dit eget domæne
+## September 2026 — v0.3.41
 
-**`nordkraft domain add mitfirma.dk --container myapp`**
+**Brug dit eget domæne**
 
 Peg dit eget domæne direkte på en container. Du opretter to DNS-records hos
 din udbyder — resten sker automatisk: ejerskabet bekræftes mod domænets

@@ -388,8 +388,7 @@ nordkraft ingress list
 
 ## Domain kommandoer (dit eget domæne)
 
-!!! info "På vej"
-    Klar i næste release. Se guiden [Custom domæner & HTTPS](../guides/domains.md).
+Se også guiden [Custom domæner & HTTPS](../guides/domains.md).
 
 ### domain add
 

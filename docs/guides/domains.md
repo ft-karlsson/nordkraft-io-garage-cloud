@@ -20,10 +20,6 @@ projekter der ikke behøver eget navn.
 
 ## Dit eget domæne
 
-!!! info "På vej"
-    Custom domæner er klar i næste release af CLI'en. Guiden her beskriver
-    hvordan det kommer til at virke.
-
 Peg dit eget domæne — fx `mitfirma.dk` — direkte på en container. Du får:
 
 - **Automatisk HTTPS** med et rigtigt Let's Encrypt-certifikat
