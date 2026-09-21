@@ -54,6 +54,22 @@ pub struct TcpIngressResult {
     pub frontend_name: String,
 }
 
+/// Result of creating custom-domain routing objects (BYO domain).
+#[derive(Debug, Clone)]
+pub struct CustomDomainIngressResult {
+    pub backend_name: String,
+    pub server_name: String,
+    pub acl_name: String,
+}
+
+/// Shared names for the ACME HTTP-01 challenge plumbing, created once at
+/// startup by ensure_acme_challenge_route(). The path ACL routes
+/// /.well-known/acme-challenge/* on BOTH frontends to container-api.
+pub const ACME_CHALLENGE_BACKEND: &str = "nk_acme_challenge";
+pub const ACME_CHALLENGE_SERVER: &str = "nk_acme_srv";
+pub const ACME_CHALLENGE_ACL: &str = "nk_acme_path";
+pub const ACME_CHALLENGE_PATH: &str = "/.well-known/acme-challenge/";
+
 // ============= TRAIT =============
 
 #[async_trait]
@@ -108,6 +124,78 @@ pub trait HAProxyClientTrait: Send + Sync {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     async fn apply(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    // ============= CUSTOM DOMAINS (BYO domain) =============
+
+    /// Idempotently create the shared ACME challenge backend + path ACL +
+    /// action on BOTH frontends. Called at startup. `challenge_addr` is
+    /// "ip:port" of container-api's own challenge endpoint.
+    async fn ensure_acme_challenge_route(
+        &self,
+        challenge_addr: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Upload a PEM cert chain + private key to the pfSense certificate
+    /// store. Returns the pfSense cert refid.
+    async fn upload_certificate(
+        &self,
+        name: &str,
+        cert_chain_pem: &str,
+        private_key_pem: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Remove a certificate from the pfSense store by refid. Idempotent.
+    async fn delete_certificate(
+        &self,
+        refid: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Attach a certificate to the HTTPS frontend's additional-certificates
+    /// list (SNI selects it at runtime). Idempotent.
+    async fn bind_certificate_to_https_frontend(
+        &self,
+        cert_refid: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Detach a certificate from the HTTPS frontend. Idempotent.
+    async fn unbind_certificate_from_https_frontend(
+        &self,
+        cert_refid: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Create routing for a custom domain on the HTTPS frontend: dedicated
+    /// backend + EXACT host-match ACL + use_backend action. `name_prefix`
+    /// must be derived from the DB row id (e.g. "cd_17_customer1_net") —
+    /// never from raw user input.
+    async fn create_custom_domain_ingress(
+        &self,
+        name_prefix: &str,
+        full_domain: &str,
+        target_ip: &str,
+        target_port: u16,
+    ) -> Result<CustomDomainIngressResult, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Remove the HTTP→HTTPS redirect objects for a custom domain from the
+    /// HTTP frontend (redirect action + host ACL). Idempotent.
+    async fn remove_custom_domain_http_redirect(
+        &self,
+        acl_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Read-back verification: do the backend, ACL, and action for this
+    /// custom domain all currently exist on pfSense? Used before a domain is
+    /// ever marked 'active', and for steady-state drift detection.
+    async fn verify_custom_domain_ingress(
+        &self,
+        backend_name: &str,
+        acl_name: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Read-back verification for cert binding on the HTTPS frontend.
+    async fn https_frontend_has_certificate(
+        &self,
+        cert_refid: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // ============= PFSENSE HAPROXY CLIENT =============
@@ -173,7 +261,11 @@ struct CreateActionRequest {
     parent_id: i64,
     action: String,
     acl: String,
-    backend: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend: Option<String>,
+    /// For http-request_redirect actions, e.g. "scheme https code 301".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,16 +360,32 @@ impl HAProxyClient {
         name: &str,
         mode: &str,
     ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        self.create_backend_with_check(name, mode, mode == "http")
+            .await
+    }
+
+    /// `health_check: false` creates the backend with check_type "none".
+    /// Needed for the ACME challenge backend: the default HTTP check probes
+    /// GET / — container-api has no / route, answers 404, and HAProxy would
+    /// mark the server DOWN (503 for every challenge).
+    async fn create_backend_with_check(
+        &self,
+        name: &str,
+        mode: &str,
+        health_check: bool,
+    ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
         let request = CreateBackendRequest {
             name: name.to_string(),
             mode: mode.to_string(),
             balance: "roundrobin".to_string(),
-            check_type: if mode == "http" {
+            check_type: if mode == "http" && health_check {
                 Some("HTTP".to_string())
+            } else if !health_check {
+                Some("none".to_string())
             } else {
                 None
             },
-            httpcheck_method: if mode == "http" {
+            httpcheck_method: if mode == "http" && health_check {
                 Some("GET".to_string())
             } else {
                 None
@@ -508,7 +616,8 @@ impl HAProxyClient {
             parent_id: frontend_id,
             acl: acl_name.to_string(),
             action: "use_backend".to_string(),
-            backend: backend.to_string(),
+            backend: Some(backend.to_string()),
+            rule: None,
         };
 
         self.api_request(
@@ -518,6 +627,223 @@ impl HAProxyClient {
         )
         .await?;
         info!("✅ Added action: {} → {}", acl_name, backend);
+        Ok(())
+    }
+
+    /// Add an http-request redirect action (e.g. "scheme https code 301")
+    /// gated on `acl_condition` (space-separated ACL names, `!` negates).
+    async fn add_redirect_action(
+        &self,
+        frontend_id: i64,
+        acl_condition: &str,
+        rule: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let request = CreateActionRequest {
+            parent_id: frontend_id,
+            acl: acl_condition.to_string(),
+            action: "http-request_redirect".to_string(),
+            backend: None,
+            rule: Some(rule.to_string()),
+        };
+
+        self.api_request(
+            "POST",
+            "/api/v2/services/haproxy/frontend/action",
+            Some(&request),
+        )
+        .await?;
+        info!("✅ Added redirect action [{}] → {}", acl_condition, rule);
+        Ok(())
+    }
+
+    /// Does `frontend_name` carry an action whose ACL condition equals
+    /// `acl_condition`? (Used for redirect actions, which have no backend.)
+    async fn frontend_has_action_with_acl(
+        &self,
+        frontend_name: &str,
+        acl_condition: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        for frontend in self.get_frontends().await? {
+            if frontend.get("name").and_then(|v| v.as_str()) != Some(frontend_name) {
+                continue;
+            }
+            return Ok(frontend
+                .get("a_actionitems")
+                .and_then(|v| v.as_array())
+                .map(|actions| {
+                    actions
+                        .iter()
+                        .any(|a| a.get("acl").and_then(|v| v.as_str()) == Some(acl_condition))
+                })
+                .unwrap_or(false));
+        }
+        Ok(false)
+    }
+
+    /// Delete the action on `frontend_name` whose ACL condition equals
+    /// `acl_condition`. Idempotent.
+    async fn delete_action_by_acl(
+        &self,
+        frontend_name: &str,
+        acl_condition: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for frontend in self.get_frontends().await? {
+            if frontend.get("name").and_then(|v| v.as_str()) != Some(frontend_name) {
+                continue;
+            }
+            if let Some(actions) = frontend.get("a_actionitems").and_then(|v| v.as_array()) {
+                for action in actions {
+                    if action.get("acl").and_then(|v| v.as_str()) == Some(acl_condition) {
+                        if let (Some(parent_id), Some(action_id)) = (
+                            frontend.get("id").and_then(|v| v.as_i64()),
+                            action.get("id").and_then(|v| v.as_i64()),
+                        ) {
+                            let endpoint = format!(
+                                "/api/v2/services/haproxy/frontend/action?parent_id={}&id={}",
+                                parent_id, action_id
+                            );
+                            self.api_request::<()>("DELETE", &endpoint, None).await?;
+                            info!(
+                                "✅ Deleted action [{}] from frontend {}",
+                                acl_condition, frontend_name
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        warn!(
+            "Action [{}] not found in frontend {} (already deleted?)",
+            acl_condition, frontend_name
+        );
+        Ok(())
+    }
+
+    // ============= CUSTOM DOMAIN HELPERS =============
+    //
+    // Endpoint/field names for frontend certificate binding are CONFIRMED
+    // against the pfSense REST API v2 OpenAPI spec (pfrest.org):
+    //   POST/DELETE /api/v2/services/haproxy/frontend/certificate
+    //   HAProxyFrontendCertificate.ssl_certificate = cert refid
+    //   HAProxyFrontend.ha_certificates = additional-certs array
+    // If a future package version renames them, adjust the two constants
+    // below — nothing else references them.
+    const FRONTEND_CERT_ENDPOINT: &'static str = "/api/v2/services/haproxy/frontend/certificate";
+    const FRONTEND_CERT_FIELD: &'static str = "ssl_certificate";
+
+    async fn get_backends(
+        &self,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let response = self
+            .api_request::<()>("GET", "/api/v2/services/haproxy/backends", None)
+            .await?;
+
+        if let Some(data) = response.data {
+            if let Some(backends) = data.as_array() {
+                return Ok(backends.clone());
+            }
+        }
+        Ok(vec![])
+    }
+
+    async fn find_backend_id(
+        &self,
+        name: &str,
+    ) -> Result<Option<i64>, Box<dyn std::error::Error + Send + Sync>> {
+        for backend in self.get_backends().await? {
+            if backend.get("name").and_then(|v| v.as_str()) == Some(name) {
+                return Ok(backend.get("id").and_then(|v| v.as_i64()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Does `frontend_name` currently carry both the named ACL and a
+    /// use_backend action pointing at `backend_name`?
+    async fn frontend_has_acl_and_action(
+        &self,
+        frontend_name: &str,
+        acl_name: &str,
+        backend_name: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        for frontend in self.get_frontends().await? {
+            if frontend.get("name").and_then(|v| v.as_str()) != Some(frontend_name) {
+                continue;
+            }
+            let has_acl = frontend
+                .get("ha_acls")
+                .and_then(|v| v.as_array())
+                .map(|acls| {
+                    acls.iter()
+                        .any(|a| a.get("name").and_then(|v| v.as_str()) == Some(acl_name))
+                })
+                .unwrap_or(false);
+            let has_action = frontend
+                .get("a_actionitems")
+                .and_then(|v| v.as_array())
+                .map(|actions| {
+                    actions
+                        .iter()
+                        .any(|a| a.get("backend").and_then(|v| v.as_str()) == Some(backend_name))
+                })
+                .unwrap_or(false);
+            return Ok(has_acl && has_action);
+        }
+        Ok(false)
+    }
+
+    async fn add_path_acl(
+        &self,
+        frontend_id: i64,
+        acl_name: &str,
+        path_prefix: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let request = CreateAclRequest {
+            parent_id: frontend_id,
+            name: acl_name.to_string(),
+            expression: "path_starts_with".to_string(),
+            value: path_prefix.to_string(),
+            casesensitive: Some(true),
+            not: Some(false),
+        };
+
+        self.api_request(
+            "POST",
+            "/api/v2/services/haproxy/frontend/acl",
+            Some(&request),
+        )
+        .await?;
+        info!("✅ Added path ACL {} for {}", acl_name, path_prefix);
+        Ok(())
+    }
+
+    /// Idempotently ensure the ACME challenge backend + ACL + action exist on
+    /// the given frontend.
+    async fn ensure_acme_route_on_frontend(
+        &self,
+        frontend_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self
+            .frontend_has_acl_and_action(frontend_name, ACME_CHALLENGE_ACL, ACME_CHALLENGE_BACKEND)
+            .await?
+        {
+            debug!(
+                "ACME challenge route already present on frontend {}",
+                frontend_name
+            );
+            return Ok(());
+        }
+
+        let frontend_id = self.get_frontend_id(frontend_name).await?;
+        self.add_path_acl(frontend_id, ACME_CHALLENGE_ACL, ACME_CHALLENGE_PATH)
+            .await?;
+        self.add_backend_action(frontend_id, ACME_CHALLENGE_ACL, ACME_CHALLENGE_BACKEND)
+            .await?;
+        info!(
+            "✅ ACME challenge route created on frontend {}",
+            frontend_name
+        );
         Ok(())
     }
 
@@ -748,6 +1074,367 @@ impl HAProxyClientTrait for HAProxyClient {
         info!("✅ HAProxy configuration applied");
         Ok(())
     }
+
+    // ============= CUSTOM DOMAINS =============
+
+    async fn ensure_acme_challenge_route(
+        &self,
+        challenge_addr: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (addr, port_str) = challenge_addr
+            .rsplit_once(':')
+            .ok_or("CUSTOM_DOMAINS_CHALLENGE_ADDR must be ip:port")?;
+        let port: u16 = port_str
+            .parse()
+            .map_err(|e| format!("Invalid challenge port '{}': {}", port_str, e))?;
+
+        // 1. Shared backend pointing at container-api's challenge endpoint.
+        //    NO health check: the default HTTP check probes GET /, which
+        //    container-api answers with 404, and HAProxy would mark the
+        //    server DOWN — every challenge would 503.
+        let existing = self
+            .get_backends()
+            .await?
+            .into_iter()
+            .find(|b| b.get("name").and_then(|v| v.as_str()) == Some(ACME_CHALLENGE_BACKEND));
+
+        match existing {
+            None => {
+                let backend_id = self
+                    .create_backend_with_check(ACME_CHALLENGE_BACKEND, "http", false)
+                    .await?;
+                self.add_server(backend_id, ACME_CHALLENGE_SERVER, addr, port)
+                    .await?;
+                info!("✅ ACME challenge backend created → {}:{}", addr, port);
+            }
+            Some(backend) => {
+                // Self-heal a backend created by an earlier build that still
+                // carries the HTTP health check.
+                let check = backend
+                    .get("check_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !check.eq_ignore_ascii_case("none") {
+                    if let Some(id) = backend.get("id").and_then(|v| v.as_i64()) {
+                        warn!(
+                            "ACME challenge backend has health check '{}' — disabling it",
+                            check
+                        );
+                        let patch = serde_json::json!({ "id": id, "check_type": "none" });
+                        self.api_request("PATCH", "/api/v2/services/haproxy/backend", Some(&patch))
+                            .await?;
+                        info!("✅ ACME challenge backend health check disabled");
+                    }
+                } else {
+                    debug!("ACME challenge backend already exists (no health check)");
+                }
+
+                // Self-heal the server address too, so changing
+                // CUSTOM_DOMAINS_CHALLENGE_ADDR takes effect on restart
+                // instead of silently keeping the old target.
+                if let (Some(backend_id), Some(servers)) = (
+                    backend.get("id").and_then(|v| v.as_i64()),
+                    backend.get("servers").and_then(|v| v.as_array()),
+                ) {
+                    for server in servers {
+                        if server.get("name").and_then(|v| v.as_str())
+                            != Some(ACME_CHALLENGE_SERVER)
+                        {
+                            continue;
+                        }
+                        let cur_addr = server.get("address").and_then(|v| v.as_str()).unwrap_or("");
+                        let cur_port = server
+                            .get("port")
+                            .map(|v| match v {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            })
+                            .unwrap_or_default();
+                        if cur_addr != addr || cur_port != port.to_string() {
+                            if let Some(server_id) = server.get("id").and_then(|v| v.as_i64()) {
+                                warn!(
+                                    "ACME challenge server points at {}:{} — updating to {}:{}",
+                                    cur_addr, cur_port, addr, port
+                                );
+                                let patch = serde_json::json!({
+                                    "parent_id": backend_id,
+                                    "id": server_id,
+                                    "address": addr,
+                                    "port": port.to_string(),
+                                });
+                                self.api_request(
+                                    "PATCH",
+                                    "/api/v2/services/haproxy/backend/server",
+                                    Some(&patch),
+                                )
+                                .await?;
+                                info!("✅ ACME challenge server updated → {}:{}", addr, port);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Path ACL + action on BOTH frontends. Both are needed: if the
+        //    HTTP frontend redirects to HTTPS, Let's Encrypt follows the
+        //    redirect and the challenge arrives on 443 instead.
+        let http_frontend = self.http_frontend.clone();
+        let https_frontend = self.https_frontend.clone();
+        self.ensure_acme_route_on_frontend(&http_frontend).await?;
+        self.ensure_acme_route_on_frontend(&https_frontend).await?;
+
+        self.apply().await?;
+        info!("✅ ACME challenge routing verified on both frontends");
+        Ok(())
+    }
+
+    async fn upload_certificate(
+        &self,
+        name: &str,
+        cert_chain_pem: &str,
+        private_key_pem: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        // crt/prv take RAW PEM strings — the API base64-encodes internally
+        // for config.xml (its "Base64Field" describes storage, not the API
+        // contract; base64 input fails X509_VALIDATOR_INVALID_VALUE —
+        // verified empirically against a Netgate 4200). A full chain
+        // (leaf + intermediates) in one crt is accepted.
+        let request = serde_json::json!({
+            "descr": name,
+            "type": "server",
+            "crt": cert_chain_pem,
+            "prv": private_key_pem,
+        });
+
+        let response = self
+            .api_request("POST", "/api/v2/system/certificate", Some(&request))
+            .await?;
+
+        let refid = response
+            .data
+            .as_ref()
+            .and_then(|d| d.get("refid"))
+            .and_then(|v| v.as_str())
+            .ok_or("pfSense did not return a certificate refid")?
+            .to_string();
+
+        info!("✅ Uploaded certificate '{}' (refid: {})", name, refid);
+        Ok(refid)
+    }
+
+    async fn delete_certificate(
+        &self,
+        refid: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Look up the current numeric id by refid (ids shift, refids don't).
+        let response = self
+            .api_request::<()>("GET", "/api/v2/system/certificates", None)
+            .await?;
+
+        if let Some(data) = response.data {
+            if let Some(certs) = data.as_array() {
+                for cert in certs {
+                    if cert.get("refid").and_then(|v| v.as_str()) == Some(refid) {
+                        if let Some(id) = cert.get("id").and_then(|v| v.as_i64()) {
+                            let endpoint = format!("/api/v2/system/certificate?id={}", id);
+                            self.api_request::<()>("DELETE", &endpoint, None).await?;
+                            info!("🗑️ Deleted certificate refid {}", refid);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+
+        warn!("Certificate refid {} not found (already deleted?)", refid);
+        Ok(())
+    }
+
+    async fn bind_certificate_to_https_frontend(
+        &self,
+        cert_refid: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.https_frontend_has_certificate(cert_refid).await? {
+            debug!("Certificate {} already bound to HTTPS frontend", cert_refid);
+            return Ok(());
+        }
+
+        let frontend_id = self.get_frontend_id(&self.https_frontend).await?;
+        let request = serde_json::json!({
+            "parent_id": frontend_id,
+            Self::FRONTEND_CERT_FIELD: cert_refid,
+        });
+
+        self.api_request("POST", Self::FRONTEND_CERT_ENDPOINT, Some(&request))
+            .await?;
+        self.apply().await?;
+        info!(
+            "✅ Certificate {} bound to HTTPS frontend (SNI)",
+            cert_refid
+        );
+        Ok(())
+    }
+
+    async fn unbind_certificate_from_https_frontend(
+        &self,
+        cert_refid: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for frontend in self.get_frontends().await? {
+            if frontend.get("name").and_then(|v| v.as_str()) != Some(self.https_frontend.as_str()) {
+                continue;
+            }
+            if let Some(certs) = frontend.get("ha_certificates").and_then(|v| v.as_array()) {
+                for cert in certs {
+                    if cert.get(Self::FRONTEND_CERT_FIELD).and_then(|v| v.as_str())
+                        == Some(cert_refid)
+                    {
+                        if let (Some(parent_id), Some(cert_id)) = (
+                            frontend.get("id").and_then(|v| v.as_i64()),
+                            cert.get("id").and_then(|v| v.as_i64()),
+                        ) {
+                            let endpoint = format!(
+                                "{}?parent_id={}&id={}",
+                                Self::FRONTEND_CERT_ENDPOINT,
+                                parent_id,
+                                cert_id
+                            );
+                            self.api_request::<()>("DELETE", &endpoint, None).await?;
+                            self.apply().await?;
+                            info!("🗑️ Certificate {} unbound from HTTPS frontend", cert_refid);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+
+        warn!(
+            "Certificate {} not bound to HTTPS frontend (already unbound?)",
+            cert_refid
+        );
+        Ok(())
+    }
+
+    async fn create_custom_domain_ingress(
+        &self,
+        name_prefix: &str,
+        full_domain: &str,
+        target_ip: &str,
+        target_port: u16,
+    ) -> Result<CustomDomainIngressResult, Box<dyn std::error::Error + Send + Sync>> {
+        let backend_name = format!("{}_be", name_prefix);
+        let server_name = format!("{}_srv", name_prefix);
+        let acl_name = format!("{}_acl", name_prefix);
+
+        info!(
+            "🌍 Creating custom-domain ingress: {} → {}:{}",
+            full_domain, target_ip, target_port
+        );
+
+        // Idempotent: a leftover backend from a previous partial attempt is
+        // reused rather than failing the whole activation.
+        match self.find_backend_id(&backend_name).await? {
+            Some(id) => {
+                debug!("Backend {} already exists (id {})", backend_name, id);
+            }
+            None => {
+                let id = self.create_backend(&backend_name, "http").await?;
+                self.add_server(id, &server_name, target_ip, target_port)
+                    .await?;
+            }
+        }
+
+        if !self
+            .frontend_has_acl_and_action(&self.https_frontend, &acl_name, &backend_name)
+            .await?
+        {
+            let frontend_id = self.get_frontend_id(&self.https_frontend).await?;
+            // EXACT host match — never a wildcard. Isolation by construction.
+            self.add_http_acl(frontend_id, &acl_name, full_domain)
+                .await?;
+            self.add_backend_action(frontend_id, &acl_name, &backend_name)
+                .await?;
+        }
+
+        // HTTP→HTTPS redirect for this host on the HTTP frontend. The
+        // exclusion uses OUR nk_acme_path ACL (guaranteed by the startup
+        // bootstrap on every install) so HTTP-01 challenges are never
+        // redirected while everything else gets a 301.
+        let redirect_condition = format!("{} !{}", acl_name, ACME_CHALLENGE_ACL);
+        if !self
+            .frontend_has_action_with_acl(&self.http_frontend, &redirect_condition)
+            .await?
+        {
+            let http_frontend_id = self.get_frontend_id(&self.http_frontend).await?;
+            self.add_http_acl(http_frontend_id, &acl_name, full_domain)
+                .await?;
+            self.add_redirect_action(
+                http_frontend_id,
+                &redirect_condition,
+                "scheme https code 301",
+            )
+            .await?;
+        }
+
+        self.apply().await?;
+
+        info!(
+            "✅ Custom-domain ingress created: https://{} (+ http→https redirect)",
+            full_domain
+        );
+
+        Ok(CustomDomainIngressResult {
+            backend_name,
+            server_name,
+            acl_name,
+        })
+    }
+
+    async fn remove_custom_domain_http_redirect(
+        &self,
+        acl_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let redirect_condition = format!("{} !{}", acl_name, ACME_CHALLENGE_ACL);
+        let http_frontend = self.http_frontend.clone();
+        self.delete_action_by_acl(&http_frontend, &redirect_condition)
+            .await?;
+        self.apply().await?;
+        self.delete_acl_from_frontend(&http_frontend, acl_name)
+            .await?;
+        self.apply().await?;
+        Ok(())
+    }
+
+    async fn verify_custom_domain_ingress(
+        &self,
+        backend_name: &str,
+        acl_name: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let backend_exists = self.find_backend_id(backend_name).await?.is_some();
+        let routing_exists = self
+            .frontend_has_acl_and_action(&self.https_frontend, acl_name, backend_name)
+            .await?;
+        Ok(backend_exists && routing_exists)
+    }
+
+    async fn https_frontend_has_certificate(
+        &self,
+        cert_refid: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        for frontend in self.get_frontends().await? {
+            if frontend.get("name").and_then(|v| v.as_str()) != Some(self.https_frontend.as_str()) {
+                continue;
+            }
+            if let Some(certs) = frontend.get("ha_certificates").and_then(|v| v.as_array()) {
+                return Ok(certs.iter().any(|c| {
+                    c.get(Self::FRONTEND_CERT_FIELD).and_then(|v| v.as_str()) == Some(cert_refid)
+                }));
+            }
+            return Ok(false);
+        }
+        Ok(false)
+    }
 }
 
 // ============= DUMMY CLIENT =============
@@ -878,5 +1565,110 @@ impl HAProxyClientTrait for DummyHAProxyClient {
     async fn apply(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         warn!("⚠️ HAProxy API disabled - manual apply required");
         Ok(())
+    }
+
+    // ============= CUSTOM DOMAINS (dummy) =============
+
+    async fn ensure_acme_challenge_route(
+        &self,
+        challenge_addr: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        warn!(
+            "⚠️ HAProxy API disabled - ACME challenge route not created (would target {})",
+            challenge_addr
+        );
+        Ok(())
+    }
+
+    async fn upload_certificate(
+        &self,
+        name: &str,
+        _cert_chain_pem: &str,
+        _private_key_pem: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        warn!(
+            "⚠️ HAProxy API disabled - certificate '{}' not uploaded",
+            name
+        );
+        Ok(format!("manual-cert-{}", uuid::Uuid::new_v4()))
+    }
+
+    async fn delete_certificate(
+        &self,
+        refid: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        warn!(
+            "⚠️ HAProxy API disabled - certificate {} not deleted",
+            refid
+        );
+        Ok(())
+    }
+
+    async fn bind_certificate_to_https_frontend(
+        &self,
+        cert_refid: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        warn!(
+            "⚠️ HAProxy API disabled - certificate {} not bound to frontend",
+            cert_refid
+        );
+        Ok(())
+    }
+
+    async fn unbind_certificate_from_https_frontend(
+        &self,
+        cert_refid: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        warn!(
+            "⚠️ HAProxy API disabled - certificate {} not unbound from frontend",
+            cert_refid
+        );
+        Ok(())
+    }
+
+    async fn create_custom_domain_ingress(
+        &self,
+        name_prefix: &str,
+        full_domain: &str,
+        target_ip: &str,
+        target_port: u16,
+    ) -> Result<CustomDomainIngressResult, Box<dyn std::error::Error + Send + Sync>> {
+        warn!(
+            "⚠️ HAProxy API disabled - manual config required: {} → {}:{}",
+            full_domain, target_ip, target_port
+        );
+        Ok(CustomDomainIngressResult {
+            backend_name: format!("{}_be", name_prefix),
+            server_name: format!("{}_srv", name_prefix),
+            acl_name: format!("{}_acl", name_prefix),
+        })
+    }
+
+    async fn remove_custom_domain_http_redirect(
+        &self,
+        acl_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        warn!(
+            "⚠️ HAProxy API disabled - redirect for {} not removed",
+            acl_name
+        );
+        Ok(())
+    }
+
+    async fn verify_custom_domain_ingress(
+        &self,
+        _backend_name: &str,
+        _acl_name: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        // Dummy mode: pretend verified so the dev-mode state machine can
+        // reach 'active'.
+        Ok(true)
+    }
+
+    async fn https_frontend_has_certificate(
+        &self,
+        _cert_refid: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(true)
     }
 }

@@ -204,6 +204,141 @@ fn init_haproxy_client(_config: &AppConfig) -> Arc<dyn HAProxyClientTrait> {
     }
 }
 
+// ============= CUSTOM DOMAINS INIT =============
+
+struct CustomDomainsInit {
+    routes_config: routes::domains::CustomDomainsConfig,
+    challenge_store: services::acme_manager::ChallengeStore,
+    dns_verifier: Arc<dyn services::dns_verifier::DnsVerifierTrait>,
+    acme_manager: Option<Arc<services::acme_manager::AcmeManager>>,
+    reconciler_settings: services::domain_reconciler::DomainReconcilerSettings,
+    challenge_addr: String,
+}
+
+/// Resolve custom-domain (BYO domain) configuration from the environment.
+/// Enabled only when CUSTOM_DOMAINS_ENABLED=true AND ingress is configured
+/// AND an ACME contact email is set — anything less runs disabled rather
+/// than half-working.
+fn init_custom_domains(config: &AppConfig) -> CustomDomainsInit {
+    let requested = std::env::var("CUSTOM_DOMAINS_ENABLED")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    let ingress_enabled = std::env::var("INGRESS_ENABLED")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    let base_domain =
+        std::env::var("INGRESS_BASE_DOMAIN").unwrap_or_else(|_| "example.dk".to_string());
+    let public_ip =
+        std::env::var("INGRESS_PUBLIC_IP").unwrap_or_else(|_| "203.0.113.1".to_string());
+    let contact_email = std::env::var("ACME_CONTACT_EMAIL").unwrap_or_default();
+    let staging = std::env::var("ACME_STAGING")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    let mut enabled = requested;
+    if requested && !ingress_enabled && !config.dev_mode {
+        error!("❌ CUSTOM_DOMAINS_ENABLED=true requires INGRESS_ENABLED=true — custom domains DISABLED");
+        enabled = false;
+    }
+    if requested && contact_email.is_empty() && !config.dev_mode {
+        error!(
+            "❌ CUSTOM_DOMAINS_ENABLED=true requires ACME_CONTACT_EMAIL — custom domains DISABLED"
+        );
+        enabled = false;
+    }
+
+    let challenge_store = services::acme_manager::ChallengeStore::new();
+
+    let dns_verifier: Arc<dyn services::dns_verifier::DnsVerifierTrait> = if config.dev_mode {
+        Arc::new(services::dns_verifier::DummyDnsVerifier)
+    } else {
+        Arc::new(services::dns_verifier::DnsVerifier::new())
+    };
+
+    let acme_manager = if enabled {
+        Some(Arc::new(services::acme_manager::AcmeManager::new(
+            contact_email,
+            staging,
+            challenge_store.clone(),
+        )))
+    } else {
+        None
+    };
+
+    let max_domains_per_user = std::env::var("CUSTOM_DOMAINS_MAX_PER_USER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+
+    let reconciler_settings = services::domain_reconciler::DomainReconcilerSettings {
+        interval_seconds: std::env::var("CUSTOM_DOMAINS_RECONCILE_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60),
+        public_ip: public_ip.clone(),
+        degraded_grace_days: std::env::var("CUSTOM_DOMAINS_GRACE_DAYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(7),
+        renew_before_days: std::env::var("CUSTOM_DOMAINS_RENEW_BEFORE_DAYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
+        active_recheck_seconds: std::env::var("CUSTOM_DOMAINS_RECHECK_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(86_400),
+    };
+
+    // Address of the DEDICATED challenge listener: a second socket in this
+    // same process, bound on the LAN side so pfSense/HAProxy can reach it
+    // directly, serving exactly one route (the ACME challenge). The main
+    // API keeps its WireGuard-only bind untouched. This value is both the
+    // listener's bind address and the HAProxy backend target.
+    let challenge_addr = std::env::var("CUSTOM_DOMAINS_CHALLENGE_ADDR")
+        .unwrap_or_else(|_| format!("{}:8801", config.controller_internal_ip));
+
+    if enabled {
+        info!(
+            "🌍 Custom domains enabled (ACME: {}, max/user: {}, challenge addr: {})",
+            if staging { "STAGING" } else { "production" },
+            max_domains_per_user,
+            challenge_addr
+        );
+    } else {
+        info!("🌍 Custom domains disabled");
+    }
+
+    CustomDomainsInit {
+        routes_config: routes::domains::CustomDomainsConfig {
+            enabled,
+            max_domains_per_user,
+            public_ip,
+            base_domain,
+        },
+        challenge_store,
+        dns_verifier,
+        acme_manager,
+        reconciler_settings,
+        challenge_addr,
+    }
+}
+
+/// Split "ip:port" for the dedicated challenge listener.
+fn parse_challenge_addr(addr: &str) -> Result<(String, u16), String> {
+    let (ip, port_str) = addr
+        .rsplit_once(':')
+        .ok_or_else(|| "expected ip:port".to_string())?;
+    if ip.is_empty() {
+        return Err("empty address".to_string());
+    }
+    let port: u16 = port_str
+        .parse()
+        .map_err(|e| format!("invalid port '{}': {}", port_str, e))?;
+    Ok((ip.to_string(), port))
+}
+
 // ============= AGENT NETWORK SETUP =============
 
 /// Ensure agent has all necessary routes for VPN traffic
@@ -896,6 +1031,84 @@ async fn rocket() -> _ {
     }
 
     // =========================================================
+    // CUSTOM DOMAINS (BYO domain) — controller/hybrid only
+    // 1. Spawn the dedicated ACME challenge listener (second socket in
+    //    THIS process — one binary, two binds; the main API stays
+    //    WireGuard-only).
+    // 2. Bootstrap the shared ACME challenge routing on HAProxy
+    //    (idempotent; safe on every boot).
+    // 3. Spawn the domain reconciler state machine.
+    // =========================================================
+    let custom_domains = init_custom_domains(&config);
+
+    if custom_domains.routes_config.enabled
+        && matches!(
+            config.mode,
+            config::OperationMode::Controller | config::OperationMode::Hybrid
+        )
+    {
+        // Dedicated challenge listener: exposes exactly ONE route
+        // (GET /.well-known/acme-challenge/<token>) on the LAN side,
+        // sharing the in-memory ChallengeStore with the ACME manager.
+        match parse_challenge_addr(&custom_domains.challenge_addr) {
+            Ok((ip, port)) => {
+                let figment = rocket::Config::figment()
+                    .merge(("address", ip))
+                    .merge(("port", port));
+                let challenge_rocket = rocket::custom(figment)
+                    .manage(custom_domains.challenge_store.clone())
+                    .mount("/", routes![routes::domains::acme_challenge]);
+                let addr = custom_domains.challenge_addr.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = challenge_rocket.launch().await {
+                        error!(
+                            "❌ ACME challenge listener on {} failed: {} — custom-domain certificate issuance will NOT work until this is fixed",
+                            addr, e
+                        );
+                    }
+                });
+                info!(
+                    "🔏 ACME challenge listener bound on {} (single route, LAN-facing)",
+                    custom_domains.challenge_addr
+                );
+            }
+            Err(e) => {
+                error!(
+                    "❌ Invalid CUSTOM_DOMAINS_CHALLENGE_ADDR '{}': {} — challenge listener NOT started",
+                    custom_domains.challenge_addr, e
+                );
+            }
+        }
+
+        match haproxy_client
+            .ensure_acme_challenge_route(&custom_domains.challenge_addr)
+            .await
+        {
+            Ok(_) => info!("✅ ACME challenge routing bootstrapped"),
+            Err(e) => {
+                // Don't crash the API — domains simply stay pending until
+                // the reconciler's next activation attempt or a restart.
+                error!(
+                    "❌ ACME challenge bootstrap failed (custom domains will not activate until this is fixed): {}",
+                    e
+                );
+            }
+        }
+
+        if let Some(acme_manager) = &custom_domains.acme_manager {
+            let reconciler = Arc::new(services::domain_reconciler::DomainReconciler::new(
+                db_pool.clone(),
+                Arc::clone(&haproxy_client),
+                Arc::clone(&pfsense_client),
+                Arc::clone(&custom_domains.dns_verifier),
+                Arc::clone(acme_manager),
+                custom_domains.reconciler_settings.clone(),
+            ));
+            reconciler.start();
+        }
+    }
+
+    // =========================================================
     // AGENT-SPECIFIC SETUP - CRITICAL FOR REBOOT SURVIVAL
     // =========================================================
 
@@ -942,7 +1155,10 @@ async fn rocket() -> _ {
         .manage(haproxy_client)
         .manage(macvlan_manager)
         .manage(event_store)
-        .manage(db_pool);
+        .manage(db_pool)
+        .manage(custom_domains.routes_config)
+        .manage(custom_domains.challenge_store)
+        .manage(custom_domains.dns_verifier);
 
     // Mount routes based on mode
     match config.mode {
@@ -986,6 +1202,12 @@ async fn rocket() -> _ {
                     routes::ingress::disable_ingress,
                     routes::ingress::get_ingress_status,
                     routes::ingress::list_ingress,
+                    // Custom domains (BYO domain)
+                    routes::domains::add_domain,
+                    routes::domains::domain_status,
+                    routes::domains::verify_domain_now,
+                    routes::domains::list_domains,
+                    routes::domains::remove_domain,
                     // Admin endpoints (signup-api → container-api provisioning)
                     admin_provision_tenant,
                     admin_deprovision_tenant,
@@ -996,6 +1218,10 @@ async fn rocket() -> _ {
                     routes::events::get_events,
                 ],
             )
+            // NOTE: the ACME challenge route is deliberately NOT mounted on
+            // this (WireGuard-only) listener — it lives on the dedicated
+            // LAN-facing listener spawned earlier, keeping this listener's
+            // surface to authenticated endpoints exactly.
         }
     }
 }

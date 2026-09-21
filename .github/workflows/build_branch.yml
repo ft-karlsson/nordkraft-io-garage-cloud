@@ -1,0 +1,52 @@
+name: Branch build (artifact only, no release)
+
+# Manually-triggered test build of container-api from any branch.
+# Produces a downloadable artifact — never a public release. Use this to
+# stage a feature branch on real hardware before merging + tagging.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Build target"
+        type: choice
+        default: aarch64-unknown-linux-gnu
+        options:
+          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-gnu
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ inputs.target }}
+
+    - name: Install cross-compilation tools
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y gcc-x86-64-linux-gnu gcc-aarch64-linux-gnu
+
+    - name: Build binary
+      env:
+        CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: x86_64-linux-gnu-gcc
+        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      run: |
+        cd container-api
+        cargo build --release --target ${{ inputs.target }}
+        mkdir -p ../dist
+        cp target/${{ inputs.target }}/release/container-api ../dist/nordkraft
+        cd ../dist && sha256sum nordkraft > nordkraft.sha256
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: nordkraft-${{ inputs.target }}-${{ github.ref_name }}
+        path: |
+          dist/nordkraft
+          dist/nordkraft.sha256
+        retention-days: 7
