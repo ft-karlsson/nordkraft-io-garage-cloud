@@ -36,6 +36,10 @@ Traffic path once active:
 ```
 Internet → pfSense :443 → https_frontend (SNI picks the customer1.net cert)
         → exact-match Host ACL → dedicated backend → 172.21.x.y:port
+
+Internet → pfSense :80  → http_frontend → 301 https://customer1.net/…
+        (per-domain redirect; ACME challenge paths are excluded via the
+         nk_acme_path ACL so HTTP-01 renewals keep working on port 80)
 ```
 
 **Isolation guarantees** (same philosophy as platform ingress, enforced by

@@ -553,10 +553,14 @@ pub async fn teardown_custom_domain(
 ) -> Vec<String> {
     let mut warnings = Vec::new();
 
-    // 1. Routing: action → ACL → backend (remove_https_ingress handles order)
+    // 1. Routing: action → ACL → backend (remove_https_ingress handles order),
+    //    plus the HTTP→HTTPS redirect objects on the HTTP frontend.
     if let (Some(backend), Some(acl)) = (&d.haproxy_backend_name, &d.haproxy_acl_name) {
         if let Err(e) = haproxy.remove_https_ingress(backend, acl).await {
             warnings.push(format!("HAProxy cleanup: {}", e));
+        }
+        if let Err(e) = haproxy.remove_custom_domain_http_redirect(acl).await {
+            warnings.push(format!("HTTP redirect cleanup: {}", e));
         }
     }
 

@@ -175,6 +175,13 @@ pub trait HAProxyClientTrait: Send + Sync {
         target_port: u16,
     ) -> Result<CustomDomainIngressResult, Box<dyn std::error::Error + Send + Sync>>;
 
+    /// Remove the HTTP→HTTPS redirect objects for a custom domain from the
+    /// HTTP frontend (redirect action + host ACL). Idempotent.
+    async fn remove_custom_domain_http_redirect(
+        &self,
+        acl_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
     /// Read-back verification: do the backend, ACL, and action for this
     /// custom domain all currently exist on pfSense? Used before a domain is
     /// ever marked 'active', and for steady-state drift detection.
@@ -254,7 +261,11 @@ struct CreateActionRequest {
     parent_id: i64,
     action: String,
     acl: String,
-    backend: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend: Option<String>,
+    /// For http-request_redirect actions, e.g. "scheme https code 301".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -605,7 +616,8 @@ impl HAProxyClient {
             parent_id: frontend_id,
             acl: acl_name.to_string(),
             action: "use_backend".to_string(),
-            backend: backend.to_string(),
+            backend: Some(backend.to_string()),
+            rule: None,
         };
 
         self.api_request(
@@ -615,6 +627,96 @@ impl HAProxyClient {
         )
         .await?;
         info!("✅ Added action: {} → {}", acl_name, backend);
+        Ok(())
+    }
+
+    /// Add an http-request redirect action (e.g. "scheme https code 301")
+    /// gated on `acl_condition` (space-separated ACL names, `!` negates).
+    async fn add_redirect_action(
+        &self,
+        frontend_id: i64,
+        acl_condition: &str,
+        rule: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let request = CreateActionRequest {
+            parent_id: frontend_id,
+            acl: acl_condition.to_string(),
+            action: "http-request_redirect".to_string(),
+            backend: None,
+            rule: Some(rule.to_string()),
+        };
+
+        self.api_request(
+            "POST",
+            "/api/v2/services/haproxy/frontend/action",
+            Some(&request),
+        )
+        .await?;
+        info!("✅ Added redirect action [{}] → {}", acl_condition, rule);
+        Ok(())
+    }
+
+    /// Does `frontend_name` carry an action whose ACL condition equals
+    /// `acl_condition`? (Used for redirect actions, which have no backend.)
+    async fn frontend_has_action_with_acl(
+        &self,
+        frontend_name: &str,
+        acl_condition: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        for frontend in self.get_frontends().await? {
+            if frontend.get("name").and_then(|v| v.as_str()) != Some(frontend_name) {
+                continue;
+            }
+            return Ok(frontend
+                .get("a_actionitems")
+                .and_then(|v| v.as_array())
+                .map(|actions| {
+                    actions
+                        .iter()
+                        .any(|a| a.get("acl").and_then(|v| v.as_str()) == Some(acl_condition))
+                })
+                .unwrap_or(false));
+        }
+        Ok(false)
+    }
+
+    /// Delete the action on `frontend_name` whose ACL condition equals
+    /// `acl_condition`. Idempotent.
+    async fn delete_action_by_acl(
+        &self,
+        frontend_name: &str,
+        acl_condition: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for frontend in self.get_frontends().await? {
+            if frontend.get("name").and_then(|v| v.as_str()) != Some(frontend_name) {
+                continue;
+            }
+            if let Some(actions) = frontend.get("a_actionitems").and_then(|v| v.as_array()) {
+                for action in actions {
+                    if action.get("acl").and_then(|v| v.as_str()) == Some(acl_condition) {
+                        if let (Some(parent_id), Some(action_id)) = (
+                            frontend.get("id").and_then(|v| v.as_i64()),
+                            action.get("id").and_then(|v| v.as_i64()),
+                        ) {
+                            let endpoint = format!(
+                                "/api/v2/services/haproxy/frontend/action?parent_id={}&id={}",
+                                parent_id, action_id
+                            );
+                            self.api_request::<()>("DELETE", &endpoint, None).await?;
+                            info!(
+                                "✅ Deleted action [{}] from frontend {}",
+                                acl_condition, frontend_name
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        warn!(
+            "Action [{}] not found in frontend {} (already deleted?)",
+            acl_condition, frontend_name
+        );
         Ok(())
     }
 
@@ -1255,15 +1357,53 @@ impl HAProxyClientTrait for HAProxyClient {
                 .await?;
         }
 
+        // HTTP→HTTPS redirect for this host on the HTTP frontend. The
+        // exclusion uses OUR nk_acme_path ACL (guaranteed by the startup
+        // bootstrap on every install) so HTTP-01 challenges are never
+        // redirected while everything else gets a 301.
+        let redirect_condition = format!("{} !{}", acl_name, ACME_CHALLENGE_ACL);
+        if !self
+            .frontend_has_action_with_acl(&self.http_frontend, &redirect_condition)
+            .await?
+        {
+            let http_frontend_id = self.get_frontend_id(&self.http_frontend).await?;
+            self.add_http_acl(http_frontend_id, &acl_name, full_domain)
+                .await?;
+            self.add_redirect_action(
+                http_frontend_id,
+                &redirect_condition,
+                "scheme https code 301",
+            )
+            .await?;
+        }
+
         self.apply().await?;
 
-        info!("✅ Custom-domain ingress created: https://{}", full_domain);
+        info!(
+            "✅ Custom-domain ingress created: https://{} (+ http→https redirect)",
+            full_domain
+        );
 
         Ok(CustomDomainIngressResult {
             backend_name,
             server_name,
             acl_name,
         })
+    }
+
+    async fn remove_custom_domain_http_redirect(
+        &self,
+        acl_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let redirect_condition = format!("{} !{}", acl_name, ACME_CHALLENGE_ACL);
+        let http_frontend = self.http_frontend.clone();
+        self.delete_action_by_acl(&http_frontend, &redirect_condition)
+            .await?;
+        self.apply().await?;
+        self.delete_acl_from_frontend(&http_frontend, acl_name)
+            .await?;
+        self.apply().await?;
+        Ok(())
     }
 
     async fn verify_custom_domain_ingress(
@@ -1502,6 +1642,17 @@ impl HAProxyClientTrait for DummyHAProxyClient {
             server_name: format!("{}_srv", name_prefix),
             acl_name: format!("{}_acl", name_prefix),
         })
+    }
+
+    async fn remove_custom_domain_http_redirect(
+        &self,
+        acl_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        warn!(
+            "⚠️ HAProxy API disabled - redirect for {} not removed",
+            acl_name
+        );
+        Ok(())
     }
 
     async fn verify_custom_domain_ingress(
