@@ -308,7 +308,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "container-api"
-version = "0.3.37"
+version = "0.3.38"
 dependencies = [
  "async-nats",
  "async-trait",

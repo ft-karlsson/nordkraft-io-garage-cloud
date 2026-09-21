@@ -349,16 +349,32 @@ impl HAProxyClient {
         name: &str,
         mode: &str,
     ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        self.create_backend_with_check(name, mode, mode == "http")
+            .await
+    }
+
+    /// `health_check: false` creates the backend with check_type "none".
+    /// Needed for the ACME challenge backend: the default HTTP check probes
+    /// GET / — container-api has no / route, answers 404, and HAProxy would
+    /// mark the server DOWN (503 for every challenge).
+    async fn create_backend_with_check(
+        &self,
+        name: &str,
+        mode: &str,
+        health_check: bool,
+    ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
         let request = CreateBackendRequest {
             name: name.to_string(),
             mode: mode.to_string(),
             balance: "roundrobin".to_string(),
-            check_type: if mode == "http" {
+            check_type: if mode == "http" && health_check {
                 Some("HTTP".to_string())
+            } else if !health_check {
+                Some("none".to_string())
             } else {
                 None
             },
-            httpcheck_method: if mode == "http" {
+            httpcheck_method: if mode == "http" && health_check {
                 Some("GET".to_string())
             } else {
                 None
@@ -970,18 +986,47 @@ impl HAProxyClientTrait for HAProxyClient {
             .parse()
             .map_err(|e| format!("Invalid challenge port '{}': {}", port_str, e))?;
 
-        // 1. Shared backend pointing at container-api's challenge endpoint
-        if self
-            .find_backend_id(ACME_CHALLENGE_BACKEND)
+        // 1. Shared backend pointing at container-api's challenge endpoint.
+        //    NO health check: the default HTTP check probes GET /, which
+        //    container-api answers with 404, and HAProxy would mark the
+        //    server DOWN — every challenge would 503.
+        let existing = self
+            .get_backends()
             .await?
-            .is_none()
-        {
-            let backend_id = self.create_backend(ACME_CHALLENGE_BACKEND, "http").await?;
-            self.add_server(backend_id, ACME_CHALLENGE_SERVER, addr, port)
-                .await?;
-            info!("✅ ACME challenge backend created → {}:{}", addr, port);
-        } else {
-            debug!("ACME challenge backend already exists");
+            .into_iter()
+            .find(|b| b.get("name").and_then(|v| v.as_str()) == Some(ACME_CHALLENGE_BACKEND));
+
+        match existing {
+            None => {
+                let backend_id = self
+                    .create_backend_with_check(ACME_CHALLENGE_BACKEND, "http", false)
+                    .await?;
+                self.add_server(backend_id, ACME_CHALLENGE_SERVER, addr, port)
+                    .await?;
+                info!("✅ ACME challenge backend created → {}:{}", addr, port);
+            }
+            Some(backend) => {
+                // Self-heal a backend created by an earlier build that still
+                // carries the HTTP health check.
+                let check = backend
+                    .get("check_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !check.eq_ignore_ascii_case("none") {
+                    if let Some(id) = backend.get("id").and_then(|v| v.as_i64()) {
+                        warn!(
+                            "ACME challenge backend has health check '{}' — disabling it",
+                            check
+                        );
+                        let patch = serde_json::json!({ "id": id, "check_type": "none" });
+                        self.api_request("PATCH", "/api/v2/services/haproxy/backend", Some(&patch))
+                            .await?;
+                        info!("✅ ACME challenge backend health check disabled");
+                    }
+                } else {
+                    debug!("ACME challenge backend already exists (no health check)");
+                }
+            }
         }
 
         // 2. Path ACL + action on BOTH frontends. Both are needed: if the
