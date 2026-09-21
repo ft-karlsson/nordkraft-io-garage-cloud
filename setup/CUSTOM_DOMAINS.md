@@ -15,6 +15,8 @@ first.
 
 ## How it works
 
+![Custom domains architecture](custom-domains-architecture.svg)
+
 ```
 nordkraft domain add customer1.net --container myapp
         │  (returns TXT + A record instructions immediately)
