@@ -37,6 +37,18 @@ pub async fn deploy_container(
             }
         };
 
+    // ========== IMAGE SOURCE POLICY ==========
+    // The agent pulls on the tenant's behalf and can reach every tenant subnet, so an
+    // IP-based registry must be inside this tenant's own subnet. Checked before any
+    // allocation happens.
+    if let Err(e) =
+        crate::services::image_policy::validate_image_source(&deploy_req.image, &container_subnet)
+    {
+        warn!("🚫 Image policy refused deploy for user {}: {}", user.0.id, e);
+        return Json(serde_json::json!({ "error": e }));
+    }
+    let registry_auth = resolve_registry_auth(pool.inner(), &user.0.id, &deploy_req.image).await;
+
     // Find best node
     let target_node = match select_garage_hardware_node(
         pool.inner(),
@@ -165,7 +177,8 @@ pub async fn deploy_container(
                 allocated_ip.clone(),
                 Some(container_name.clone()),
                 deploy_req.enable_ipv6, // Pass bool, not Option<String>
-                None,                   // event_tx — local deploy, response is synchronous
+                registry_auth.clone(),
+                None, // event_tx — local deploy, response is synchronous
             )
             .await
         {
@@ -250,6 +263,7 @@ pub async fn deploy_container(
                 volume_path: deploy_req.volume_path.clone(),
                 enable_ipv6: deploy_req.enable_ipv6,
                 ipv6_address: None, // Will be assigned by agent via SLAAC
+                registry_auth: registry_auth.clone(),
             };
             info!("📤 Sending NATS assignment to node {}", target_node);
 
@@ -829,6 +843,15 @@ pub async fn upgrade_container(
 
     let tenant_id = format!("tenant-{}", &user.0.id[..8]);
 
+    // 6b. Image source policy — before the container is stopped or removed.
+    if let Err(e) =
+        crate::services::image_policy::validate_image_source(&merged.image, &container_subnet)
+    {
+        warn!("🚫 Image policy refused upgrade for user {}: {}", user.0.id, e);
+        return Json(serde_json::json!({ "error": e }));
+    }
+    let registry_auth = resolve_registry_auth(pool.inner(), &user.0.id, &merged.image).await;
+
     // 7. Check if local or remote
     if node_id == orchestrator.node_id {
         // ===== LOCAL UPGRADE =====
@@ -840,6 +863,7 @@ pub async fn upgrade_container(
             &tenant_id,
             &node_id,
             &user,
+            registry_auth,
             app_state,
             pool,
         )
@@ -855,6 +879,7 @@ pub async fn upgrade_container(
                 user_slot: user.0.user_slot,
                 config: merged.clone(),
                 container_ip: container_ip.clone(),
+                registry_auth: registry_auth.clone(),
             };
 
             match nats.send_to_node(&node_id, msg).await {
@@ -901,6 +926,23 @@ pub async fn upgrade_container(
     }
 }
 
+/// Credentials for the tenant's own private registry, when the image points at one.
+/// Any other registry (public hostname, or an address the policy rejected) gets None.
+async fn resolve_registry_auth(
+    pool: &sqlx::PgPool,
+    user_id: &str,
+    image: &str,
+) -> Option<crate::models::RegistryAuth> {
+    let host = crate::services::image_policy::image_host(image)?;
+    match find_registry_auth(pool, user_id, host).await {
+        Ok(auth) => auth,
+        Err(e) => {
+            warn!("Registry credential lookup failed for {}: {}", host, e);
+            None
+        }
+    }
+}
+
 /// Perform a local in-place upgrade: stop → rm (preserve volumes) → redeploy.
 #[allow(clippy::too_many_arguments)]
 async fn upgrade_local(
@@ -911,6 +953,7 @@ async fn upgrade_local(
     tenant_id: &str,
     node_id: &str,
     user: &AuthenticatedUser,
+    registry_auth: Option<crate::models::RegistryAuth>,
     app_state: &rocket::State<AppState>,
     pool: &rocket::State<sqlx::PgPool>,
 ) -> Json<serde_json::Value> {
@@ -976,6 +1019,7 @@ async fn upgrade_local(
             Some(container_ip.to_string()),   // preserve IP
             Some(container_name.to_string()), // preserve name
             merged.enable_ipv6,
+            registry_auth,
             None, // event_tx — local upgrade, response is synchronous
         )
         .await

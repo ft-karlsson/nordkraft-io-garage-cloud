@@ -1,4 +1,5 @@
 deploy.sh
+.deploy.sh
 .claude/launch.json
 container-api/.DS_Store
 Claude outputs/

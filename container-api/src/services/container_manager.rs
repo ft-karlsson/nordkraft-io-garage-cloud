@@ -13,7 +13,7 @@
 //     - Parent interface: set by env
 
 use crate::config::AppConfig;
-use crate::models::{ContainerInfo, PortMapping, PortSpec};
+use crate::models::{ContainerInfo, PortMapping, PortSpec, RegistryAuth};
 use crate::services::macvlan_manager::MacvlanManager;
 use crate::services::nats_service::{NatsMessage, NatsService, NatsSubjects};
 use crate::services::persistence::PersistenceManager;
@@ -38,6 +38,29 @@ pub struct DeployPhaseEvent {
 pub type DeployEventTx = mpsc::Sender<DeployPhaseEvent>;
 
 /// Emit a deploy event. Non-blocking — silently drops if channel is full or closed.
+/// Write a Docker-style credential store holding exactly one registry entry into a
+/// private throwaway directory, for a single `nerdctl run`. The returned path is
+/// passed as DOCKER_CONFIG and removed by the caller afterwards.
+async fn write_pull_credentials(
+    auth: &RegistryAuth,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    use base64::Engine as _;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("nk-pull-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir(&dir).await?;
+    tokio::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).await?;
+
+    let token = base64::engine::general_purpose::STANDARD
+        .encode(format!("{}:{}", auth.username, auth.password));
+    let config = serde_json::json!({ "auths": { auth.host.clone(): { "auth": token } } });
+
+    let path = dir.join("config.json");
+    tokio::fs::write(&path, serde_json::to_vec(&config)?).await?;
+    tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
+    Ok(dir)
+}
+
 fn emit(
     tx: &Option<DeployEventTx>,
     container_name: &str,
@@ -137,6 +160,7 @@ impl ContainerManager {
         allocated_ip: Option<String>, // IPv4 from controller
         container_name: Option<String>,
         enable_ipv6: bool,
+        registry_auth: Option<RegistryAuth>, // scoped pull credentials, tenant's own registry only
         event_tx: Option<DeployEventTx>,
     ) -> Result<
         (
@@ -156,6 +180,13 @@ impl ContainerManager {
                 &uuid::Uuid::new_v4().to_string()[..8]
             )
         });
+
+        // The controller already enforced this; the agent checks independently.
+        if let Err(e) = crate::services::image_policy::validate_image_source(image, user_subnet) {
+            error!("🚫 Image policy refused pull for {}: {}", tenant_id, e);
+            emit(&event_tx, &container_name, "failed", &e, false);
+            return Err(e.into());
+        }
 
         emit(
             &event_tx,
@@ -376,10 +407,29 @@ impl ContainerManager {
             true,
         );
 
-        let output = tokio::process::Command::new(&self.runtime_binary)
-            .args(&args)
-            .output()
-            .await?;
+        // Credentials, if any, live in a private throwaway DOCKER_CONFIG dir that holds
+        // exactly one registry entry, scoped to this tenant's own registry.
+        let pull_config_dir = match &registry_auth {
+            Some(auth) => {
+                info!("🔐 Pull credentials scoped to {}", auth.host);
+                Some(write_pull_credentials(auth).await?)
+            }
+            None => None,
+        };
+
+        let mut cmd = tokio::process::Command::new(&self.runtime_binary);
+        cmd.args(&args);
+        if let Some(dir) = &pull_config_dir {
+            cmd.env("DOCKER_CONFIG", dir);
+        }
+        let output = cmd.output().await;
+
+        if let Some(dir) = &pull_config_dir {
+            if let Err(e) = tokio::fs::remove_dir_all(dir).await {
+                warn!("Could not remove pull credential dir {}: {}", dir.display(), e);
+            }
+        }
+        let output = output?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

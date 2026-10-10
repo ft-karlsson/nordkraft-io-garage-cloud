@@ -56,6 +56,30 @@ fn default_protocol() -> String {
     "tcp".to_string()
 }
 
+// ============= REGISTRY AUTH =============
+
+/// Credentials the agent presents when pulling from a tenant's own private registry.
+/// Resolved by the controller from the registry container's stored deploy config and
+/// scoped to exactly one registry host, so a pull from any other registry gets no
+/// credentials at all.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct RegistryAuth {
+    /// "ip:port" exactly as it appears in the image reference
+    pub host: String,
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for RegistryAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryAuth")
+            .field("host", &self.host)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
 // ============= DEPLOYMENT =============
 
 #[derive(Debug, Deserialize)]

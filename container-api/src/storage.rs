@@ -1462,6 +1462,52 @@ pub async fn get_container_config(
     }
 }
 
+/// Credentials for the tenant's own private registry at `host` ("ip:port").
+///
+/// Looks for a non-deleted container owned by `user_id` whose IP matches the host and
+/// reads REGISTRY_USERNAME / REGISTRY_PASSWORD from its stored deploy config (set by
+/// `nordkraft registry init`). Returns None for registries without credentials
+/// (0.1.0-era registries), and never for containers owned by someone else.
+pub async fn find_registry_auth(
+    pool: &PgPool,
+    user_id: &str,
+    host: &str,
+) -> Result<Option<crate::models::RegistryAuth>, Box<dyn std::error::Error + Send + Sync>> {
+    let ip = host.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(host);
+
+    let container_name: Option<String> = sqlx::query_scalar(
+        "SELECT container_name FROM containers
+         WHERE user_id = $1 AND internal_ip = $2 AND status != 'deleted'
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(ip)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(container_name) = container_name else {
+        return Ok(None);
+    };
+
+    let Some(config) = get_container_config(pool, &container_name, user_id).await? else {
+        return Ok(None);
+    };
+
+    match (
+        config.env_vars.get("REGISTRY_USERNAME"),
+        config.env_vars.get("REGISTRY_PASSWORD"),
+    ) {
+        (Some(username), Some(password)) if !username.is_empty() && !password.is_empty() => {
+            Ok(Some(crate::models::RegistryAuth {
+                host: host.to_string(),
+                username: username.clone(),
+                password: password.clone(),
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Get the current revision number for a container config.
 pub async fn get_container_config_revision(
     pool: &PgPool,

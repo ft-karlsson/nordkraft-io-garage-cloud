@@ -667,6 +667,7 @@ fn make_container_assignment_handler(
             volume_path,
             enable_ipv6,
             ipv6_address: _, // Ignored - SLAAC used instead
+            registry_auth,
         } = msg
         else {
             return;
@@ -721,6 +722,7 @@ fn make_container_assignment_handler(
                     allocated_ip,
                     Some(container_name.clone()),
                     enable_ipv6,
+                    registry_auth,
                     Some(event_tx),
                 )
                 .await;
@@ -870,6 +872,7 @@ fn make_container_upgrade_handler(
             user_slot,
             config,
             container_ip,
+            registry_auth,
         } = msg
         else {
             return;
@@ -964,6 +967,7 @@ fn make_container_upgrade_handler(
                     Some(container_ip.clone()),
                     Some(container_name.clone()),
                     config.enable_ipv6,
+                    registry_auth,
                     Some(event_tx),
                 )
                 .await;

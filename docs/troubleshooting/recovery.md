@@ -130,7 +130,9 @@ cat > ~/.nordkraft/registry.json <<'EOF'
 {
   "address": "172.21.<slot>.<ip>:5001",
   "container_name": "app-...",
-  "container_alias": "registry"
+  "container_alias": "registry",
+  "username": "nordkraft",
+  "password": "<REGISTRY_PASSWORD>"
 }
 EOF
 
@@ -138,6 +140,8 @@ nordkraft registry status
 ```
 
 Viser den `online` og dine images, er den rigtig.
+
+Adgangskoden ligger som miljøvariabel på selve registry-containeren. Hent den med `nordkraft init <registry-container> --from-server` og læs `REGISTRY_PASSWORD` i den `.nk`-spec der bliver skrevet. Registries fra før oktober 2026 har ingen adgangskode; udelad så de to felter.
 
 ### Aliaser
 

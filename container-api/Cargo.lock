@@ -396,10 +396,11 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "container-api"
-version = "0.3.41"
+version = "0.3.42"
 dependencies = [
  "async-nats",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "dotenv",
  "futures",
