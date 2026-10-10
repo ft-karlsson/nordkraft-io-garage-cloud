@@ -530,7 +530,9 @@ async fn nft_add_tenant_rule(
 
     if check.status.success() {
         let output_str = String::from_utf8_lossy(&check.stdout);
-        let pattern = format!("172.20.0.{}", user_slot);
+        // Match the rule's quoted comment exactly. A bare "172.20.0.1" prefix also
+        // matches 172.20.0.11, .12, .13 ..., which left slots 1 and 2 without a rule.
+        let pattern = format!("comment \"tenant-{}\"", user_slot);
         if output_str.contains(&pattern) {
             info!("🔥 nftables rule already exists for slot {}", user_slot);
             return Ok(());
