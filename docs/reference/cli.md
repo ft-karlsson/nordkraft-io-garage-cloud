@@ -607,6 +607,11 @@ nordkraft registry init
 
 Deployer registry-containeren og gemmer adressen i `~/.nordkraft/registry.json`.
 
+Registry'et er beskyttet med brugernavn og adgangskode, som `registry init` genererer og gemmer i samme fil. `nordkraft push` og `nordkraft deploy registry://…` bruger dem automatisk; platformen præsenterer kun dine egne credentials, og kun over for dit eget registry. Har du et registry fra før oktober 2026, er det åbent — kør `registry destroy` og `registry init` igen og push dine images på ny for at få et beskyttet.
+
+!!! note "Kun dit eget registry"
+    Et deploy må kun hente images fra dit eget registry (`registry://`) eller fra offentlige registries via hostnavn. IP-adresser uden for dit eget container-subnet afvises.
+
 !!! warning "Kør kun én gang"
     Kender CLI'en ikke dit registry — fx på en ny maskine — deployer `registry init` et **nyt** ved siden af det du allerede har. Genskab i stedet `registry.json`, se [Ny maskine / mistet config](../troubleshooting/recovery.md).
 

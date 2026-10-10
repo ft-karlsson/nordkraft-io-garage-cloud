@@ -1,6 +1,6 @@
 [package]
 name = "container-api"
-version = "0.3.41"
+version = "0.3.42"
 edition = "2021"
 
 [dependencies]
@@ -23,6 +23,8 @@ dotenv = "0.15.0"
 libc = "0.2.177"
 async-trait = "0.1.89"
 toml = "0.8"
+# Registry pull credentials (Docker config.json "auth" field)
+base64 = "0.22"
 
 # Custom domains (BYO-domain ingress): DNS verification + ACME issuance
 hickory-resolver = "0.24"

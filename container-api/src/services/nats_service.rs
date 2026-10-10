@@ -93,6 +93,10 @@ pub enum NatsMessage {
         enable_ipv6: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         ipv6_address: Option<String>,
+        /// Pull credentials scoped to the tenant's own registry. Absent for public images
+        /// and for messages from controllers that predate this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        registry_auth: Option<crate::models::RegistryAuth>,
     },
 
     // Container deletion
@@ -161,6 +165,8 @@ pub enum NatsMessage {
         user_slot: Option<i32>,
         config: ContainerConfig,
         container_ip: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        registry_auth: Option<crate::models::RegistryAuth>,
     },
 
     // Logs (request/response)
@@ -559,6 +565,7 @@ impl NatsService {
         volume_path: Option<String>,
         enable_ipv6: bool,
         ipv6_address: Option<String>,
+        registry_auth: Option<crate::models::RegistryAuth>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let message = NatsMessage::ContainerAssignment {
             job_id,
@@ -578,6 +585,7 @@ impl NatsService {
             volume_path,
             enable_ipv6,
             ipv6_address,
+            registry_auth,
         };
 
         let subject = NatsSubjects::container_assignment_for_node(node_id);

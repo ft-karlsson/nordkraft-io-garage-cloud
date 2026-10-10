@@ -5,6 +5,7 @@ pub mod domain_reconciler;
 pub mod domain_validation;
 pub mod event_store;
 pub mod haproxy_client;
+pub mod image_policy;
 pub mod macvlan_manager;
 pub mod nats_service;
 pub mod peer_resolver;

@@ -4,6 +4,28 @@
 
 ---
 
+## Oktober 2026 — v0.3.42
+
+**Privat registry med adgangskode**
+
+`nordkraft registry init` opretter nu et registry der kræver brugernavn og adgangskode.
+CLI'en genererer dem, gemmer dem i `~/.nordkraft/registry.json` og bruger dem selv ved
+`push` og `deploy registry://…`. Når platformen henter et image fra dit registry, sker
+det med dine credentials og kun dem — intet andet registry får dem præsenteret.
+
+Har du et registry fra før? Det er stadig åbent og virker som hidtil. Vil du have det
+beskyttet: `nordkraft registry destroy`, `nordkraft registry init`, og push dine images
+igen.
+
+**Hvor må et image komme fra?**
+
+Et deploy accepterer nu kun images fra dit eget registry (`registry://`) eller fra
+offentlige registries angivet med hostnavn. IP-adresser uden for dit eget
+container-subnet afvises, før noget bliver rørt. Platformen henter dermed kun images
+på dine vegne fra steder du selv råder over.
+
+---
+
 ## September 2026 — v0.3.41
 
 **Brug dit eget domæne**
