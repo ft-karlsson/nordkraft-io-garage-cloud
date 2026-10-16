@@ -83,8 +83,14 @@ orb -m nordkraft sudo bash /Users/<you>/deus/nordkraft-io-garage-cloud/scripts/i
 cd ~/deus/nordkraft-io-garage-cloud/client-cli && cargo build --release && cp target/release/nordkraft /usr/local/bin/
 nordkraft config set-api http://127.0.0.1:8001
 nordkraft deploy nginx:alpine -p 80
-curl localhost
+curl http://nordkraft.orb.local
 ```
+
+Inside OrbStack, published container ports are iptables rules, not sockets,
+so OrbStack does not forward them to the Mac's `localhost`. The installer
+detects OrbStack, publishes on `0.0.0.0`, and the VM is reached by its name,
+`<machine>.orb.local`. The API on `127.0.0.1:8001` is a real socket and is
+forwarded as usual.
 
 `--build-from` installs gcc and rustup in the VM, builds `container-api`
 into `/var/tmp/nordkraft-build` (so it never collides with a macOS build in

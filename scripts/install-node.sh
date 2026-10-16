@@ -36,7 +36,7 @@ CONTROLLER_IP=""
 LOCAL_BINARY=""
 BUILD_FROM=""
 NORDKRAFT_VERSION="${NORDKRAFT_VERSION:-latest}"
-DEV_BIND="127.0.0.1"
+DEV_BIND=""
 USE_SYSTEMD=true
 
 while [[ $# -gt 0 ]]; do
@@ -116,7 +116,15 @@ esac
 NODE_ID="${NODE_ID:-$(hostname)}"
 if $DEV; then NODE_ID="dev-node"; fi
 
-log "Mode: ${MODE}$($DEV && echo ' (dev)')   Arch: ${ARCH}   Node: ${NODE_ID}"
+# Dev bind address: 127.0.0.1 on a real machine; 0.0.0.0 inside a VM such as
+# OrbStack, where published ports (iptables DNAT, not sockets) are only
+# reachable from the host by the VM's own address.
+IN_ORBSTACK=false
+if grep -qi orbstack /proc/version 2>/dev/null || [[ -d /opt/orbstack-guest ]]; then IN_ORBSTACK=true; fi
+if [[ -z "$DEV_BIND" ]]; then
+  if $IN_ORBSTACK; then DEV_BIND="0.0.0.0"; else DEV_BIND="127.0.0.1"; fi
+fi
+log "Mode: ${MODE}$($DEV && echo ' (dev)')   Arch: ${ARCH}   Node: ${NODE_ID}$($IN_ORBSTACK && echo '   (OrbStack VM)')"
 
 # =============================================================================
 section "Phase 1: Packages"
@@ -430,10 +438,11 @@ if $DEV; then
 
   Dev node ready.
 
-    API:         http://${DEV_BIND}:${API_PORT}/api
-    Try it:      curl http://${DEV_BIND}:${API_PORT}/api/status
-    CLI:         nordkraft config set-api http://${DEV_BIND}:${API_PORT}
-                 nordkraft deploy nginx:alpine --port 8080
+    API:         http://127.0.0.1:${API_PORT}/api
+    Try it:      curl http://127.0.0.1:${API_PORT}/api/status
+    CLI:         nordkraft config set-api http://127.0.0.1:${API_PORT}
+                 nordkraft deploy nginx:alpine -p 80
+    Reach it:    curl http://$($IN_ORBSTACK && echo "$(hostname).orb.local" || echo "127.0.0.1")
     Logs:        journalctl -u nordkraft-node -f
 
   No WireGuard, no auth: anything that can reach the port is the dev user.

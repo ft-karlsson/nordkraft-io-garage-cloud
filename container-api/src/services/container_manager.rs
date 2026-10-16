@@ -78,6 +78,42 @@ fn emit(
     }
 }
 
+/// One published port in bridge mode (stored as the app_published label).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PublishedPort {
+    pub port: u16,
+    pub host_port: u16,
+    pub protocol: String,
+}
+
+fn bridge_url(host: &str, host_port: u16, protocol: &str) -> String {
+    match (host_port, protocol) {
+        (80, "tcp") => format!("http://{}", host),
+        (p, "tcp") => format!("http://{}:{}", host, p),
+        (p, proto) => format!("{}:{}/{}", host, p, proto),
+    }
+}
+
+/// Requested host port if it is free (not a listening socket, not published
+/// by another Nordkraft container, not already taken in this deploy),
+/// otherwise the first free port in 30000–39999. A nerdctl publish is an
+/// iptables rule, not a socket, so the bind test alone is not enough.
+fn pick_host_port(
+    addr: &str,
+    wanted: u16,
+    taken: &[PublishedPort],
+    published_elsewhere: &std::collections::HashSet<u16>,
+) -> u16 {
+    let in_use = |p: u16| taken.iter().any(|t| t.host_port == p) || published_elsewhere.contains(&p);
+    let free = |p: u16| std::net::TcpListener::bind((addr, p)).is_ok();
+    if !in_use(wanted) && free(wanted) {
+        return wanted;
+    }
+    (30000u16..40000)
+        .find(|&p| !in_use(p) && free(p))
+        .unwrap_or(wanted)
+}
+
 pub struct ContainerManager {
     runtime_binary: String, // "nerdctl" or "podman"
     use_kata: bool,
@@ -132,7 +168,7 @@ impl ContainerManager {
     }
 
     /// Host address a published port is reachable on (bridge mode only).
-    fn publish_host(&self) -> &str {
+    pub fn publish_host(&self) -> &str {
         if self.bridge_publish_addr == "0.0.0.0" {
             "127.0.0.1"
         } else {
@@ -253,17 +289,36 @@ impl ContainerManager {
             // Bridge: nerdctl's default network, ports published on the host.
             // The controller-allocated IP is recorded but not enforced.
             args.extend_from_slice(&["--network".to_string(), "bridge".to_string()]);
+            // Host port = the requested port if free, otherwise a free one from
+            // the ephemeral range, so several containers can publish :80.
+            let mut published: Vec<PublishedPort> = Vec::new();
+            let elsewhere = self.host_ports_in_use().await;
             for p in ports.iter().flatten() {
                 let proto = p.protocol.to_lowercase();
+                let host_port =
+                    pick_host_port(&self.bridge_publish_addr, p.port, &published, &elsewhere);
                 let spec = if proto == "udp" {
-                    format!("{}:{}:{}/udp", self.bridge_publish_addr, p.port, p.port)
+                    format!("{}:{}:{}/udp", self.bridge_publish_addr, host_port, p.port)
                 } else {
-                    format!("{}:{}:{}", self.bridge_publish_addr, p.port, p.port)
+                    format!("{}:{}:{}", self.bridge_publish_addr, host_port, p.port)
                 };
                 args.extend_from_slice(&["-p".to_string(), spec]);
+                published.push(PublishedPort {
+                    port: p.port,
+                    host_port,
+                    protocol: proto,
+                });
+            }
+            if !published.is_empty() {
+                let json = serde_json::to_string(&published).unwrap_or_default();
+                args.extend_from_slice(&["--label".to_string(), format!("app_published={}", json)]);
             }
             info!(
-                "📡 Bridge network: ports published on {}",
+                "📡 Bridge network: published {:?} on {}",
+                published
+                    .iter()
+                    .map(|p| format!("{}->{}", p.host_port, p.port))
+                    .collect::<Vec<_>>(),
                 self.bridge_publish_addr
             );
             allocated_ip.unwrap_or_default()
@@ -729,15 +784,17 @@ impl ContainerManager {
 
             // Build port mappings with proper URLs
             let bridge_host = self.is_bridge().then(|| self.publish_host().to_string());
+            let published = self.get_published_ports(&container);
             let port_mappings: Vec<PortMapping> = ports
                 .iter()
                 .map(|port_spec| {
                     let access_url = if let Some(ref host) = bridge_host {
-                        match (port_spec.port, port_spec.protocol.as_str()) {
-                            (80, "tcp") => format!("http://{}", host),
-                            (p, "tcp") => format!("http://{}:{}", host, p),
-                            (p, proto) => format!("{}:{}/{}", host, p, proto),
-                        }
+                        let hp = published
+                            .iter()
+                            .find(|pp| pp.port == port_spec.port)
+                            .map(|pp| pp.host_port)
+                            .unwrap_or(port_spec.port);
+                        bridge_url(host, hp, &port_spec.protocol)
                     } else if let Some(ref ip) = container_ip {
                         match (port_spec.port, port_spec.protocol.as_str()) {
                             (80, "tcp") => format!("http://{}", ip),
@@ -815,6 +872,58 @@ impl ContainerManager {
         }
 
         None
+    }
+
+    /// Bridge mode: host↔container port mapping from the app_published label.
+    fn get_published_ports(&self, container: &serde_json::Value) -> Vec<PublishedPort> {
+        self.get_label_value(container, "app_published")
+            .and_then(|s| serde_json::from_str::<Vec<PublishedPort>>(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Bridge mode: host ports already published by any Nordkraft container
+    /// on this node (running or stopped — a stopped one keeps its mapping).
+    async fn host_ports_in_use(&self) -> std::collections::HashSet<u16> {
+        let mut set = std::collections::HashSet::new();
+        let output = tokio::process::Command::new(&self.runtime_binary)
+            .args(["ps", "-a", "--format", "json", "--filter", "label=managed_by=nordkraft"])
+            .output()
+            .await;
+        let Ok(output) = output else { return set };
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let Ok(c) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            for pp in self.get_published_ports(&c) {
+                set.insert(pp.host_port);
+            }
+        }
+        set
+    }
+
+    /// Bridge mode: URLs a caller can reach a container's published ports on.
+    /// Empty in macvlan mode.
+    pub async fn access_urls(&self, container_name: &str) -> Vec<String> {
+        if !self.is_bridge() {
+            return vec![];
+        }
+        let output = tokio::process::Command::new(&self.runtime_binary)
+            .args(["inspect", container_name])
+            .output()
+            .await;
+        let Ok(output) = output else { return vec![] };
+        let Ok(raw) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+            return vec![];
+        };
+        let Some(c) = raw.as_array().and_then(|a| a.first()) else { return vec![] };
+        let labels = &c["Config"]["Labels"];
+        let published: Vec<PublishedPort> = labels["app_published"]
+            .as_str()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let host = self.publish_host();
+        published
+            .iter()
+            .map(|p| bridge_url(host, p.host_port, &p.protocol))
+            .collect()
     }
 
     /// Get ports from container labels — only returns ports if explicitly set via app_ports label.

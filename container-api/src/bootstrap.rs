@@ -16,7 +16,7 @@ const MIGRATION_CUSTOM_DOMAINS_SQL: &str = include_str!("../../setup/migration_c
 /// Identity of the dev user — must match the shortcut in guards.rs.
 pub const DEV_USER_ID: &str = "dev-user-id";
 pub const DEV_USER_SLOT: i32 = 99;
-pub const DEV_GARAGE_ID: &str = "ry";
+pub const DEV_GARAGE_ID: &str = "local-dev";
 pub const DEV_PLAN_ID: &str = "dev-plan";
 
 /// Strip pg_dump artifacts that only psql understands, and ownership /
@@ -85,7 +85,7 @@ pub async fn seed_dev(
 
     sqlx::query(
         "INSERT INTO garages (garage_id, name, location, country, vpn_endpoint, container_subnet_base, status)
-         VALUES ($1, 'Dev garage', 'localhost', 'DK', '127.0.0.1:51820', '172.21.1.0/24', 'active')
+         VALUES ($1, 'Local dev garage', 'this machine', 'DK', '127.0.0.1:51820', '172.21.1.0/24', 'active')
          ON CONFLICT (garage_id) DO NOTHING",
     )
     .bind(DEV_GARAGE_ID)

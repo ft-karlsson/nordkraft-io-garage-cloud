@@ -1489,6 +1489,11 @@ struct DeployResponse {
     message: Option<String>,
     #[serde(default)]
     ipv6_urls: Vec<String>,
+    /// Bridge/dev mode: URLs of the published ports on the host
+    #[serde(default)]
+    access_urls: Vec<String>,
+    #[serde(default)]
+    network_mode: Option<String>,
 }
 
 // Upgrade
@@ -2521,7 +2526,17 @@ async fn handle_deploy(
     if let Some(node) = &result.node {
         println!("   {} {}", "Node:".cyan(), node);
     }
-    if let Some(ip) = &result.container_ip {
+    if !result.access_urls.is_empty() {
+        for url in &result.access_urls {
+            println!("   {} {}", "URL:".cyan(), url.cyan().bold());
+        }
+        if result.network_mode.as_deref() == Some("bridge") {
+            println!(
+                "   {}",
+                "(bridge mode: reached via the host's published port, not the container IP)".dimmed()
+            );
+        }
+    } else if let Some(ip) = &result.container_ip {
         println!("   {} {}", "IPv4:".cyan(), ip);
     }
     if let Some(ipv6) = &result.ipv6_address {
