@@ -20,6 +20,7 @@ set -euo pipefail
 #   --controller <ip>       (agent only) controller's internal IP
 #   --kata                  install Kata Containers for VM isolation (not dev)
 #   --binary <path>         use a locally built binary instead of downloading a release
+#   --build-from <repo>     build container-api from a checkout on this machine (installs rustup + gcc)
 #   --version <tag>         release tag to download (default: latest)
 #   --bind <addr>           API bind address for --dev (default 127.0.0.1; use 0.0.0.0 for LAN)
 #   --no-systemd            write configs but do not manage services (containers, CI)
@@ -33,6 +34,7 @@ KATA=false
 FORCE=false
 CONTROLLER_IP=""
 LOCAL_BINARY=""
+BUILD_FROM=""
 NORDKRAFT_VERSION="${NORDKRAFT_VERSION:-latest}"
 DEV_BIND="127.0.0.1"
 USE_SYSTEMD=true
@@ -46,6 +48,7 @@ while [[ $# -gt 0 ]]; do
     --force)       FORCE=true; shift ;;
     --controller)  CONTROLLER_IP="$2"; shift 2 ;;
     --binary)      LOCAL_BINARY="$2"; shift 2 ;;
+    --build-from)  BUILD_FROM="$2"; shift 2 ;;
     --version)     NORDKRAFT_VERSION="$2"; shift 2 ;;
     --bind)        DEV_BIND="$2"; shift 2 ;;
     --no-systemd)  USE_SYSTEMD=false; shift ;;
@@ -120,7 +123,7 @@ section "Phase 1: Packages"
 # =============================================================================
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-PKGS=(curl jq uuid-runtime ca-certificates containerd iptables)
+PKGS=(curl jq uuid-runtime ca-certificates containerd iptables file)
 if $IS_SERVER; then PKGS+=(postgresql postgresql-client); fi
 if ! $DEV; then PKGS+=(wireguard wireguard-tools nftables); fi
 apt-get install -y -qq "${PKGS[@]}"
@@ -180,6 +183,31 @@ fi
 
 # =============================================================================
 section "Phase 2: Nordkraft binary"
+# =============================================================================
+if [[ -n "$BUILD_FROM" ]]; then
+  [[ -f "$BUILD_FROM/container-api/Cargo.toml" ]] || error "--build-from: $BUILD_FROM/container-api/Cargo.toml not found (inside OrbStack your Mac home is at /Users/<you>, not ~)"
+  log "Building container-api from $BUILD_FROM"
+  apt-get install -y -qq build-essential pkg-config >/dev/null
+  # The repo's .cargo/config.toml names cross-compiler binaries even for native
+  # builds; point those names at the system toolchain.
+  for t in gcc g++ ar; do ln -sf "/usr/bin/$t" "/usr/local/bin/${ARCH}-unknown-linux-gnu-$t"; done
+  BUILD_USER="${SUDO_USER:-root}"
+  BUILD_HOME=$(getent passwd "$BUILD_USER" | cut -d: -f6)
+  if [[ ! -x "$BUILD_HOME/.cargo/bin/cargo" ]]; then
+    log "Installing rustup for $BUILD_USER..."
+    sudo -u "$BUILD_USER" -H bash -c 'curl -fsSL https://sh.rustup.rs | sh -s -- -y -q --profile minimal' >/dev/null
+  fi
+  # Separate target dir: the checkout may be shared with a macOS build.
+  TARGET_DIR="/var/tmp/nordkraft-build"
+  mkdir -p "$TARGET_DIR" && chown "$BUILD_USER" "$TARGET_DIR"
+  sudo -u "$BUILD_USER" -H bash -c "cd '$BUILD_FROM/container-api' && CARGO_TARGET_DIR='$TARGET_DIR' '$BUILD_HOME/.cargo/bin/cargo' build --release 2>&1 | tail -3"
+  LOCAL_BINARY="$TARGET_DIR/release/container-api"
+  [[ -x "$LOCAL_BINARY" ]] || error "build failed — see output above"
+  file "$LOCAL_BINARY" | grep -q "ELF" || error "$LOCAL_BINARY is not a Linux binary"
+fi
+if [[ -n "$LOCAL_BINARY" ]] && ! file "$LOCAL_BINARY" | grep -q "ELF.*${ARCH/x86_64/x86-64}"; then
+  error "--binary $LOCAL_BINARY is not a Linux $ARCH executable: $(file -b "$LOCAL_BINARY" | cut -c1-60)"
+fi
 # =============================================================================
 if [[ -n "$LOCAL_BINARY" ]]; then
   install -m 755 "$LOCAL_BINARY" /usr/local/bin/nordkraft-node

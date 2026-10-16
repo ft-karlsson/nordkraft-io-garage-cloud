@@ -67,34 +67,29 @@ network. It is for development, not for serving anyone else's containers.
 ### On a Mac (OrbStack)
 
 The server needs Linux with containerd, so on macOS it runs in a VM.
-OrbStack forwards the VM's ports to `localhost` and mounts your home
-directory inside the VM at the same path, so nothing else needs configuring.
-(Kata is unavailable in any macOS VM — dev mode disables it anyway.)
+OrbStack forwards the VM's ports to `localhost` and mounts your Mac home
+inside the VM at the same path (`/Users/<you>`, not `~`). Kata is
+unavailable in any macOS VM; dev mode disables it anyway.
 
 ```bash
 brew install orbstack
 orb create ubuntu:24.04 nordkraft
 
-# install the dev node inside the VM — your checkout is visible at the same path
-orb -m nordkraft sudo bash ~/deus/nordkraft-io-garage-cloud/scripts/install-node.sh --dev
+# build inside the VM and install the dev node, one command
+orb -m nordkraft sudo bash /Users/<you>/deus/nordkraft-io-garage-cloud/scripts/install-node.sh \
+  --dev --build-from /Users/<you>/deus/nordkraft-io-garage-cloud
 
 # on the Mac: CLI with the `config` command, pointed at the VM
-cd client-cli && cargo build --release && cp target/release/nordkraft /usr/local/bin/
+cd ~/deus/nordkraft-io-garage-cloud/client-cli && cargo build --release && cp target/release/nordkraft /usr/local/bin/
 nordkraft config set-api http://127.0.0.1:8001
 nordkraft deploy nginx:alpine -p 80
 curl localhost
 ```
 
-Before a release exists (or to run your own build), build inside the VM
-and hand the binary to the installer:
-
-```bash
-orb -m nordkraft bash -c 'curl -fsSL https://sh.rustup.rs | sh -s -- -y && \
-  cd ~/deus/nordkraft-io-garage-cloud/container-api && \
-  ~/.cargo/bin/cargo build --release'
-orb -m nordkraft sudo bash ~/deus/nordkraft-io-garage-cloud/scripts/install-node.sh --dev \
-  --binary ~/deus/nordkraft-io-garage-cloud/container-api/target/release/container-api
-```
+`--build-from` installs gcc and rustup in the VM, builds `container-api`
+into `/var/tmp/nordkraft-build` (so it never collides with a macOS build in
+the same checkout) and installs the result. Once a release is tagged,
+`install-node.sh --dev` alone downloads it instead.
 
 Day to day: `orb start nordkraft` brings the service up via systemd;
 `orb -m nordkraft journalctl -u nordkraft-node -f` tails the logs.
@@ -136,6 +131,7 @@ NATS.
 --controller <ip>       agent only
 --kata                  install Kata Containers (VM isolation)
 --binary <path>         use a local build instead of a GitHub release
+--build-from <repo>     build container-api from a checkout (installs rustup + gcc)
 --version <tag>         pin a release
 --bind <addr>           dev bind address (0.0.0.0 for LAN access)
 --force                 rewrite config.env and WireGuard config
