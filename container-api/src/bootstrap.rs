@@ -3,7 +3,7 @@
 // No SQL files to ship: setup/schema.sql and the migrations are embedded at
 // compile time and applied when the `users` table is missing. The dev seed
 // creates exactly the rows the guards' dev user expects (see guards.rs), so
-// `serve --dev` can deploy on a fresh database with zero manual steps.
+// `container-api --dev` can deploy on a fresh database with zero manual steps.
 
 use sqlx::PgPool;
 use tracing::{info, warn};
@@ -152,12 +152,13 @@ pub async fn seed_dev(
 
 /// Minimal argument handling for the server binary.
 ///
-///   nordkraft serve            production (all config from env)
-///   nordkraft serve --dev      local dev preset (see config::apply_dev_preset)
-///   nordkraft --version
+///   nordkraft-node             production (all config from env)
+///   nordkraft-node --dev       local dev preset (see config::apply_dev_preset)
+///   nordkraft-node --version
 ///
-/// `serve` is accepted and ignored so the systemd unit and the docs can
-/// keep saying `nordkraft serve`.
+/// `serve` is accepted and ignored for compatibility with older unit files
+/// and docs that said `nordkraft serve`. This binary is the server; the
+/// CLI is the separate `nordkraft` binary from client-cli.
 pub fn parse_args() -> bool {
     let mut dev = false;
     for arg in std::env::args().skip(1) {
@@ -165,12 +166,12 @@ pub fn parse_args() -> bool {
             "serve" => {}
             "--dev" | "-d" => dev = true,
             "--version" | "-V" => {
-                println!("nordkraft {}", env!("CARGO_PKG_VERSION"));
+                println!("nordkraft-node {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "--help" | "-h" => {
-                println!("Nordkraft container API\n");
-                println!("Usage: nordkraft [serve] [--dev]\n");
+                println!("Nordkraft node — controller / agent / hybrid, set by NORDKRAFT_MODE\n");
+                println!("Usage: nordkraft-node [--dev]\n");
                 println!("  --dev        Local development: no WireGuard, no NATS, bridge");
                 println!("               networking, auto-seeded database on 127.0.0.1:8001");
                 println!("  --version    Print version");

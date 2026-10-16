@@ -4,17 +4,21 @@ set -euo pipefail
 # =============================================================================
 # Nordkraft node installer — Ubuntu 22.04 / 24.04, x86_64 or aarch64
 #
-#   sudo bash install-node.sh --role server          controller + agent (hybrid)
-#   sudo bash install-node.sh --role agent --controller 10.0.0.200
-#                                                     worker node joining a controller
-#   sudo bash install-node.sh --dev                   local dev: no WireGuard, no NATS,
+# A Nordkraft node is one binary (nordkraft-node) run in one of three modes:
+#   hybrid      controller + agent on the same machine (default, the single-box setup)
+#   controller  API, scheduler, database — no workloads
+#   agent       workloads only, joins a controller over NATS
+#
+#   sudo bash install-node.sh                         hybrid node
+#   sudo bash install-node.sh --mode agent --controller 10.0.0.200
+#   sudo bash install-node.sh --dev                   local dev: hybrid, no WireGuard, no NATS,
 #                                                     bridge networking, API on 127.0.0.1:8001
 #
 # Options
-#   --role server|agent     what this machine is (default: server)
-#   --dev                   dev preset (implies --role server, skips WireGuard/NATS/Kata)
+#   --mode hybrid|controller|agent   (default: hybrid)
+#   --dev                   dev preset (implies --mode hybrid, skips WireGuard/NATS/Kata)
 #   --controller <ip>       (agent only) controller's internal IP
-#   --kata                  install Kata Containers for VM isolation (server/agent, not dev)
+#   --kata                  install Kata Containers for VM isolation (not dev)
 #   --binary <path>         use a locally built binary instead of downloading a release
 #   --version <tag>         release tag to download (default: latest)
 #   --bind <addr>           API bind address for --dev (default 127.0.0.1; use 0.0.0.0 for LAN)
@@ -23,7 +27,7 @@ set -euo pipefail
 # Idempotent: safe to re-run. Existing config.env is kept unless --force.
 # =============================================================================
 
-ROLE="server"
+MODE="hybrid"
 DEV=false
 KATA=false
 FORCE=false
@@ -35,7 +39,8 @@ USE_SYSTEMD=true
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --role)        ROLE="$2"; shift 2 ;;
+    --mode)        MODE="$2"; shift 2 ;;
+    --role)        MODE="$2"; [[ "$MODE" == "server" ]] && MODE="hybrid"; shift 2 ;;  # legacy
     --dev)         DEV=true; shift ;;
     --kata)        KATA=true; shift ;;
     --force)       FORCE=true; shift ;;
@@ -49,11 +54,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ "$ROLE" == "server" || "$ROLE" == "agent" ]] || { echo "--role must be server or agent"; exit 1; }
-if $DEV; then ROLE="server"; fi
-if [[ "$ROLE" == "agent" && -z "$CONTROLLER_IP" ]]; then
-  echo "--role agent requires --controller <ip>"; exit 1
+case "$MODE" in hybrid|controller|agent) ;; *) echo "--mode must be hybrid, controller or agent"; exit 1 ;; esac
+if $DEV; then MODE="hybrid"; fi
+if [[ "$MODE" == "agent" && -z "$CONTROLLER_IP" ]]; then
+  echo "--mode agent requires --controller <ip>"; exit 1
 fi
+# "server" below = anything that runs the controller (hybrid or controller)
+IS_SERVER=$([[ "$MODE" != "agent" ]] && echo true || echo false)
 
 NORDKRAFT_DIR="/etc/nordkraft"
 NORDKRAFT_DATA="/var/lib/nordkraft"
@@ -106,7 +113,7 @@ esac
 NODE_ID="${NODE_ID:-$(hostname)}"
 if $DEV; then NODE_ID="dev-node"; fi
 
-log "Role: ${ROLE}$($DEV && echo ' (dev)')   Arch: ${ARCH}   Node: ${NODE_ID}"
+log "Mode: ${MODE}$($DEV && echo ' (dev)')   Arch: ${ARCH}   Node: ${NODE_ID}"
 
 # =============================================================================
 section "Phase 1: Packages"
@@ -114,7 +121,7 @@ section "Phase 1: Packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 PKGS=(curl jq uuid-runtime ca-certificates containerd iptables)
-if [[ "$ROLE" == "server" ]]; then PKGS+=(postgresql postgresql-client); fi
+if $IS_SERVER; then PKGS+=(postgresql postgresql-client); fi
 if ! $DEV; then PKGS+=(wireguard wireguard-tools nftables); fi
 apt-get install -y -qq "${PKGS[@]}"
 log "Packages installed"
@@ -175,10 +182,10 @@ fi
 section "Phase 2: Nordkraft binary"
 # =============================================================================
 if [[ -n "$LOCAL_BINARY" ]]; then
-  install -m 755 "$LOCAL_BINARY" /usr/local/bin/nordkraft-server
-  log "Installed local binary → /usr/local/bin/nordkraft-server"
-elif [[ -x /usr/local/bin/nordkraft-server && "$NORDKRAFT_VERSION" == "latest" && ! $FORCE ]]; then
-  log "Binary already present ($(/usr/local/bin/nordkraft-server --version 2>/dev/null || echo unknown)) — keep"
+  install -m 755 "$LOCAL_BINARY" /usr/local/bin/nordkraft-node
+  log "Installed local binary → /usr/local/bin/nordkraft-node"
+elif [[ -x /usr/local/bin/nordkraft-node && "$NORDKRAFT_VERSION" == "latest" && ! $FORCE ]]; then
+  log "Binary already present ($(/usr/local/bin/nordkraft-node --version 2>/dev/null || echo unknown)) — keep"
 else
   if [[ "$NORDKRAFT_VERSION" == "latest" ]]; then
     NORDKRAFT_VERSION=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | jq -r '.tag_name')
@@ -190,19 +197,19 @@ else
   EXPECTED=$(awk '{print $1}' /tmp/nordkraft-new.sha256)
   ACTUAL=$(sha256sum /tmp/nordkraft-new | awk '{print $1}')
   [[ "$EXPECTED" == "$ACTUAL" ]] || error "Checksum mismatch"
-  install -m 755 /tmp/nordkraft-new /usr/local/bin/nordkraft-server
+  install -m 755 /tmp/nordkraft-new /usr/local/bin/nordkraft-node
   rm -f /tmp/nordkraft-new /tmp/nordkraft-new.sha256
-  log "Installed ${NORDKRAFT_VERSION} → /usr/local/bin/nordkraft-server"
+  log "Installed ${NORDKRAFT_VERSION} → /usr/local/bin/nordkraft-node"
 fi
 
 mkdir -p "$NORDKRAFT_DIR" "$NORDKRAFT_DATA" "$NORDKRAFT_LOG"
 chmod 750 "$NORDKRAFT_DIR"
 
 # =============================================================================
-# Phase 3: PostgreSQL (server role only)
+# Phase 3: PostgreSQL (controller / hybrid only)
 # =============================================================================
 DATABASE_URL=""
-if [[ "$ROLE" == "server" ]]; then
+if $IS_SERVER; then
   section "Phase 3: PostgreSQL"
   svc enable-now postgresql
   if $DEV; then
@@ -244,7 +251,7 @@ if ! $DEV; then
   WG_PUBLIC_KEY=$(echo "$WG_PRIVATE_KEY" | wg pubkey)
   echo "$WG_PUBLIC_KEY" > "${NORDKRAFT_DIR}/server.pub"
 
-  if [[ "$ROLE" == "server" ]]; then
+  if $IS_SERVER; then
     if [[ ! -f "/etc/wireguard/${WG_INTERFACE}.conf" || $FORCE == true ]]; then
       cat > "/etc/wireguard/${WG_INTERFACE}.conf" <<EOF
 [Interface]
@@ -308,11 +315,11 @@ DATABASE_URL=${DATABASE_URL}
 BRIDGE_PUBLISH_ADDR=${DEV_BIND}
 RUST_LOG=info
 EOF
-    EXEC="/usr/local/bin/nordkraft-server serve --dev"
-  elif [[ "$ROLE" == "server" ]]; then
+    EXEC="/usr/local/bin/nordkraft-node --dev"
+  elif $IS_SERVER; then
     cat > "${NORDKRAFT_DIR}/config.env" <<EOF
-# Nordkraft SERVER (controller + agent) — generated by install-node.sh
-NORDKRAFT_MODE=hybrid
+# Nordkraft node (${MODE}) — generated by install-node.sh
+NORDKRAFT_MODE=${MODE}
 NODE_ID=${NODE_ID}
 BIND_ADDRESS=${VPN_SERVER_IP}
 BIND_PORT=${API_PORT}
@@ -332,7 +339,7 @@ INGRESS_ENABLED=false
 QUOTA_ENFORCED=false
 RUST_LOG=info
 EOF
-    EXEC="/usr/local/bin/nordkraft-server serve"
+    EXEC="/usr/local/bin/nordkraft-node"
   else
     cat > "${NORDKRAFT_DIR}/config.env" <<EOF
 # Nordkraft AGENT (worker) — generated by install-node.sh
@@ -353,17 +360,17 @@ ADMIN_API_KEY=unused-on-agent
 USE_KATA=$($KATA && echo true || echo false)
 RUST_LOG=info
 EOF
-    EXEC="/usr/local/bin/nordkraft-server serve"
+    EXEC="/usr/local/bin/nordkraft-node"
   fi
   chmod 640 "${NORDKRAFT_DIR}/config.env"
   log "Wrote ${NORDKRAFT_DIR}/config.env"
 fi
-: "${EXEC:=/usr/local/bin/nordkraft-server serve$($DEV && echo ' --dev')}"
+: "${EXEC:=/usr/local/bin/nordkraft-node$($DEV && echo " --dev")}"
 
-cat > /etc/systemd/system/nordkraft.service <<EOF
+cat > /etc/systemd/system/nordkraft-node.service <<EOF
 [Unit]
-Description=Nordkraft container API (${ROLE}$($DEV && echo ', dev'))
-After=network-online.target containerd.service$([[ "$ROLE" == "server" ]] && echo ' postgresql.service')
+Description=Nordkraft node (${MODE}$($DEV && echo ', dev'))
+After=network-online.target containerd.service$($IS_SERVER && echo ' postgresql.service')
 Wants=containerd.service
 
 [Service]
@@ -378,12 +385,12 @@ WantedBy=multi-user.target
 EOF
 if $USE_SYSTEMD; then
   systemctl daemon-reload
-  systemctl enable nordkraft >/dev/null
-  systemctl restart nordkraft
+  systemctl enable nordkraft-node >/dev/null
+  systemctl restart nordkraft-node
   sleep 2
-  systemctl is-active --quiet nordkraft && log "nordkraft.service running" || warn "nordkraft.service not running — journalctl -u nordkraft -n 50"
+  systemctl is-active --quiet nordkraft-node && log "nordkraft-node.service running" || warn "nordkraft-node.service not running — journalctl -u nordkraft-node -n 50"
 else
-  log "Unit written to /etc/systemd/system/nordkraft.service (not started: --no-systemd)"
+  log "Unit written to /etc/systemd/system/nordkraft-node.service (not started: --no-systemd)"
   log "Start by hand:  set -a; . ${NORDKRAFT_DIR}/config.env; set +a; ${EXEC}"
 fi
 
@@ -399,21 +406,21 @@ if $DEV; then
     Try it:      curl http://${DEV_BIND}:${API_PORT}/api/status
     CLI:         nordkraft config set-api http://${DEV_BIND}:${API_PORT}
                  nordkraft deploy nginx:alpine --port 8080
-    Logs:        journalctl -u nordkraft -f
+    Logs:        journalctl -u nordkraft-node -f
 
   No WireGuard, no auth: anything that can reach the port is the dev user.
   Keep it on 127.0.0.1 or a private network.
 
 EOF
-elif [[ "$ROLE" == "server" ]]; then
+elif $IS_SERVER; then
   cat <<EOF
 
-  Server ready.
+  Node ready (${MODE}).
 
     WireGuard:   ${VPN_SERVER_IP}:${WG_PORT}   pubkey ${WG_PUBLIC_KEY}
     API:         http://${VPN_SERVER_IP}:${API_PORT}/api   (WireGuard only)
     Config:      ${NORDKRAFT_DIR}/config.env
-    Logs:        journalctl -u nordkraft -f
+    Logs:        journalctl -u nordkraft-node -f
 
   Next: create the first user/invite (see setup/SETUP.md) and connect with
   the CLI: curl -fsSL https://install.nordkraft.io | sh -s NKINVITE-...
@@ -425,7 +432,7 @@ else
   Agent ready — joins controller ${CONTROLLER_IP} over NATS.
 
     Config:      ${NORDKRAFT_DIR}/config.env
-    Logs:        journalctl -u nordkraft -f
+    Logs:        journalctl -u nordkraft-node -f
 
   On the controller, register this node in the 'nodes' table and add its
   WireGuard key (${WG_PUBLIC_KEY}) as a peer.

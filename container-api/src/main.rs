@@ -867,7 +867,7 @@ async fn admin_tenants_status(
 
 #[launch]
 async fn rocket() -> _ {
-    // `serve --dev` must set env defaults BEFORE config is read
+    // `container-api --dev` must set env defaults BEFORE config is read
     let dev_flag = bootstrap::parse_args();
     if dev_flag {
         config::apply_dev_preset();

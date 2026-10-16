@@ -1,10 +1,18 @@
 # Self-hosting Nordkraft
 
-One installer, three shapes. Ubuntu 22.04 / 24.04, x86_64 or aarch64.
+Two binaries, three node modes:
 
-| | `--dev` | `--role server` | `--role agent` |
+- **`nordkraft`** — the CLI (client-cli). Lives on your laptop.
+- **`nordkraft-node`** — the server (container-api). Lives on a machine and
+  runs in one mode: `hybrid` (controller + agent, the single-box default),
+  `controller` (API, scheduler, database, no workloads) or `agent`
+  (workloads only, joins a controller over NATS).
+
+One installer. Ubuntu 22.04 / 24.04, x86_64 or aarch64.
+
+| | `--dev` | `--mode hybrid` (default) | `--mode agent` |
 |---|---|---|---|
-| What it is | Local API for development and integration tests | Controller + worker on one machine (hybrid) | Extra worker joining a controller |
+| What it is | Local API for development and integration tests | Controller + worker on one machine | Extra worker joining a controller |
 | WireGuard | no — anyone who can reach the port is the dev user | yes, API is WireGuard-only | yes |
 | NATS | no | yes | client → controller |
 | Networking | bridge, ports published on the host | macvlan, containers get LAN IPs | macvlan |
@@ -47,7 +55,7 @@ curl http://127.0.0.1:8001/api/containers/<name>/logs?lines=50
 curl -X DELETE http://127.0.0.1:8001/api/containers/<name>
 ```
 
-What `serve --dev` actually does (see `container-api/src/config.rs`,
+What `nordkraft-node --dev` actually does (see `container-api/src/config.rs`,
 `apply_dev_preset`): `DEV_MODE=true NATS_ENABLED=false DISABLE_KATA=true
 NETWORK_MODE=bridge BIND_ADDRESS=127.0.0.1`, plus an auto-seeded dev user,
 garage and node. Every value is only a default — anything set in
@@ -89,31 +97,31 @@ orb -m nordkraft sudo bash ~/deus/nordkraft-io-garage-cloud/scripts/install-node
 ```
 
 Day to day: `orb start nordkraft` brings the service up via systemd;
-`orb -m nordkraft journalctl -u nordkraft -f` tails the logs.
+`orb -m nordkraft journalctl -u nordkraft-node -f` tails the logs.
 
 ### Running from source without the installer
 
 ```bash
 createuser nordkraft -P   # password: nordkraft
 createdb -O nordkraft nordkraft
-cd container-api && cargo run -- serve --dev
+cd container-api && cargo run -- --dev
 ```
 
-## Server — production, one machine
+## Hybrid — production, one machine
 
 ```bash
-sudo bash scripts/install-node.sh --role server [--kata]
+sudo bash scripts/install-node.sh [--kata]          # --mode hybrid is the default
 ```
 
 Installs containerd, nerdctl, CNI plugins, Postgres, WireGuard, NATS and
-writes `/etc/nordkraft/config.env` + `nordkraft.service`. The API binds to
+writes `/etc/nordkraft/config.env` + `nordkraft-node.service`. The API binds to
 the WireGuard address (`172.20.0.254:8001`) only. Create the first user and
 invite as described in `SETUP.md`, then connect with the CLI.
 
 ## Agent — add a worker
 
 ```bash
-sudo bash scripts/install-node.sh --role agent --controller 172.20.0.254 [--kata]
+sudo bash scripts/install-node.sh --mode agent --controller 172.20.0.254 [--kata]
 ```
 
 The script prints the agent's WireGuard public key. Add it as a peer on the
@@ -123,8 +131,8 @@ NATS.
 ## Options
 
 ```
---role server|agent     default server
---dev                   dev preset (implies server)
+--mode hybrid|controller|agent   default hybrid
+--dev                   dev preset (implies hybrid)
 --controller <ip>       agent only
 --kata                  install Kata Containers (VM isolation)
 --binary <path>         use a local build instead of a GitHub release
