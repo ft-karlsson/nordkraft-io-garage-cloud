@@ -5,6 +5,7 @@ use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -72,6 +73,7 @@ fn remove_alias(alias: &str) -> Result<(), Box<dyn std::error::Error>> {
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "🚀 Nordkraft Garage Cloud CLI - Secure Container Hosting")]
 #[command(long_about = None)]
+#[command(disable_help_subcommand = true)]
 struct Cli {
     /// Output as JSON (for scripting)
     #[arg(long, global = true)]
@@ -118,6 +120,11 @@ enum Commands {
     Nodes,
     /// System status
     Status,
+    /// CLI configuration (API endpoint — e.g. point at a local dev server)
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
     /// Show help with examples
     Help,
     /// Private container registry
@@ -1167,33 +1174,150 @@ fn display_diff(diffs: &[SpecDiff], name: &str) {
     );
 }
 
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Set the API endpoint, e.g. http://localhost:8001 (no WireGuard needed)
+    SetApi {
+        /// Base URL of a Nordkraft API ("/api" is appended if missing)
+        url: String,
+    },
+    /// Forget the API endpoint override (back to WireGuard / connection.json)
+    ResetApi,
+    /// Show the effective API endpoint and where it comes from
+    Show,
+}
+
 // ============= API TYPES =============
 
 const CONFIG_DIR: &str = ".nordkraft";
+const API_URL_FILE: &str = "api_url";
 const ALIASES_FILE: &str = "aliases.json";
 const DEPLOYMENTS_DIR: &str = "deployments";
 const WG_CONFIG_FILE: &str = "wg.conf";
 const WG_INTERFACE: &str = "nordkraft";
 const CONNECTION_FILE: &str = "connection.json";
 
-pub(crate) static API_BASE_URL: LazyLock<String> = LazyLock::new(|| {
-    // 1. Env var override (dev/testing)
+pub(crate) static API_BASE_URL: LazyLock<String> = LazyLock::new(|| resolve_api_base_url().0);
+
+/// Resolve the API base URL and report where it came from.
+///
+///   1. API_BASE_URL env var               (one-off override)
+///   2. ~/.nordkraft/api_url               (`nordkraft config set-api …`)
+///   3. connection.json api_endpoint       (written by `nordkraft setup`)
+///   4. http://172.20.0.254:8001/api       (controller default over WireGuard)
+fn resolve_api_base_url() -> (String, &'static str) {
     if let Ok(url) = std::env::var("API_BASE_URL") {
-        return url;
+        if !url.is_empty() {
+            return (url, "API_BASE_URL env var");
+        }
     }
 
-    // 2. From connection config if set
+    if let Some(url) = load_api_url_override() {
+        return (url, "~/.nordkraft/api_url (nordkraft config set-api)");
+    }
+
     if let Some(config) = load_connection_config() {
         if let Some(endpoint) = config.api_endpoint {
             if !endpoint.is_empty() {
-                return endpoint;
+                return (endpoint, "~/.nordkraft/connection.json");
             }
         }
     }
 
-    // 3. Default — matches open source controller default
-    "http://172.20.0.254:8001/api".to_string()
-});
+    (
+        "http://172.20.0.254:8001/api".to_string(),
+        "default (controller over WireGuard)",
+    )
+}
+
+fn api_url_override_path() -> PathBuf {
+    get_config_dir().join(API_URL_FILE)
+}
+
+fn load_api_url_override() -> Option<String> {
+    let s = fs::read_to_string(api_url_override_path()).ok()?;
+    let s = s.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Normalise a user-supplied base URL: add scheme, strip trailing slash,
+/// make sure it ends in /api.
+fn normalise_api_url(input: &str) -> String {
+    let mut url = input.trim().trim_end_matches('/').to_string();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        url = format!("http://{}", url);
+    }
+    if !url.ends_with("/api") {
+        url.push_str("/api");
+    }
+    url
+}
+
+async fn handle_config(command: ConfigCommands, json_output: bool) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        ConfigCommands::SetApi { url } => {
+            let url = normalise_api_url(&url);
+            let dir = get_config_dir();
+            fs::create_dir_all(&dir)?;
+            fs::write(api_url_override_path(), format!("{}\n", url))?;
+
+            // Quick reachability check — not fatal, just informative
+            let reachable = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()?
+                .get(format!("{}/status", url))
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false);
+
+            if json_output {
+                println!("{}", serde_json::json!({"api_url": url, "reachable": reachable}));
+            } else {
+                println!("{} API endpoint set to {}", "✓".green(), url.cyan());
+                if reachable {
+                    println!("  {} server responded on {}/status", "✓".green(), url);
+                } else {
+                    println!(
+                        "  {} no response from {}/status yet (is the server running?)",
+                        "!".yellow(),
+                        url
+                    );
+                }
+                println!("  Remove with: {}", "nordkraft config reset-api".dimmed());
+            }
+            Ok(())
+        }
+        ConfigCommands::ResetApi => {
+            let path = api_url_override_path();
+            if path.exists() {
+                fs::remove_file(&path)?;
+            }
+            let (url, source) = resolve_api_base_url();
+            if json_output {
+                println!("{}", serde_json::json!({"api_url": url, "source": source}));
+            } else {
+                println!("{} API endpoint override removed", "✓".green());
+                println!("  Now using {} ({})", url.cyan(), source.dimmed());
+            }
+            Ok(())
+        }
+        ConfigCommands::Show => {
+            let (url, source) = resolve_api_base_url();
+            if json_output {
+                println!("{}", serde_json::json!({"api_url": url, "source": source}));
+            } else {
+                println!("API endpoint: {}", url.cyan());
+                println!("Source:       {}", source.dimmed());
+            }
+            Ok(())
+        }
+    }
+}
 
 static PUBLIC_API_URL: LazyLock<String> = LazyLock::new(|| {
     // 1. Env var override
@@ -1624,6 +1748,7 @@ async fn main() {
         }
         Commands::Alias { command } => handle_alias(command, json_output).await,
         Commands::Update { check } => handle_update(check, json_output).await,
+        Commands::Config { command } => handle_config(command, json_output).await,
         Commands::Registry { command } => handle_registry(command, json_output).await,
         // UI console
         Commands::Ui => crate::tui::run_tui().await,
@@ -1684,6 +1809,12 @@ async fn main() {
 
 fn create_client() -> Result<Client, Box<dyn std::error::Error>> {
     Ok(Client::builder().timeout(Duration::from_secs(30)).build()?)
+}
+
+/// Client for calls that wait on a graceful container stop server-side
+/// (stop-timeout is 30s, so the HTTP timeout must be longer than that).
+fn create_slow_client() -> Result<Client, Box<dyn std::error::Error>> {
+    Ok(Client::builder().timeout(Duration::from_secs(90)).build()?)
 }
 
 // ============= AUTH HANDLERS =============
@@ -2479,7 +2610,7 @@ async fn handle_container_stop(
     container: &str,
     json_output: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = create_client()?;
+    let client = create_slow_client()?;
     let container = resolve_alias(container);
 
     if !json_output {
@@ -2509,7 +2640,7 @@ async fn handle_container_remove(
     container: &str,
     json_output: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = create_client()?;
+    let client = create_slow_client()?;
     let container = resolve_alias(container);
 
     if !json_output {

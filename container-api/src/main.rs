@@ -5,6 +5,7 @@ use sqlx::{PgPool, Row};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+mod bootstrap;
 mod config;
 mod controller;
 mod guards;
@@ -866,9 +867,16 @@ async fn admin_tenants_status(
 
 #[launch]
 async fn rocket() -> _ {
+    // `serve --dev` must set env defaults BEFORE config is read
+    let dev_flag = bootstrap::parse_args();
+    if dev_flag {
+        config::apply_dev_preset();
+    }
+
     tracing_subscriber::fmt::init();
 
     let config = config::init_config();
+    let dev = config.dev_mode;
 
     // =========================================================
     // DATABASE POOL - direct sqlx, no rocket_db_pools wrapper
@@ -882,6 +890,14 @@ async fn rocket() -> _ {
             pool
         }
         Err(e) => {
+            if dev {
+                error!("❌ Database connection failed: {}", e);
+                error!("   DATABASE_URL={}", database_url);
+                error!(
+                    "   Dev mode needs a reachable Postgres — run scripts/install-node.sh --dev"
+                );
+                std::process::exit(1);
+            }
             // In agent mode we don't need a DB, so warn but continue
             warn!("⚠️ Database connection failed: {} (OK for agent mode)", e);
             // Create a pool that will fail on use - agents don't need it
@@ -890,23 +906,54 @@ async fn rocket() -> _ {
     };
 
     // =========================================================
+    // SCHEMA + DEV SEED — controller/hybrid only
+    // Embedded schema is applied on an empty database; dev mode
+    // additionally seeds the dev user/garage/node so deploy works.
+    // =========================================================
+    if matches!(
+        config.mode,
+        config::OperationMode::Controller | config::OperationMode::Hybrid
+    ) {
+        match bootstrap::ensure_schema(&db_pool).await {
+            Ok(true) => info!("✅ Database initialised"),
+            Ok(false) => {}
+            Err(e) => {
+                error!("❌ Schema bootstrap failed: {}", e);
+                if dev {
+                    std::process::exit(1);
+                }
+            }
+        }
+        if dev {
+            if let Err(e) = bootstrap::seed_dev(&db_pool, &config).await {
+                error!("❌ Dev seed failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // =========================================================
     // EMBEDDED PEER CACHE - replaces the separate auth-api
     // Calls `sudo wg show wg0` every 5 seconds to build
     // VPN IP → WireGuard public key mapping in-process.
     // =========================================================
     let wg_interface = std::env::var("WG_INTERFACE").unwrap_or_else(|_| "wg0".to_string());
     let peer_cache = PeerCache::new(&wg_interface);
-    peer_cache.start().await;
+    if !dev {
+        peer_cache.start().await;
+    }
 
     // =========================================================
     // WG RECONCILER - re-provisions missing peers from DB
     // Catches peers lost to systemd-networkd restarts, netplan
     // apply, unattended-upgrades, etc. Runs every 5 minutes.
     // =========================================================
-    if matches!(
-        config.mode,
-        config::OperationMode::Controller | config::OperationMode::Hybrid
-    ) {
+    if !dev
+        && matches!(
+            config.mode,
+            config::OperationMode::Controller | config::OperationMode::Hybrid
+        )
+    {
         let reconciler = WgReconciler::new(&wg_interface, db_pool.clone());
         reconciler.start().await;
     }
@@ -949,10 +996,12 @@ async fn rocket() -> _ {
     // Catches routes lost to systemd-networkd restarts, netplan
     // apply, unattended-upgrades, etc. Runs every 5 minutes.
     // =========================================================
-    if matches!(
-        config.mode,
-        config::OperationMode::Controller | config::OperationMode::Hybrid
-    ) {
+    if !dev
+        && matches!(
+            config.mode,
+            config::OperationMode::Controller | config::OperationMode::Hybrid
+        )
+    {
         let route_reconciler =
             RouteReconciler::new(Arc::clone(&app_state.route_manager), db_pool.clone());
         route_reconciler.start().await;
@@ -1114,32 +1163,37 @@ async fn rocket() -> _ {
     // AGENT-SPECIFIC SETUP - CRITICAL FOR REBOOT SURVIVAL
     // =========================================================
 
-    // Setup VPN return routes (so containers can reply to VPN clients)
-    if let Err(e) = ensure_agent_vpn_routes(&config).await {
-        error!("❌ CRITICAL: Failed to setup agent VPN routes: {}", e);
-        panic!("Agent cannot start without return routes - security requirement");
-    }
+    if dev || config.network_mode.is_bridge() {
+        // Bridge networking: no VPN return routes, no shims, no macvlan.
+        info!("🌉 Bridge networking — skipping VPN routes and macvlan setup");
+    } else {
+        // Setup VPN return routes (so containers can reply to VPN clients)
+        if let Err(e) = ensure_agent_vpn_routes(&config).await {
+            error!("❌ CRITICAL: Failed to setup agent VPN routes: {}", e);
+            panic!("Agent cannot start without return routes - security requirement");
+        }
 
-    // =========================================================
-    // AGENT ROUTE RECONCILER - VPN return route + tenant routes
-    // =========================================================
-    if matches!(
-        config.mode,
-        config::OperationMode::Agent | config::OperationMode::Hybrid
-    ) {
-        let agent_reconciler = services::route_manager::AgentRouteReconciler::new(
-            &config.vpn_network,
-            &config.controller_internal_ip,
-            &config.agent_interface,
-        );
-        agent_reconciler.start().await;
-    }
+        // =========================================================
+        // AGENT ROUTE RECONCILER - VPN return route + tenant routes
+        // =========================================================
+        if matches!(
+            config.mode,
+            config::OperationMode::Agent | config::OperationMode::Hybrid
+        ) {
+            let agent_reconciler = services::route_manager::AgentRouteReconciler::new(
+                &config.vpn_network,
+                &config.controller_internal_ip,
+                &config.agent_interface,
+            );
+            agent_reconciler.start().await;
+        }
 
-    // NEW: Setup macvlan shim + routes (so containers are reachable)
-    // This is idempotent - safe to run every boot
-    if let Err(e) = ensure_agent_macvlan_setup(&macvlan_manager, &config).await {
-        error!("❌ WARNING: Macvlan setup failed: {}", e);
-        // Don't panic - containers may still work if setup was manual
+        // Setup macvlan shim + routes (so containers are reachable)
+        // This is idempotent - safe to run every boot
+        if let Err(e) = ensure_agent_macvlan_setup(&macvlan_manager, &config).await {
+            error!("❌ WARNING: Macvlan setup failed: {}", e);
+            // Don't panic - containers may still work if setup was manual
+        }
     }
 
     // Log startup info
@@ -1257,8 +1311,16 @@ fn log_startup_info(config: &AppConfig, nats_connected: bool) {
 
     if config.dev_mode {
         warn!("🚨 DEV MODE ENABLED 🚨");
-        warn!("- Peer resolution bypassed");
-        warn!("- Dev key: {}", config.dev_user_public_key);
+        warn!("- Every caller is the dev user — anyone who can reach the port is trusted");
+        warn!("- No WireGuard, no NATS, no Kata, bridge networking with published ports");
+        warn!(
+            "- API: http://{}:{}/api",
+            config.bind_address, config.bind_port
+        );
+        warn!(
+            "- Point the CLI here: nordkraft config set-api http://{}:{}/api",
+            config.bind_address, config.bind_port
+        );
     } else {
         info!("🔒 Production mode");
         info!("🔑 Embedded peer resolver active (no separate auth-api needed)");

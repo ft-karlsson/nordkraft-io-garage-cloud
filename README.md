@@ -41,7 +41,7 @@ It runs on hardware you already own. A Raspberry Pi and an old PC are enough. An
 
 ## Quick start
 
-> ⚠️ **Self-hosting install script is in progress.** The platform runs in production today — a streamlined self-hosting installer is coming in MARK II.
+> **Self-hosting:** `sudo bash scripts/install-node.sh --dev` gives you a local API in minutes (no WireGuard, bridge networking); `--role server` / `--role agent` for production nodes. See [`setup/SELF_HOSTING.md`](setup/SELF_HOSTING.md).
 
 ```bash
 # Install the CLI (with invite token for Nordkraft I/O Garage Cloud.io Cloud)

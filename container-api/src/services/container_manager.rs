@@ -12,7 +12,7 @@
 //     - SLAAC IPv6:  router assigns)
 //     - Parent interface: set by env
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, NetworkMode};
 use crate::models::{ContainerInfo, PortMapping, PortSpec, RegistryAuth};
 use crate::services::macvlan_manager::MacvlanManager;
 use crate::services::nats_service::{NatsMessage, NatsService, NatsSubjects};
@@ -85,6 +85,8 @@ pub struct ContainerManager {
     restart_policy: String,
     persistence: PersistenceManager,
     macvlan: MacvlanManager,
+    network_mode: NetworkMode,
+    bridge_publish_addr: String,
 }
 
 impl ContainerManager {
@@ -118,6 +120,23 @@ impl ContainerManager {
             restart_policy: config.container_restart_policy.clone(),
             persistence: PersistenceManager::new(),
             macvlan: MacvlanManager::with_defaults(),
+            network_mode: config.network_mode,
+            bridge_publish_addr: config.bridge_publish_addr.clone(),
+        }
+    }
+
+    /// True when containers live behind nerdctl's default bridge with
+    /// published ports instead of on a per-tenant macvlan.
+    pub fn is_bridge(&self) -> bool {
+        self.network_mode.is_bridge()
+    }
+
+    /// Host address a published port is reachable on (bridge mode only).
+    fn publish_host(&self) -> &str {
+        if self.bridge_publish_addr == "0.0.0.0" {
+            "127.0.0.1"
+        } else {
+            &self.bridge_publish_addr
         }
     }
 
@@ -188,24 +207,34 @@ impl ContainerManager {
             return Err(e.into());
         }
 
-        emit(
-            &event_tx,
-            &container_name,
-            "network",
-            &format!("Setting up macvlan network for slot"),
-            true,
-        );
-
-        // ========== MACVLAN NETWORK (DUAL-STACK) ==========
-        // Ensure per-user macvlan network exists
+        let bridge = self.is_bridge();
         let user_slot = user_slot.ok_or("user_slot required for network allocation")?;
 
-        // Verify interface setup on first deploy
-        if let Err(e) = self.macvlan.verify_setup().await {
-            warn!("Interface verification failed: {} - continuing anyway", e);
-        }
+        if bridge {
+            emit(
+                &event_tx,
+                &container_name,
+                "network",
+                "Using bridge network with published ports",
+                true,
+            );
+        } else {
+            emit(
+                &event_tx,
+                &container_name,
+                "network",
+                "Setting up macvlan network for slot",
+                true,
+            );
 
-        self.macvlan.ensure_network_for_slot(user_slot).await?;
+            // ========== MACVLAN NETWORK (DUAL-STACK) ==========
+            // Verify interface setup on first deploy
+            if let Err(e) = self.macvlan.verify_setup().await {
+                warn!("Interface verification failed: {} - continuing anyway", e);
+            }
+
+            self.macvlan.ensure_network_for_slot(user_slot).await?;
+        }
 
         // Build command args
         let mut args = vec![
@@ -219,19 +248,40 @@ impl ContainerManager {
             "30".to_string(),
         ];
 
-        // ========== NETWORK CONFIGURATION (MACVLAN ONLY) ==========
-        // Attach to macvlan with static IPv4 + IPv6 SLAAC
-        let allocated_ip = allocated_ip.ok_or("allocated_ip required for macvlan")?;
-        let network_args = self
-            .macvlan
-            .get_network_args_with_ipv4(user_slot, &allocated_ip);
-        args.extend(network_args);
+        // ========== NETWORK CONFIGURATION ==========
+        let allocated_ip = if bridge {
+            // Bridge: nerdctl's default network, ports published on the host.
+            // The controller-allocated IP is recorded but not enforced.
+            args.extend_from_slice(&["--network".to_string(), "bridge".to_string()]);
+            for p in ports.iter().flatten() {
+                let proto = p.protocol.to_lowercase();
+                let spec = if proto == "udp" {
+                    format!("{}:{}:{}/udp", self.bridge_publish_addr, p.port, p.port)
+                } else {
+                    format!("{}:{}:{}", self.bridge_publish_addr, p.port, p.port)
+                };
+                args.extend_from_slice(&["-p".to_string(), spec]);
+            }
+            info!(
+                "📡 Bridge network: ports published on {}",
+                self.bridge_publish_addr
+            );
+            allocated_ip.unwrap_or_default()
+        } else {
+            // Attach to macvlan with static IPv4 + IPv6 SLAAC
+            let allocated_ip = allocated_ip.ok_or("allocated_ip required for macvlan")?;
+            let network_args = self
+                .macvlan
+                .get_network_args_with_ipv4(user_slot, &allocated_ip);
+            args.extend(network_args);
 
-        info!(
-            "📡 Macvlan dual-stack: {} with IPv4 {} + IPv6 SLAAC",
-            self.macvlan.network_name_for_slot(user_slot),
+            info!(
+                "📡 Macvlan dual-stack: {} with IPv4 {} + IPv6 SLAAC",
+                self.macvlan.network_name_for_slot(user_slot),
+                allocated_ip
+            );
             allocated_ip
-        );
+        };
 
         // Add Kata runtime if enabled
         if self.use_kata {
@@ -426,7 +476,11 @@ impl ContainerManager {
 
         if let Some(dir) = &pull_config_dir {
             if let Err(e) = tokio::fs::remove_dir_all(dir).await {
-                warn!("Could not remove pull credential dir {}: {}", dir.display(), e);
+                warn!(
+                    "Could not remove pull credential dir {}: {}",
+                    dir.display(),
+                    e
+                );
             }
         }
         let output = output?;
@@ -493,8 +547,9 @@ impl ContainerManager {
             }
         };
 
-        // Verify IPv4 assignment matches what we requested
-        if container_ip != allocated_ip {
+        // Verify IPv4 assignment matches what we requested (macvlan only —
+        // on a bridge the runtime hands out the address)
+        if !bridge && container_ip != allocated_ip {
             error!(
                 "🚨 IP MISMATCH! Expected {} but container got {}. \
                  This will break routing. Removing container.",
@@ -525,7 +580,10 @@ impl ContainerManager {
 
         // ========== SLAAC IPv6 ==========
         // Fetch the IPv6 address ASSIGNED BY THE ROUTER (not by us)
-        let final_ipv6 = if enable_ipv6 {
+        let final_ipv6 = if enable_ipv6 && bridge {
+            warn!("⚠️ IPv6 requested but not available in bridge mode — IPv4 only");
+            None
+        } else if enable_ipv6 {
             info!("🌐 Waiting for SLAAC to assign IPv6...");
 
             match self.macvlan.wait_for_slaac_ipv6(&container_name).await {
@@ -670,10 +728,17 @@ impl ContainerManager {
                 || ipv6_address.is_some();
 
             // Build port mappings with proper URLs
+            let bridge_host = self.is_bridge().then(|| self.publish_host().to_string());
             let port_mappings: Vec<PortMapping> = ports
                 .iter()
                 .map(|port_spec| {
-                    let access_url = if let Some(ref ip) = container_ip {
+                    let access_url = if let Some(ref host) = bridge_host {
+                        match (port_spec.port, port_spec.protocol.as_str()) {
+                            (80, "tcp") => format!("http://{}", host),
+                            (p, "tcp") => format!("http://{}:{}", host, p),
+                            (p, proto) => format!("{}:{}/{}", host, p, proto),
+                        }
+                    } else if let Some(ref ip) = container_ip {
                         match (port_spec.port, port_spec.protocol.as_str()) {
                             (80, "tcp") => format!("http://{}", ip),
                             (443, "tcp") => format!("https://{}", ip),
