@@ -56,6 +56,41 @@ garage and node. Every value is only a default — anything set in
 Dev mode has **no authentication**. Keep it on 127.0.0.1 or a private
 network. It is for development, not for serving anyone else's containers.
 
+### On a Mac (OrbStack)
+
+The server needs Linux with containerd, so on macOS it runs in a VM.
+OrbStack forwards the VM's ports to `localhost` and mounts your home
+directory inside the VM at the same path, so nothing else needs configuring.
+(Kata is unavailable in any macOS VM — dev mode disables it anyway.)
+
+```bash
+brew install orbstack
+orb create ubuntu:24.04 nordkraft
+
+# install the dev node inside the VM — your checkout is visible at the same path
+orb -m nordkraft sudo bash ~/deus/nordkraft-io-garage-cloud/scripts/install-node.sh --dev
+
+# on the Mac: CLI with the `config` command, pointed at the VM
+cd client-cli && cargo build --release && cp target/release/nordkraft /usr/local/bin/
+nordkraft config set-api http://127.0.0.1:8001
+nordkraft deploy nginx:alpine -p 80
+curl localhost
+```
+
+Before a release exists (or to run your own build), build inside the VM
+and hand the binary to the installer:
+
+```bash
+orb -m nordkraft bash -c 'curl -fsSL https://sh.rustup.rs | sh -s -- -y && \
+  cd ~/deus/nordkraft-io-garage-cloud/container-api && \
+  ~/.cargo/bin/cargo build --release'
+orb -m nordkraft sudo bash ~/deus/nordkraft-io-garage-cloud/scripts/install-node.sh --dev \
+  --binary ~/deus/nordkraft-io-garage-cloud/container-api/target/release/container-api
+```
+
+Day to day: `orb start nordkraft` brings the service up via systemd;
+`orb -m nordkraft journalctl -u nordkraft -f` tails the logs.
+
 ### Running from source without the installer
 
 ```bash

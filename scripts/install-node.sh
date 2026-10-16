@@ -183,7 +183,7 @@ else
   if [[ "$NORDKRAFT_VERSION" == "latest" ]]; then
     NORDKRAFT_VERSION=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | jq -r '.tag_name')
   fi
-  BINARY_URL="https://github.com/${GITHUB_REPO}/releases/download/${NORDKRAFT_VERSION}/nordkraft-${BINARY_ARCH}-linux"
+  BINARY_URL="https://github.com/${GITHUB_REPO}/releases/download/${NORDKRAFT_VERSION}/nordkraft-linux-${BINARY_ARCH}"
   log "Downloading ${NORDKRAFT_VERSION}..."
   curl -fsSL "$BINARY_URL" -o /tmp/nordkraft-new
   curl -fsSL "${BINARY_URL}.sha256" -o /tmp/nordkraft-new.sha256
