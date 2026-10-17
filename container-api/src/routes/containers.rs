@@ -396,9 +396,10 @@ pub async fn list_containers_route(
     }
 }
 
-#[delete("/containers/<container_id>")]
+#[delete("/containers/<container_id>?<force>")]
 pub async fn delete_container(
     container_id: String,
+    force: Option<bool>,
     user: AuthenticatedUser,
     app_state: &rocket::State<AppState>,
     orchestrator: &rocket::State<OrchestratorService>,
@@ -423,6 +424,7 @@ pub async fn delete_container(
                 user.0.user_slot,
                 orchestrator.nats_service.as_deref(),
                 Some(&orchestrator.node_id),
+                force.unwrap_or(false),
             )
             .await
         {

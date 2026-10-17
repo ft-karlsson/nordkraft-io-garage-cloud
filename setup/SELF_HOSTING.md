@@ -43,6 +43,20 @@ nordkraft logs <name>
 nordkraft rm <name>
 ```
 
+Useful in dev:
+
+```bash
+nordkraft status                      # shows "DEV MODE · bridge · no auth" so you know which node you are on
+nordkraft -y deploy nginx:alpine -p 80   # no prompts (also implied when stdin is not a terminal, or with --json)
+nordkraft rm --force <name>           # kill now instead of a graceful stop
+sudo bash scripts/install-node.sh --dev --reset   # wipe the dev database and all containers, start over
+```
+
+Several containers can ask for the same port: the first gets it, the rest get
+a free port from 30000 upward, and `deploy` prints the URL. `PUBLIC_HOST` in
+`/etc/nordkraft/config.env` is the hostname used in those URLs (the installer
+sets `<machine>.orb.local` inside OrbStack).
+
 Or straight from your own backend:
 
 ```bash
@@ -142,6 +156,7 @@ NATS.
 --bind <addr>           dev bind address (0.0.0.0 for LAN access)
 --force                 rewrite config.env and WireGuard config
 --no-systemd            write configs only (containers, CI)
+--reset                 (dev) wipe the dev database and all managed containers
 ```
 
 The script is idempotent; re-running keeps existing keys, database password

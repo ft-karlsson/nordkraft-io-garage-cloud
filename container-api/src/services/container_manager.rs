@@ -123,6 +123,8 @@ pub struct ContainerManager {
     macvlan: MacvlanManager,
     network_mode: NetworkMode,
     bridge_publish_addr: String,
+    public_host: Option<String>,
+    stop_timeout: u32,
 }
 
 impl ContainerManager {
@@ -158,6 +160,8 @@ impl ContainerManager {
             macvlan: MacvlanManager::with_defaults(),
             network_mode: config.network_mode,
             bridge_publish_addr: config.bridge_publish_addr.clone(),
+            public_host: config.public_host.clone(),
+            stop_timeout: config.container_stop_timeout,
         }
     }
 
@@ -169,6 +173,9 @@ impl ContainerManager {
 
     /// Host address a published port is reachable on (bridge mode only).
     pub fn publish_host(&self) -> &str {
+        if let Some(h) = &self.public_host {
+            return h;
+        }
         if self.bridge_publish_addr == "0.0.0.0" {
             "127.0.0.1"
         } else {
@@ -281,7 +288,7 @@ impl ContainerManager {
             "--restart".to_string(),
             self.restart_policy.clone(),
             "--stop-timeout".to_string(),
-            "30".to_string(),
+            self.stop_timeout.to_string(),
         ];
 
         // ========== NETWORK CONFIGURATION ==========
@@ -999,6 +1006,7 @@ impl ContainerManager {
         user_slot: Option<i32>,
         nats: Option<&NatsService>,
         node_id: Option<&str>,
+        force: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let containers = self.list_user_containers(owner_pubkey).await?;
         let container = containers
@@ -1011,11 +1019,14 @@ impl ContainerManager {
 
         let container_name = container.unwrap().name.clone();
 
-        // Stop first if running
-        let _ = tokio::process::Command::new(&self.runtime_binary)
-            .args(["stop", &container_name])
-            .output()
-            .await;
+        // Graceful stop first (SIGTERM, then SIGKILL after stop_timeout) —
+        // unless forced, in which case `rm -f` kills it straight away.
+        if !force {
+            let _ = tokio::process::Command::new(&self.runtime_binary)
+                .args(["stop", "-t", &self.stop_timeout.to_string(), &container_name])
+                .output()
+                .await;
+        }
 
         // Remove container
         let output = tokio::process::Command::new(&self.runtime_binary)

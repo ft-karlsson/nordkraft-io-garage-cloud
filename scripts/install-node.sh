@@ -24,6 +24,7 @@ set -euo pipefail
 #   --version <tag>         release tag to download (default: latest)
 #   --bind <addr>           API bind address for --dev (default 127.0.0.1; use 0.0.0.0 for LAN)
 #   --no-systemd            write configs but do not manage services (containers, CI)
+#   --reset                 (dev) wipe the dev database and all managed containers, then restart
 #
 # Idempotent: safe to re-run. Existing config.env is kept unless --force.
 # =============================================================================
@@ -38,6 +39,7 @@ BUILD_FROM=""
 NORDKRAFT_VERSION="${NORDKRAFT_VERSION:-latest}"
 DEV_BIND=""
 USE_SYSTEMD=true
+RESET=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,6 +54,7 @@ while [[ $# -gt 0 ]]; do
     --version)     NORDKRAFT_VERSION="$2"; shift 2 ;;
     --bind)        DEV_BIND="$2"; shift 2 ;;
     --no-systemd)  USE_SYSTEMD=false; shift ;;
+    --reset)       RESET=true; shift ;;
     -h|--help)     sed -n '4,25p' "$0"; exit 0 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
@@ -125,6 +128,17 @@ if [[ -z "$DEV_BIND" ]]; then
   if $IN_ORBSTACK; then DEV_BIND="0.0.0.0"; else DEV_BIND="127.0.0.1"; fi
 fi
 log "Mode: ${MODE}$($DEV && echo ' (dev)')   Arch: ${ARCH}   Node: ${NODE_ID}$($IN_ORBSTACK && echo '   (OrbStack VM)')"
+
+if $RESET; then
+  $DEV || error "--reset only works with --dev"
+  [[ -f "${NORDKRAFT_DIR}/config.env" && -x /usr/local/bin/nordkraft-node ]] || error "--reset: no dev node installed here yet"
+  section "Dev reset"
+  if $USE_SYSTEMD; then systemctl stop nordkraft-node || true; fi
+  ( set -a; . "${NORDKRAFT_DIR}/config.env"; set +a; /usr/local/bin/nordkraft-node --dev --reset )
+  if $USE_SYSTEMD; then systemctl start nordkraft-node; sleep 2; fi
+  log "Dev node reset — empty database, no containers"
+  exit 0
+fi
 
 # =============================================================================
 section "Phase 1: Packages"
@@ -349,6 +363,7 @@ BIND_ADDRESS=${DEV_BIND}
 BIND_PORT=${API_PORT}
 DATABASE_URL=${DATABASE_URL}
 BRIDGE_PUBLISH_ADDR=${DEV_BIND}
+$($IN_ORBSTACK && echo "PUBLIC_HOST=$(hostname).orb.local" || echo "# PUBLIC_HOST=<hostname or IP to print in URLs>")
 RUST_LOG=info
 EOF
     EXEC="/usr/local/bin/nordkraft-node --dev"
@@ -444,6 +459,7 @@ if $DEV; then
                  nordkraft deploy nginx:alpine -p 80
     Reach it:    curl http://$($IN_ORBSTACK && echo "$(hostname).orb.local" || echo "127.0.0.1")
     Logs:        journalctl -u nordkraft-node -f
+    Start over:  sudo bash install-node.sh --dev --reset
 
   No WireGuard, no auth: anything that can reach the port is the dev user.
   Keep it on 127.0.0.1 or a private network.

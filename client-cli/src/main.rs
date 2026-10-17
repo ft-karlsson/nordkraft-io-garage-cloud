@@ -79,6 +79,11 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Non-interactive: skip prompts and accept defaults (implied when
+    /// stdin is not a terminal or --json is given)
+    #[arg(short = 'y', long, global = true)]
+    yes: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -174,6 +179,9 @@ enum Commands {
     Remove {
         /// Container name, alias, or omit for interactive selection
         container: Option<String>,
+        /// Kill immediately instead of a graceful stop first
+        #[arg(short, long)]
+        force: bool,
     },
     /// Update nordkraft CLI to the latest version
     Update {
@@ -313,6 +321,9 @@ enum ContainerCommands {
     Remove {
         /// Container name, alias, or omit for interactive selection
         container: Option<String>,
+        /// Kill immediately instead of a graceful stop first
+        #[arg(short, long)]
+        force: bool,
     },
     /// Get container logs
     Logs {
@@ -1187,6 +1198,13 @@ enum ConfigCommands {
     Show,
 }
 
+/// True when prompts must be skipped: --yes, --json, or no terminal on stdin.
+static NON_INTERACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn non_interactive() -> bool {
+    NON_INTERACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 // ============= API TYPES =============
 
 const CONFIG_DIR: &str = ".nordkraft";
@@ -1665,6 +1683,18 @@ struct NodeInfo {
 struct StatusResponse {
     status: String,
     timestamp: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    dev: Option<bool>,
+    #[serde(default)]
+    network_mode: Option<String>,
+    #[serde(default)]
+    auth: Option<String>,
 }
 
 // Logs
@@ -1737,6 +1767,11 @@ struct ApiError {
 async fn main() {
     let cli = Cli::parse();
     let json_output = cli.json;
+    {
+        use std::io::IsTerminal;
+        let quiet = cli.yes || cli.json || !std::io::stdin().is_terminal();
+        NON_INTERACTIVE.store(quiet, std::sync::atomic::Ordering::Relaxed);
+    }
 
     let result = match cli.command {
         Commands::Auth { command } => handle_auth(command, json_output).await,
@@ -1799,7 +1834,9 @@ async fn main() {
         }
         Commands::Stop { container } => handle_stop_interactive(container, json_output).await,
         Commands::Start { container } => handle_start_interactive(container, json_output).await,
-        Commands::Remove { container } => handle_remove_interactive(container, json_output).await,
+        Commands::Remove { container, force } => {
+            handle_remove_interactive(container, force, json_output).await
+        }
     };
 
     if let Err(e) = result {
@@ -1946,9 +1983,9 @@ async fn handle_container(
             handle_container_stop(&container, json_output).await?;
             handle_container_start(&container, json_output).await
         }
-        ContainerCommands::Remove { container } => {
+        ContainerCommands::Remove { container, force } => {
             let container = get_container_or_select(container, json_output).await?;
-            handle_container_remove(&container, json_output).await
+            handle_container_remove_opts(&container, force, json_output).await
         }
         ContainerCommands::Logs {
             container,
@@ -1993,10 +2030,11 @@ async fn handle_start_interactive(
 
 async fn handle_remove_interactive(
     container: Option<String>,
+    force: bool,
     json_output: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let container = get_container_or_select(container, json_output).await?;
-    handle_container_remove(&container, json_output).await
+    handle_container_remove_opts(&container, force, json_output).await
 }
 
 async fn handle_container_list(json_output: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -2497,8 +2535,10 @@ async fn handle_deploy(
         else if args.name.is_some() {
             // No alias prompt — user explicitly named this container
         }
-        // Otherwise, offer interactive alias prompt
-        else {
+        // Otherwise, offer interactive alias prompt (unless non-interactive)
+        else if non_interactive() {
+            // --yes / --json / no TTY: no alias, no prompt
+        } else {
             let set_alias_prompt = Confirm::with_theme(&ColorfulTheme::default())
                 .with_prompt("Set a short alias for this container?")
                 .default(true)
@@ -2575,7 +2615,7 @@ async fn handle_deploy(
     }
 
     // Prompt to inspect — verify runtime, ports, volumes are correct
-    if let Some(name) = &result.container_name {
+    if let (Some(name), false) = (&result.container_name, non_interactive()) {
         println!();
         let inspect_prompt = Confirm::with_theme(&ColorfulTheme::default())
             .with_prompt("Inspect container now?")
@@ -2655,6 +2695,14 @@ async fn handle_container_remove(
     container: &str,
     json_output: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    handle_container_remove_opts(container, false, json_output).await
+}
+
+async fn handle_container_remove_opts(
+    container: &str,
+    force: bool,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let client = create_slow_client()?;
     let container = resolve_alias(container);
 
@@ -2662,7 +2710,11 @@ async fn handle_container_remove(
         println!("{}", format!("🗑️  Removing {}...", container).cyan());
     }
 
-    let url = format!("{}/containers/{}", *API_BASE_URL, container);
+    let url = if force {
+        format!("{}/containers/{}?force=true", *API_BASE_URL, container)
+    } else {
+        format!("{}/containers/{}", *API_BASE_URL, container)
+    };
     let response = client.delete(&url).send().await?;
 
     if !response.status().is_success() {
@@ -4953,6 +5005,28 @@ async fn handle_status(json_output: bool) -> Result<(), Box<dyn std::error::Erro
             result.status.green(),
             result.timestamp.unwrap_or_default().dimmed()
         );
+        let (url, source) = resolve_api_base_url();
+        println!("  {} {} ({})", "Endpoint:".dimmed(), url, source.dimmed());
+        if let (Some(v), Some(n)) = (&result.version, &result.node_id) {
+            println!("  {} nordkraft-node {} on {}", "Server:".dimmed(), v, n);
+        }
+        if result.dev == Some(true) {
+            println!(
+                "  {} {} · {} · {}",
+                "⚠ DEV MODE".yellow().bold(),
+                result.mode.as_deref().unwrap_or("hybrid"),
+                result.network_mode.as_deref().unwrap_or("bridge"),
+                result.auth.as_deref().unwrap_or("no auth").yellow()
+            );
+        } else if let Some(m) = &result.mode {
+            println!(
+                "  {} {} · {} · {}",
+                "Mode:".dimmed(),
+                m,
+                result.network_mode.as_deref().unwrap_or("macvlan"),
+                result.auth.as_deref().unwrap_or("wireguard peer")
+            );
+        }
     }
 
     Ok(())

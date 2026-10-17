@@ -868,8 +868,8 @@ async fn admin_tenants_status(
 #[launch]
 async fn rocket() -> _ {
     // `container-api --dev` must set env defaults BEFORE config is read
-    let dev_flag = bootstrap::parse_args();
-    if dev_flag {
+    let args = bootstrap::parse_args();
+    if args.dev {
         config::apply_dev_preset();
     }
 
@@ -910,6 +910,18 @@ async fn rocket() -> _ {
     // Embedded schema is applied on an empty database; dev mode
     // additionally seeds the dev user/garage/node so deploy works.
     // =========================================================
+    if args.reset {
+        if !dev {
+            error!("❌ --reset only works together with --dev (refusing to wipe a production node)");
+            std::process::exit(2);
+        }
+        if let Err(e) = bootstrap::reset_dev(&db_pool, &config.container_runtime).await {
+            error!("❌ Dev reset failed: {}", e);
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+
     if matches!(
         config.mode,
         config::OperationMode::Controller | config::OperationMode::Hybrid

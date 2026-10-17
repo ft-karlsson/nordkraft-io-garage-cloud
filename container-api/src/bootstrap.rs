@@ -12,6 +12,8 @@ use crate::config::AppConfig;
 
 const SCHEMA_SQL: &str = include_str!("../../setup/schema.sql");
 const MIGRATION_CUSTOM_DOMAINS_SQL: &str = include_str!("../../setup/migration_custom_domains.sql");
+const MIGRATION_CONTAINER_STATUS_SQL: &str =
+    include_str!("../../setup/migration_container_status.sql");
 
 /// Identity of the dev user — must match the shortcut in guards.rs.
 pub const DEV_USER_ID: &str = "dev-user-id";
@@ -59,6 +61,9 @@ pub async fn ensure_schema(
     info!("🗄️ Empty database — applying embedded schema");
     sqlx::raw_sql(&clean_dump(SCHEMA_SQL)).execute(pool).await?;
     sqlx::raw_sql(&clean_dump(MIGRATION_CUSTOM_DOMAINS_SQL))
+        .execute(pool)
+        .await?;
+    sqlx::raw_sql(MIGRATION_CONTAINER_STATUS_SQL)
         .execute(pool)
         .await?;
     info!("✅ Schema applied");
@@ -150,21 +155,64 @@ pub async fn seed_dev(
     Ok(())
 }
 
+/// `--dev --reset`: wipe the dev database and every Nordkraft-managed
+/// container on this node, then exit. Refuses outside dev mode.
+pub async fn reset_dev(
+    pool: &PgPool,
+    runtime: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    info!("🧹 Dev reset: removing all Nordkraft-managed containers");
+    let ps = tokio::process::Command::new(runtime)
+        .args(["ps", "-aq", "--filter", "label=managed_by=nordkraft"])
+        .output()
+        .await?;
+    let ids: Vec<String> = String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !ids.is_empty() {
+        let mut args = vec!["rm".to_string(), "-f".to_string()];
+        args.extend(ids.iter().cloned());
+        let out = tokio::process::Command::new(runtime).args(&args).output().await?;
+        if !out.status.success() {
+            warn!("container cleanup: {}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
+    info!("🧹 Dev reset: {} container(s) removed", ids.len());
+
+    info!("🧹 Dev reset: dropping database schema");
+    sqlx::raw_sql("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        .execute(pool)
+        .await?;
+    info!("✅ Dev reset complete — next start re-applies schema and seed");
+    Ok(())
+}
+
+/// Command-line flags for the server binary.
+#[derive(Debug, Default)]
+pub struct Args {
+    pub dev: bool,
+    pub reset: bool,
+}
+
 /// Minimal argument handling for the server binary.
 ///
 ///   nordkraft-node             production (all config from env)
 ///   nordkraft-node --dev       local dev preset (see config::apply_dev_preset)
+///   nordkraft-node --dev --reset  wipe dev DB + containers, then exit
 ///   nordkraft-node --version
 ///
 /// `serve` is accepted and ignored for compatibility with older unit files
 /// and docs that said `nordkraft serve`. This binary is the server; the
 /// CLI is the separate `nordkraft` binary from client-cli.
-pub fn parse_args() -> bool {
-    let mut dev = false;
+pub fn parse_args() -> Args {
+    let mut a = Args::default();
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "serve" => {}
-            "--dev" | "-d" => dev = true,
+            "--dev" | "-d" => a.dev = true,
+            "--reset" => a.reset = true,
             "--version" | "-V" => {
                 println!("nordkraft-node {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -174,6 +222,8 @@ pub fn parse_args() -> bool {
                 println!("Usage: nordkraft-node [--dev]\n");
                 println!("  --dev        Local development: no WireGuard, no NATS, bridge");
                 println!("               networking, auto-seeded database on 127.0.0.1:8001");
+                println!("  --reset      With --dev: wipe the dev database and all managed");
+                println!("               containers, then exit");
                 println!("  --version    Print version");
                 std::process::exit(0);
             }
@@ -182,5 +232,5 @@ pub fn parse_args() -> bool {
             }
         }
     }
-    dev
+    a
 }

@@ -59,6 +59,11 @@ pub struct AppConfig {
     pub network_mode: NetworkMode,
     // Address published ports bind to in bridge mode (default 0.0.0.0)
     pub bridge_publish_addr: String,
+    // Hostname/IP to print in access URLs (bridge mode). Default: derived from
+    // bridge_publish_addr. Set to e.g. "nordkraft.orb.local" inside OrbStack.
+    pub public_host: Option<String>,
+    // Seconds to wait for SIGTERM before SIGKILL on stop (default 30)
+    pub container_stop_timeout: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -113,6 +118,7 @@ pub fn apply_dev_preset() {
         ("BIND_PORT", "8001"),
         ("ADMIN_API_KEY", "dev"),
         ("CONTAINER_RESTART_POLICY", "no"),
+        ("CONTAINER_STOP_TIMEOUT", "5"),
         (
             "DATABASE_URL",
             "postgres://nordkraft:nordkraft@localhost/nordkraft",
@@ -266,5 +272,10 @@ pub fn init_config() -> AppConfig {
             .unwrap_or(NetworkMode::Macvlan),
         bridge_publish_addr: env::var("BRIDGE_PUBLISH_ADDR")
             .unwrap_or_else(|_| "0.0.0.0".to_string()),
+        public_host: env::var("PUBLIC_HOST").ok().filter(|s| !s.is_empty()),
+        container_stop_timeout: env::var("CONTAINER_STOP_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
     }
 }
