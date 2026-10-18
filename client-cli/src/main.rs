@@ -5,6 +5,7 @@ use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -72,10 +73,16 @@ fn remove_alias(alias: &str) -> Result<(), Box<dyn std::error::Error>> {
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "🚀 Nordkraft Garage Cloud CLI - Secure Container Hosting")]
 #[command(long_about = None)]
+#[command(disable_help_subcommand = true)]
 struct Cli {
     /// Output as JSON (for scripting)
     #[arg(long, global = true)]
     json: bool,
+
+    /// Non-interactive: skip prompts and accept defaults (implied when
+    /// stdin is not a terminal or --json is given)
+    #[arg(short = 'y', long, global = true)]
+    yes: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -118,6 +125,11 @@ enum Commands {
     Nodes,
     /// System status
     Status,
+    /// CLI configuration (API endpoint — e.g. point at a local dev server)
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
     /// Show help with examples
     Help,
     /// Private container registry
@@ -167,6 +179,9 @@ enum Commands {
     Remove {
         /// Container name, alias, or omit for interactive selection
         container: Option<String>,
+        /// Kill immediately instead of a graceful stop first
+        #[arg(short, long)]
+        force: bool,
     },
     /// Update nordkraft CLI to the latest version
     Update {
@@ -306,6 +321,9 @@ enum ContainerCommands {
     Remove {
         /// Container name, alias, or omit for interactive selection
         container: Option<String>,
+        /// Kill immediately instead of a graceful stop first
+        #[arg(short, long)]
+        force: bool,
     },
     /// Get container logs
     Logs {
@@ -1167,33 +1185,157 @@ fn display_diff(diffs: &[SpecDiff], name: &str) {
     );
 }
 
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Set the API endpoint, e.g. http://localhost:8001 (no WireGuard needed)
+    SetApi {
+        /// Base URL of a Nordkraft API ("/api" is appended if missing)
+        url: String,
+    },
+    /// Forget the API endpoint override (back to WireGuard / connection.json)
+    ResetApi,
+    /// Show the effective API endpoint and where it comes from
+    Show,
+}
+
+/// True when prompts must be skipped: --yes, --json, or no terminal on stdin.
+static NON_INTERACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn non_interactive() -> bool {
+    NON_INTERACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 // ============= API TYPES =============
 
 const CONFIG_DIR: &str = ".nordkraft";
+const API_URL_FILE: &str = "api_url";
 const ALIASES_FILE: &str = "aliases.json";
 const DEPLOYMENTS_DIR: &str = "deployments";
 const WG_CONFIG_FILE: &str = "wg.conf";
 const WG_INTERFACE: &str = "nordkraft";
 const CONNECTION_FILE: &str = "connection.json";
 
-pub(crate) static API_BASE_URL: LazyLock<String> = LazyLock::new(|| {
-    // 1. Env var override (dev/testing)
+pub(crate) static API_BASE_URL: LazyLock<String> = LazyLock::new(|| resolve_api_base_url().0);
+
+/// Resolve the API base URL and report where it came from.
+///
+///   1. API_BASE_URL env var               (one-off override)
+///   2. ~/.nordkraft/api_url               (`nordkraft config set-api …`)
+///   3. connection.json api_endpoint       (written by `nordkraft setup`)
+///   4. http://172.20.0.254:8001/api       (controller default over WireGuard)
+fn resolve_api_base_url() -> (String, &'static str) {
     if let Ok(url) = std::env::var("API_BASE_URL") {
-        return url;
+        if !url.is_empty() {
+            return (url, "API_BASE_URL env var");
+        }
     }
 
-    // 2. From connection config if set
+    if let Some(url) = load_api_url_override() {
+        return (url, "~/.nordkraft/api_url (nordkraft config set-api)");
+    }
+
     if let Some(config) = load_connection_config() {
         if let Some(endpoint) = config.api_endpoint {
             if !endpoint.is_empty() {
-                return endpoint;
+                return (endpoint, "~/.nordkraft/connection.json");
             }
         }
     }
 
-    // 3. Default — matches open source controller default
-    "http://172.20.0.254:8001/api".to_string()
-});
+    (
+        "http://172.20.0.254:8001/api".to_string(),
+        "default (controller over WireGuard)",
+    )
+}
+
+fn api_url_override_path() -> PathBuf {
+    get_config_dir().join(API_URL_FILE)
+}
+
+fn load_api_url_override() -> Option<String> {
+    let s = fs::read_to_string(api_url_override_path()).ok()?;
+    let s = s.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Normalise a user-supplied base URL: add scheme, strip trailing slash,
+/// make sure it ends in /api.
+fn normalise_api_url(input: &str) -> String {
+    let mut url = input.trim().trim_end_matches('/').to_string();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        url = format!("http://{}", url);
+    }
+    if !url.ends_with("/api") {
+        url.push_str("/api");
+    }
+    url
+}
+
+async fn handle_config(command: ConfigCommands, json_output: bool) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        ConfigCommands::SetApi { url } => {
+            let url = normalise_api_url(&url);
+            let dir = get_config_dir();
+            fs::create_dir_all(&dir)?;
+            fs::write(api_url_override_path(), format!("{}\n", url))?;
+
+            // Quick reachability check — not fatal, just informative
+            let reachable = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()?
+                .get(format!("{}/status", url))
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false);
+
+            if json_output {
+                println!("{}", serde_json::json!({"api_url": url, "reachable": reachable}));
+            } else {
+                println!("{} API endpoint set to {}", "✓".green(), url.cyan());
+                if reachable {
+                    println!("  {} server responded on {}/status", "✓".green(), url);
+                } else {
+                    println!(
+                        "  {} no response from {}/status yet (is the server running?)",
+                        "!".yellow(),
+                        url
+                    );
+                }
+                println!("  Remove with: {}", "nordkraft config reset-api".dimmed());
+            }
+            Ok(())
+        }
+        ConfigCommands::ResetApi => {
+            let path = api_url_override_path();
+            if path.exists() {
+                fs::remove_file(&path)?;
+            }
+            let (url, source) = resolve_api_base_url();
+            if json_output {
+                println!("{}", serde_json::json!({"api_url": url, "source": source}));
+            } else {
+                println!("{} API endpoint override removed", "✓".green());
+                println!("  Now using {} ({})", url.cyan(), source.dimmed());
+            }
+            Ok(())
+        }
+        ConfigCommands::Show => {
+            let (url, source) = resolve_api_base_url();
+            if json_output {
+                println!("{}", serde_json::json!({"api_url": url, "source": source}));
+            } else {
+                println!("API endpoint: {}", url.cyan());
+                println!("Source:       {}", source.dimmed());
+            }
+            Ok(())
+        }
+    }
+}
 
 static PUBLIC_API_URL: LazyLock<String> = LazyLock::new(|| {
     // 1. Env var override
@@ -1365,6 +1507,11 @@ struct DeployResponse {
     message: Option<String>,
     #[serde(default)]
     ipv6_urls: Vec<String>,
+    /// Bridge/dev mode: URLs of the published ports on the host
+    #[serde(default)]
+    access_urls: Vec<String>,
+    #[serde(default)]
+    network_mode: Option<String>,
 }
 
 // Upgrade
@@ -1536,6 +1683,18 @@ struct NodeInfo {
 struct StatusResponse {
     status: String,
     timestamp: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    dev: Option<bool>,
+    #[serde(default)]
+    network_mode: Option<String>,
+    #[serde(default)]
+    auth: Option<String>,
 }
 
 // Logs
@@ -1608,6 +1767,11 @@ struct ApiError {
 async fn main() {
     let cli = Cli::parse();
     let json_output = cli.json;
+    {
+        use std::io::IsTerminal;
+        let quiet = cli.yes || cli.json || !std::io::stdin().is_terminal();
+        NON_INTERACTIVE.store(quiet, std::sync::atomic::Ordering::Relaxed);
+    }
 
     let result = match cli.command {
         Commands::Auth { command } => handle_auth(command, json_output).await,
@@ -1624,6 +1788,7 @@ async fn main() {
         }
         Commands::Alias { command } => handle_alias(command, json_output).await,
         Commands::Update { check } => handle_update(check, json_output).await,
+        Commands::Config { command } => handle_config(command, json_output).await,
         Commands::Registry { command } => handle_registry(command, json_output).await,
         // UI console
         Commands::Ui => crate::tui::run_tui().await,
@@ -1669,7 +1834,9 @@ async fn main() {
         }
         Commands::Stop { container } => handle_stop_interactive(container, json_output).await,
         Commands::Start { container } => handle_start_interactive(container, json_output).await,
-        Commands::Remove { container } => handle_remove_interactive(container, json_output).await,
+        Commands::Remove { container, force } => {
+            handle_remove_interactive(container, force, json_output).await
+        }
     };
 
     if let Err(e) = result {
@@ -1684,6 +1851,12 @@ async fn main() {
 
 fn create_client() -> Result<Client, Box<dyn std::error::Error>> {
     Ok(Client::builder().timeout(Duration::from_secs(30)).build()?)
+}
+
+/// Client for calls that wait on a graceful container stop server-side
+/// (stop-timeout is 30s, so the HTTP timeout must be longer than that).
+fn create_slow_client() -> Result<Client, Box<dyn std::error::Error>> {
+    Ok(Client::builder().timeout(Duration::from_secs(90)).build()?)
 }
 
 // ============= AUTH HANDLERS =============
@@ -1810,9 +1983,9 @@ async fn handle_container(
             handle_container_stop(&container, json_output).await?;
             handle_container_start(&container, json_output).await
         }
-        ContainerCommands::Remove { container } => {
+        ContainerCommands::Remove { container, force } => {
             let container = get_container_or_select(container, json_output).await?;
-            handle_container_remove(&container, json_output).await
+            handle_container_remove_opts(&container, force, json_output).await
         }
         ContainerCommands::Logs {
             container,
@@ -1857,10 +2030,11 @@ async fn handle_start_interactive(
 
 async fn handle_remove_interactive(
     container: Option<String>,
+    force: bool,
     json_output: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let container = get_container_or_select(container, json_output).await?;
-    handle_container_remove(&container, json_output).await
+    handle_container_remove_opts(&container, force, json_output).await
 }
 
 async fn handle_container_list(json_output: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -2361,8 +2535,10 @@ async fn handle_deploy(
         else if args.name.is_some() {
             // No alias prompt — user explicitly named this container
         }
-        // Otherwise, offer interactive alias prompt
-        else {
+        // Otherwise, offer interactive alias prompt (unless non-interactive)
+        else if non_interactive() {
+            // --yes / --json / no TTY: no alias, no prompt
+        } else {
             let set_alias_prompt = Confirm::with_theme(&ColorfulTheme::default())
                 .with_prompt("Set a short alias for this container?")
                 .default(true)
@@ -2390,7 +2566,17 @@ async fn handle_deploy(
     if let Some(node) = &result.node {
         println!("   {} {}", "Node:".cyan(), node);
     }
-    if let Some(ip) = &result.container_ip {
+    if !result.access_urls.is_empty() {
+        for url in &result.access_urls {
+            println!("   {} {}", "URL:".cyan(), url.cyan().bold());
+        }
+        if result.network_mode.as_deref() == Some("bridge") {
+            println!(
+                "   {}",
+                "(bridge mode: reached via the host's published port, not the container IP)".dimmed()
+            );
+        }
+    } else if let Some(ip) = &result.container_ip {
         println!("   {} {}", "IPv4:".cyan(), ip);
     }
     if let Some(ipv6) = &result.ipv6_address {
@@ -2429,7 +2615,7 @@ async fn handle_deploy(
     }
 
     // Prompt to inspect — verify runtime, ports, volumes are correct
-    if let Some(name) = &result.container_name {
+    if let (Some(name), false) = (&result.container_name, non_interactive()) {
         println!();
         let inspect_prompt = Confirm::with_theme(&ColorfulTheme::default())
             .with_prompt("Inspect container now?")
@@ -2479,7 +2665,7 @@ async fn handle_container_stop(
     container: &str,
     json_output: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = create_client()?;
+    let client = create_slow_client()?;
     let container = resolve_alias(container);
 
     if !json_output {
@@ -2509,14 +2695,26 @@ async fn handle_container_remove(
     container: &str,
     json_output: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = create_client()?;
+    handle_container_remove_opts(container, false, json_output).await
+}
+
+async fn handle_container_remove_opts(
+    container: &str,
+    force: bool,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = create_slow_client()?;
     let container = resolve_alias(container);
 
     if !json_output {
         println!("{}", format!("🗑️  Removing {}...", container).cyan());
     }
 
-    let url = format!("{}/containers/{}", *API_BASE_URL, container);
+    let url = if force {
+        format!("{}/containers/{}?force=true", *API_BASE_URL, container)
+    } else {
+        format!("{}/containers/{}", *API_BASE_URL, container)
+    };
     let response = client.delete(&url).send().await?;
 
     if !response.status().is_success() {
@@ -4807,6 +5005,28 @@ async fn handle_status(json_output: bool) -> Result<(), Box<dyn std::error::Erro
             result.status.green(),
             result.timestamp.unwrap_or_default().dimmed()
         );
+        let (url, source) = resolve_api_base_url();
+        println!("  {} {} ({})", "Endpoint:".dimmed(), url, source.dimmed());
+        if let (Some(v), Some(n)) = (&result.version, &result.node_id) {
+            println!("  {} nordkraft-node {} on {}", "Server:".dimmed(), v, n);
+        }
+        if result.dev == Some(true) {
+            println!(
+                "  {} {} · {} · {}",
+                "⚠ DEV MODE".yellow().bold(),
+                result.mode.as_deref().unwrap_or("hybrid"),
+                result.network_mode.as_deref().unwrap_or("bridge"),
+                result.auth.as_deref().unwrap_or("no auth").yellow()
+            );
+        } else if let Some(m) = &result.mode {
+            println!(
+                "  {} {} · {} · {}",
+                "Mode:".dimmed(),
+                m,
+                result.network_mode.as_deref().unwrap_or("macvlan"),
+                result.auth.as_deref().unwrap_or("wireguard peer")
+            );
+        }
     }
 
     Ok(())

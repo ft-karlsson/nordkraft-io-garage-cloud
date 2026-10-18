@@ -225,6 +225,14 @@ pub async fn deploy_container(
                     "ports": ports,
                 });
 
+                // Bridge mode: the container IP is internal to the host; what
+                // the caller can actually reach is the published port.
+                if app_state.container_manager.is_bridge() {
+                    let urls = app_state.container_manager.access_urls(&container_name).await;
+                    response["network_mode"] = serde_json::json!("bridge");
+                    response["access_urls"] = serde_json::json!(urls);
+                }
+
                 // Add IPv6 info to response if enabled
                 if let Some(ipv6_addr) = deployed_ipv6 {
                     response["ipv6_address"] = serde_json::json!(ipv6_addr);
@@ -388,9 +396,10 @@ pub async fn list_containers_route(
     }
 }
 
-#[delete("/containers/<container_id>")]
+#[delete("/containers/<container_id>?<force>")]
 pub async fn delete_container(
     container_id: String,
+    force: Option<bool>,
     user: AuthenticatedUser,
     app_state: &rocket::State<AppState>,
     orchestrator: &rocket::State<OrchestratorService>,
@@ -415,6 +424,7 @@ pub async fn delete_container(
                 user.0.user_slot,
                 orchestrator.nats_service.as_deref(),
                 Some(&orchestrator.node_id),
+                force.unwrap_or(false),
             )
             .await
         {

@@ -51,6 +51,84 @@ pub struct AppConfig {
 
     // Quota enforcement (cloud.nordkraft.io = true, self-hosted = false)
     pub quota_enforced: bool,
+
+    // Container networking: "macvlan" (production, containers get LAN IPs)
+    // or "bridge" (dev/local, containers behind nerdctl's default bridge with
+    // published ports). Bridge needs no physical interface, no shims, no
+    // routes — it is what `serve --dev` uses.
+    pub network_mode: NetworkMode,
+    // Address published ports bind to in bridge mode (default 0.0.0.0)
+    pub bridge_publish_addr: String,
+    // Hostname/IP to print in access URLs (bridge mode). Default: derived from
+    // bridge_publish_addr. Set to e.g. "nordkraft.orb.local" inside OrbStack.
+    pub public_host: Option<String>,
+    // Seconds to wait for SIGTERM before SIGKILL on stop (default 30)
+    pub container_stop_timeout: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkMode {
+    Macvlan,
+    Bridge,
+}
+
+impl NetworkMode {
+    pub fn is_bridge(&self) -> bool {
+        matches!(self, NetworkMode::Bridge)
+    }
+}
+
+impl std::str::FromStr for NetworkMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "bridge" => Ok(NetworkMode::Bridge),
+            "macvlan" => Ok(NetworkMode::Macvlan),
+            other => Err(format!(
+                "Unknown NETWORK_MODE '{}' (expected 'macvlan' or 'bridge')",
+                other
+            )),
+        }
+    }
+}
+
+/// Apply the `--dev` preset: every value is a *default* — anything already
+/// set in the environment wins, so a dev.env file can still override.
+///
+/// What dev mode means:
+///   - no WireGuard: every caller is the dev user (DEV_MODE=true)
+///   - no NATS, no pfSense/HAProxy, no Kata, no macvlan, no ingress
+///   - bridge networking with published ports
+///   - API on 127.0.0.1:8001 — trust everyone who can reach the port
+///   - schema + dev user/garage/node seeded on startup
+pub fn apply_dev_preset() {
+    let defaults: &[(&str, &str)] = &[
+        ("DEV_MODE", "true"),
+        ("NORDKRAFT_MODE", "hybrid"),
+        ("NODE_ID", "dev-node"),
+        ("NATS_ENABLED", "false"),
+        ("DISABLE_KATA", "true"),
+        ("NETWORK_MODE", "bridge"),
+        ("INGRESS_ENABLED", "false"),
+        ("CUSTOM_DOMAINS_ENABLED", "false"),
+        ("QUOTA_ENFORCED", "false"),
+        ("BIND_ADDRESS", "127.0.0.1"),
+        ("BIND_PORT", "8001"),
+        ("ADMIN_API_KEY", "dev"),
+        ("CONTAINER_RESTART_POLICY", "no"),
+        ("CONTAINER_STOP_TIMEOUT", "5"),
+        (
+            "DATABASE_URL",
+            "postgres://nordkraft:nordkraft@localhost/nordkraft",
+        ),
+    ];
+    for (k, v) in defaults {
+        if env::var(k).map(|s| s.is_empty()).unwrap_or(true) {
+            env::set_var(k, v);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -186,5 +264,18 @@ pub fn init_config() -> AppConfig {
             .unwrap_or_else(|_| "false".to_string())
             .parse()
             .unwrap_or(false),
+
+        // Networking — macvlan unless told otherwise
+        network_mode: env::var("NETWORK_MODE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(NetworkMode::Macvlan),
+        bridge_publish_addr: env::var("BRIDGE_PUBLISH_ADDR")
+            .unwrap_or_else(|_| "0.0.0.0".to_string()),
+        public_host: env::var("PUBLIC_HOST").ok().filter(|s| !s.is_empty()),
+        container_stop_timeout: env::var("CONTAINER_STOP_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
     }
 }

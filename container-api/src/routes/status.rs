@@ -1,14 +1,22 @@
 // routes/status.rs - Status and health check routes
 use crate::guards::AuthenticatedUser;
+use crate::AppState;
 use crate::storage::get_user_garage_subnet;
 use rocket::serde::json::Json;
 use sqlx::PgPool;
 
 #[get("/status")]
-pub async fn get_status() -> Json<serde_json::Value> {
+pub async fn get_status(app_state: &rocket::State<AppState>) -> Json<serde_json::Value> {
+    let c = &app_state.config;
     Json(serde_json::json!({
         "status": "online",
-        "timestamp": chrono::Utc::now()
+        "timestamp": chrono::Utc::now(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "node_id": c.node_id,
+        "mode": format!("{:?}", c.mode).to_lowercase(),
+        "dev": c.dev_mode,
+        "network_mode": if c.network_mode.is_bridge() { "bridge" } else { "macvlan" },
+        "auth": if c.dev_mode { "none (dev mode)" } else { "wireguard peer" },
     }))
 }
 

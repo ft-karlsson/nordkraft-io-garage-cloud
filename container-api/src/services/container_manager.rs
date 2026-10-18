@@ -12,7 +12,7 @@
 //     - SLAAC IPv6:  router assigns)
 //     - Parent interface: set by env
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, NetworkMode};
 use crate::models::{ContainerInfo, PortMapping, PortSpec, RegistryAuth};
 use crate::services::macvlan_manager::MacvlanManager;
 use crate::services::nats_service::{NatsMessage, NatsService, NatsSubjects};
@@ -78,6 +78,42 @@ fn emit(
     }
 }
 
+/// One published port in bridge mode (stored as the app_published label).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PublishedPort {
+    pub port: u16,
+    pub host_port: u16,
+    pub protocol: String,
+}
+
+fn bridge_url(host: &str, host_port: u16, protocol: &str) -> String {
+    match (host_port, protocol) {
+        (80, "tcp") => format!("http://{}", host),
+        (p, "tcp") => format!("http://{}:{}", host, p),
+        (p, proto) => format!("{}:{}/{}", host, p, proto),
+    }
+}
+
+/// Requested host port if it is free (not a listening socket, not published
+/// by another Nordkraft container, not already taken in this deploy),
+/// otherwise the first free port in 30000–39999. A nerdctl publish is an
+/// iptables rule, not a socket, so the bind test alone is not enough.
+fn pick_host_port(
+    addr: &str,
+    wanted: u16,
+    taken: &[PublishedPort],
+    published_elsewhere: &std::collections::HashSet<u16>,
+) -> u16 {
+    let in_use = |p: u16| taken.iter().any(|t| t.host_port == p) || published_elsewhere.contains(&p);
+    let free = |p: u16| std::net::TcpListener::bind((addr, p)).is_ok();
+    if !in_use(wanted) && free(wanted) {
+        return wanted;
+    }
+    (30000u16..40000)
+        .find(|&p| !in_use(p) && free(p))
+        .unwrap_or(wanted)
+}
+
 pub struct ContainerManager {
     runtime_binary: String, // "nerdctl" or "podman"
     use_kata: bool,
@@ -85,6 +121,10 @@ pub struct ContainerManager {
     restart_policy: String,
     persistence: PersistenceManager,
     macvlan: MacvlanManager,
+    network_mode: NetworkMode,
+    bridge_publish_addr: String,
+    public_host: Option<String>,
+    stop_timeout: u32,
 }
 
 impl ContainerManager {
@@ -118,6 +158,28 @@ impl ContainerManager {
             restart_policy: config.container_restart_policy.clone(),
             persistence: PersistenceManager::new(),
             macvlan: MacvlanManager::with_defaults(),
+            network_mode: config.network_mode,
+            bridge_publish_addr: config.bridge_publish_addr.clone(),
+            public_host: config.public_host.clone(),
+            stop_timeout: config.container_stop_timeout,
+        }
+    }
+
+    /// True when containers live behind nerdctl's default bridge with
+    /// published ports instead of on a per-tenant macvlan.
+    pub fn is_bridge(&self) -> bool {
+        self.network_mode.is_bridge()
+    }
+
+    /// Host address a published port is reachable on (bridge mode only).
+    pub fn publish_host(&self) -> &str {
+        if let Some(h) = &self.public_host {
+            return h;
+        }
+        if self.bridge_publish_addr == "0.0.0.0" {
+            "127.0.0.1"
+        } else {
+            &self.bridge_publish_addr
         }
     }
 
@@ -188,24 +250,34 @@ impl ContainerManager {
             return Err(e.into());
         }
 
-        emit(
-            &event_tx,
-            &container_name,
-            "network",
-            &format!("Setting up macvlan network for slot"),
-            true,
-        );
-
-        // ========== MACVLAN NETWORK (DUAL-STACK) ==========
-        // Ensure per-user macvlan network exists
+        let bridge = self.is_bridge();
         let user_slot = user_slot.ok_or("user_slot required for network allocation")?;
 
-        // Verify interface setup on first deploy
-        if let Err(e) = self.macvlan.verify_setup().await {
-            warn!("Interface verification failed: {} - continuing anyway", e);
-        }
+        if bridge {
+            emit(
+                &event_tx,
+                &container_name,
+                "network",
+                "Using bridge network with published ports",
+                true,
+            );
+        } else {
+            emit(
+                &event_tx,
+                &container_name,
+                "network",
+                "Setting up macvlan network for slot",
+                true,
+            );
 
-        self.macvlan.ensure_network_for_slot(user_slot).await?;
+            // ========== MACVLAN NETWORK (DUAL-STACK) ==========
+            // Verify interface setup on first deploy
+            if let Err(e) = self.macvlan.verify_setup().await {
+                warn!("Interface verification failed: {} - continuing anyway", e);
+            }
+
+            self.macvlan.ensure_network_for_slot(user_slot).await?;
+        }
 
         // Build command args
         let mut args = vec![
@@ -216,22 +288,62 @@ impl ContainerManager {
             "--restart".to_string(),
             self.restart_policy.clone(),
             "--stop-timeout".to_string(),
-            "30".to_string(),
+            self.stop_timeout.to_string(),
         ];
 
-        // ========== NETWORK CONFIGURATION (MACVLAN ONLY) ==========
-        // Attach to macvlan with static IPv4 + IPv6 SLAAC
-        let allocated_ip = allocated_ip.ok_or("allocated_ip required for macvlan")?;
-        let network_args = self
-            .macvlan
-            .get_network_args_with_ipv4(user_slot, &allocated_ip);
-        args.extend(network_args);
+        // ========== NETWORK CONFIGURATION ==========
+        let allocated_ip = if bridge {
+            // Bridge: nerdctl's default network, ports published on the host.
+            // The controller-allocated IP is recorded but not enforced.
+            args.extend_from_slice(&["--network".to_string(), "bridge".to_string()]);
+            // Host port = the requested port if free, otherwise a free one from
+            // the ephemeral range, so several containers can publish :80.
+            let mut published: Vec<PublishedPort> = Vec::new();
+            let elsewhere = self.host_ports_in_use().await;
+            for p in ports.iter().flatten() {
+                let proto = p.protocol.to_lowercase();
+                let host_port =
+                    pick_host_port(&self.bridge_publish_addr, p.port, &published, &elsewhere);
+                let spec = if proto == "udp" {
+                    format!("{}:{}:{}/udp", self.bridge_publish_addr, host_port, p.port)
+                } else {
+                    format!("{}:{}:{}", self.bridge_publish_addr, host_port, p.port)
+                };
+                args.extend_from_slice(&["-p".to_string(), spec]);
+                published.push(PublishedPort {
+                    port: p.port,
+                    host_port,
+                    protocol: proto,
+                });
+            }
+            if !published.is_empty() {
+                let json = serde_json::to_string(&published).unwrap_or_default();
+                args.extend_from_slice(&["--label".to_string(), format!("app_published={}", json)]);
+            }
+            info!(
+                "📡 Bridge network: published {:?} on {}",
+                published
+                    .iter()
+                    .map(|p| format!("{}->{}", p.host_port, p.port))
+                    .collect::<Vec<_>>(),
+                self.bridge_publish_addr
+            );
+            allocated_ip.unwrap_or_default()
+        } else {
+            // Attach to macvlan with static IPv4 + IPv6 SLAAC
+            let allocated_ip = allocated_ip.ok_or("allocated_ip required for macvlan")?;
+            let network_args = self
+                .macvlan
+                .get_network_args_with_ipv4(user_slot, &allocated_ip);
+            args.extend(network_args);
 
-        info!(
-            "📡 Macvlan dual-stack: {} with IPv4 {} + IPv6 SLAAC",
-            self.macvlan.network_name_for_slot(user_slot),
+            info!(
+                "📡 Macvlan dual-stack: {} with IPv4 {} + IPv6 SLAAC",
+                self.macvlan.network_name_for_slot(user_slot),
+                allocated_ip
+            );
             allocated_ip
-        );
+        };
 
         // Add Kata runtime if enabled
         if self.use_kata {
@@ -426,7 +538,11 @@ impl ContainerManager {
 
         if let Some(dir) = &pull_config_dir {
             if let Err(e) = tokio::fs::remove_dir_all(dir).await {
-                warn!("Could not remove pull credential dir {}: {}", dir.display(), e);
+                warn!(
+                    "Could not remove pull credential dir {}: {}",
+                    dir.display(),
+                    e
+                );
             }
         }
         let output = output?;
@@ -493,8 +609,9 @@ impl ContainerManager {
             }
         };
 
-        // Verify IPv4 assignment matches what we requested
-        if container_ip != allocated_ip {
+        // Verify IPv4 assignment matches what we requested (macvlan only —
+        // on a bridge the runtime hands out the address)
+        if !bridge && container_ip != allocated_ip {
             error!(
                 "🚨 IP MISMATCH! Expected {} but container got {}. \
                  This will break routing. Removing container.",
@@ -525,7 +642,10 @@ impl ContainerManager {
 
         // ========== SLAAC IPv6 ==========
         // Fetch the IPv6 address ASSIGNED BY THE ROUTER (not by us)
-        let final_ipv6 = if enable_ipv6 {
+        let final_ipv6 = if enable_ipv6 && bridge {
+            warn!("⚠️ IPv6 requested but not available in bridge mode — IPv4 only");
+            None
+        } else if enable_ipv6 {
             info!("🌐 Waiting for SLAAC to assign IPv6...");
 
             match self.macvlan.wait_for_slaac_ipv6(&container_name).await {
@@ -670,10 +790,19 @@ impl ContainerManager {
                 || ipv6_address.is_some();
 
             // Build port mappings with proper URLs
+            let bridge_host = self.is_bridge().then(|| self.publish_host().to_string());
+            let published = self.get_published_ports(&container);
             let port_mappings: Vec<PortMapping> = ports
                 .iter()
                 .map(|port_spec| {
-                    let access_url = if let Some(ref ip) = container_ip {
+                    let access_url = if let Some(ref host) = bridge_host {
+                        let hp = published
+                            .iter()
+                            .find(|pp| pp.port == port_spec.port)
+                            .map(|pp| pp.host_port)
+                            .unwrap_or(port_spec.port);
+                        bridge_url(host, hp, &port_spec.protocol)
+                    } else if let Some(ref ip) = container_ip {
                         match (port_spec.port, port_spec.protocol.as_str()) {
                             (80, "tcp") => format!("http://{}", ip),
                             (443, "tcp") => format!("https://{}", ip),
@@ -752,6 +881,58 @@ impl ContainerManager {
         None
     }
 
+    /// Bridge mode: host↔container port mapping from the app_published label.
+    fn get_published_ports(&self, container: &serde_json::Value) -> Vec<PublishedPort> {
+        self.get_label_value(container, "app_published")
+            .and_then(|s| serde_json::from_str::<Vec<PublishedPort>>(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Bridge mode: host ports already published by any Nordkraft container
+    /// on this node (running or stopped — a stopped one keeps its mapping).
+    async fn host_ports_in_use(&self) -> std::collections::HashSet<u16> {
+        let mut set = std::collections::HashSet::new();
+        let output = tokio::process::Command::new(&self.runtime_binary)
+            .args(["ps", "-a", "--format", "json", "--filter", "label=managed_by=nordkraft"])
+            .output()
+            .await;
+        let Ok(output) = output else { return set };
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let Ok(c) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            for pp in self.get_published_ports(&c) {
+                set.insert(pp.host_port);
+            }
+        }
+        set
+    }
+
+    /// Bridge mode: URLs a caller can reach a container's published ports on.
+    /// Empty in macvlan mode.
+    pub async fn access_urls(&self, container_name: &str) -> Vec<String> {
+        if !self.is_bridge() {
+            return vec![];
+        }
+        let output = tokio::process::Command::new(&self.runtime_binary)
+            .args(["inspect", container_name])
+            .output()
+            .await;
+        let Ok(output) = output else { return vec![] };
+        let Ok(raw) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+            return vec![];
+        };
+        let Some(c) = raw.as_array().and_then(|a| a.first()) else { return vec![] };
+        let labels = &c["Config"]["Labels"];
+        let published: Vec<PublishedPort> = labels["app_published"]
+            .as_str()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let host = self.publish_host();
+        published
+            .iter()
+            .map(|p| bridge_url(host, p.host_port, &p.protocol))
+            .collect()
+    }
+
     /// Get ports from container labels — only returns ports if explicitly set via app_ports label.
     /// Base runtime images (node, python, ubuntu etc.) have no label and return empty.
     fn get_ports_from_container(&self, container: &serde_json::Value) -> Vec<PortSpec> {
@@ -825,6 +1006,7 @@ impl ContainerManager {
         user_slot: Option<i32>,
         nats: Option<&NatsService>,
         node_id: Option<&str>,
+        force: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let containers = self.list_user_containers(owner_pubkey).await?;
         let container = containers
@@ -837,11 +1019,14 @@ impl ContainerManager {
 
         let container_name = container.unwrap().name.clone();
 
-        // Stop first if running
-        let _ = tokio::process::Command::new(&self.runtime_binary)
-            .args(["stop", &container_name])
-            .output()
-            .await;
+        // Graceful stop first (SIGTERM, then SIGKILL after stop_timeout) —
+        // unless forced, in which case `rm -f` kills it straight away.
+        if !force {
+            let _ = tokio::process::Command::new(&self.runtime_binary)
+                .args(["stop", "-t", &self.stop_timeout.to_string(), &container_name])
+                .output()
+                .await;
+        }
 
         // Remove container
         let output = tokio::process::Command::new(&self.runtime_binary)

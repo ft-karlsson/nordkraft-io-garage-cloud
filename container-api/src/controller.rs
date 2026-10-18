@@ -798,6 +798,7 @@ fn make_container_delete_handler(
                     user_slot,
                     nats.as_ref().map(|n| n.as_ref()),
                     Some(&node),
+                    false,
                 )
                 .await;
         });

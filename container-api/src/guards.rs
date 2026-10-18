@@ -98,7 +98,7 @@ impl<'r> FromRequest<'r> for AuthenticatedUser {
                     "delete".to_string(),
                     "stop".to_string(),
                 ],
-                primary_garage_id: "ry".to_string(),
+                primary_garage_id: crate::bootstrap::DEV_GARAGE_ID.to_string(),
                 user_slot: Some(99),
             };
             return Outcome::Success(AuthenticatedUser(dev_user));
