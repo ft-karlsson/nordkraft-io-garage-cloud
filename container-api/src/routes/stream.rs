@@ -41,9 +41,10 @@ type Refused = (Status, String);
 
 /// Query parameters shared by both stream routes.
 #[derive(Debug, Clone, rocket::FromForm)]
+#[allow(dead_code)] // `tty` is read through is_tty()
 pub struct StreamQuery {
-    #[field(default = false)]
-    pub tty: bool,
+    /// "1"/"true"/"yes"/"on" → TTY. (Rocket's bool only takes true/false.)
+    pub tty: Option<String>,
     pub cmd: Vec<String>,
     pub cwd: Option<String>,
     pub env: Vec<String>,
@@ -55,7 +56,18 @@ pub struct StreamQuery {
 }
 
 impl StreamQuery {
+    fn is_tty(&self) -> bool {
+        matches!(
+            self.tty
+                .as_deref()
+                .map(|s| s.to_ascii_lowercase())
+                .as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    }
+
     fn into_spec(self, container: String, owner_pubkey: Option<String>) -> ExecSpec {
+        let tty = self.is_tty();
         let cmd = if self.cmd.is_empty() {
             vec!["/bin/sh".to_string()]
         } else {
@@ -68,7 +80,7 @@ impl StreamQuery {
             env: self.env,
             cwd: self.cwd,
             user: self.user,
-            tty: self.tty,
+            tty,
             initial_size: match (self.cols, self.rows) {
                 (Some(width), Some(height)) => Some(Resize { width, height }),
                 _ => None,
@@ -173,7 +185,9 @@ pub async fn container_stream(
         Placement::Local => {
             info!(
                 "🖥️  stream {} local tty={} for {}",
-                container, q.tty, user.0.email
+                container,
+                q.is_tty(),
+                user.0.email
             );
             let spec = q.into_spec(container, Some(pubkey));
             Ok(ws.channel(move |duplex| {
@@ -333,7 +347,7 @@ pub async fn container_exec(
             agent_ip,
             agent_port,
         } => {
-            let mut query = vec![("tty", "0".to_string()), ("owner", pubkey)];
+            let mut query = vec![("tty", "false".to_string()), ("owner", pubkey)];
             for c in &req.cmd {
                 query.push(("cmd", c.clone()));
             }

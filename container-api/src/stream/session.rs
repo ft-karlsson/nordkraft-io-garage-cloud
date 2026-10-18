@@ -65,7 +65,7 @@ pub async fn run(
 
     let started = Instant::now();
     let mut last_activity = Instant::now();
-    let mut idle_tick = tokio::time::interval(Duration::from_secs(5));
+    let mut idle_tick = tokio::time::interval(Duration::from_secs(1));
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // Own the only stdin sender, so dropping it is the container's EOF.
@@ -281,14 +281,25 @@ mod live {
         tokio::spawn(async move {
             run(
                 &exec,
-                spec(&["/bin/sh", "-c", "pwd; echo $GREETING; cat; echo done >&2; exit 5"]),
+                spec(&[
+                    "/bin/sh",
+                    "-c",
+                    "pwd; echo $GREETING; cat; echo done >&2; exit 5",
+                ]),
                 to_rx,
                 from_tx,
                 Limits::default(),
             )
             .await
         });
-        let r = collect(to_tx, from_rx, Some(b"from-stdin\n".to_vec()), Duration::from_secs(10), 1 << 20).await;
+        let r = collect(
+            to_tx,
+            from_rx,
+            Some(b"from-stdin\n".to_vec()),
+            Duration::from_secs(10),
+            1 << 20,
+        )
+        .await;
         assert_eq!(r.exit_code, Some(5), "{r:?}");
         assert_eq!(r.stdout, "/tmp\nhej\nfrom-stdin\n");
         assert_eq!(r.stderr, "done\n");
@@ -308,14 +319,24 @@ mod live {
                 spec(&["/bin/sleep", "60"]),
                 to_rx,
                 from_tx,
-                Limits { idle: Duration::from_secs(2), max: Duration::from_secs(2) },
+                Limits {
+                    idle: Duration::from_secs(2),
+                    max: Duration::from_secs(2),
+                },
             )
             .await
         });
         let t0 = Instant::now();
         let r = collect(to_tx, from_rx, None, Duration::from_secs(2), 1 << 20).await;
         assert!(r.exit_code.is_none());
-        assert!(r.error.as_deref().unwrap_or("").contains("timeout"), "{r:?}");
-        assert!(t0.elapsed() < Duration::from_secs(15), "took {:?}", t0.elapsed());
+        assert!(
+            r.error.as_deref().unwrap_or("").contains("timeout"),
+            "{r:?}"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(15),
+            "took {:?}",
+            t0.elapsed()
+        );
     }
 }

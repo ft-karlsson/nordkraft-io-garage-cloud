@@ -30,7 +30,7 @@ use super::protocol::{Resize, STDERR, STDOUT};
 
 const FIFO_ROOT: &str = "/run/nordkraft/exec";
 const FIFO_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
-const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(2);
+const KILL_WAIT: Duration = Duration::from_secs(5);
 const OUTPUT_CHUNK: usize = 32 * 1024;
 
 pub type ExecError = Box<dyn std::error::Error + Send + Sync>;
@@ -357,18 +357,19 @@ impl ExecProcess {
         Ok(code)
     }
 
-    /// Kill (if still running) and remove every trace. Idempotent.
-    pub async fn abort(&self) {
+    /// Kill (if still running), wait for the shim to report the death, and
+    /// remove every trace. Idempotent.
+    pub async fn abort(&mut self) {
         if self.inner.exit.lock().await.is_none() {
             let _ = self.inner.kill(9).await;
+            let _ = tokio::time::timeout(KILL_WAIT, self.wait()).await;
         }
-        tokio::time::sleep(DRAIN_AFTER_EXIT).await;
         self.inner.cleanup().await;
     }
 
-    /// Normal end-of-session cleanup after `wait` returned.
+    /// Normal end-of-session cleanup after `wait` returned. The readers hit
+    /// EOF before `wait` is called, so there is nothing left to drain.
     pub async fn finish(&self) {
-        tokio::time::sleep(DRAIN_AFTER_EXIT).await;
         self.inner.cleanup().await;
     }
 }
@@ -623,7 +624,10 @@ mod live {
     #[ignore]
     async fn live_exec_collects_streams_and_exit_code() {
         let mut p = backend()
-            .spawn(base(&["/bin/sh", "-c", "echo out; echo err >&2; exit 7"], false))
+            .spawn(base(
+                &["/bin/sh", "-c", "echo out; echo err >&2; exit 7"],
+                false,
+            ))
             .await
             .expect("spawn");
         drop(p.stdin.take());
@@ -645,7 +649,10 @@ mod live {
     #[tokio::test]
     #[ignore]
     async fn live_stdin_eof_terminates_cat() {
-        let mut p = backend().spawn(base(&["/bin/cat"], false)).await.expect("spawn");
+        let mut p = backend()
+            .spawn(base(&["/bin/cat"], false))
+            .await
+            .expect("spawn");
         let stdin = p.stdin.take().unwrap();
         stdin.send(b"ping\n".to_vec()).await.unwrap();
         drop(stdin); // EOF
@@ -662,11 +669,19 @@ mod live {
     #[ignore]
     async fn live_tty_resize_is_seen_by_shell() {
         let mut spec = base(&["/bin/sh"], true);
-        spec.initial_size = Some(Resize { width: 80, height: 24 });
+        spec.initial_size = Some(Resize {
+            width: 80,
+            height: 24,
+        });
         let mut p = backend().spawn(spec).await.expect("spawn");
         let stdin = p.stdin.take().unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
-        p.resize(Resize { width: 120, height: 40 }).await.unwrap();
+        p.resize(Resize {
+            width: 120,
+            height: 40,
+        })
+        .await
+        .unwrap();
         stdin.send(b"stty size; exit 3\n".to_vec()).await.unwrap();
         let mut out = Vec::new();
         while let Some((_, b)) = p.output.recv().await {
