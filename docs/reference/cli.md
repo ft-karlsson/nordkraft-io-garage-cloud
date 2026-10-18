@@ -49,6 +49,11 @@ nordkraft deploy IMAGE [FLAG]
 | `--name` | `-n` | auto | Brugerdefineret container navn |
 | `--garage` | | auto | Target garage (ry, aarhus, etc.) |
 | `--hardware` | | auto | Hardware præference (optiplex, raspi, mac-mini) |
+| `--restart` | | node-default | Restart-politik: `always`, `unless-stopped`, `on-failure`, `never` |
+| `--auto-stop` | | - | Stop efter denne tid uden shell/exec-aktivitet (`15m`, `0` = aldrig) |
+| `--auto-delete` | | - | Slet denne tid efter containeren stoppede (`1h`) |
+| `--max-lifetime` | | - | Stop senest denne tid efter oprettelse (`24h`) |
+| `--label` | `-l` | - | Label `KEY=VALUE` (kan gentages); se `list --label` |
 
 !!! warning "Kendte problemer"
     **CPU/Memory limits:** Disse flag er implementeret men bliver ikke anvendt endnu (bug #1). Dette bliver rettet i næste opdatering.
@@ -71,7 +76,13 @@ nordkraft deploy myapp:v1 --port 3000 \
 
 # Database med persistent storage
 nordkraft deploy postgres:15 --port 5432 --persistent
+
+# Sandbox der rydder op efter sig selv
+nordkraft deploy python:3.12 --command "python worker.py" \
+  --restart never --auto-stop 15m --auto-delete 1h --label workspace=ws-42
 ```
+
+Se [Sandboxes](../guides/sandboxes.md) for livscyklus og labels.
 
 ---
 
@@ -96,6 +107,58 @@ nordkraft list [FLAG]
 NAME                              IMAGE           STATUS    IP            PORTS
 app-8ade4622-fdd6-411b-afc9...   nginx:alpine    running   172.21.5.15   80/tcp
 db-3fa85f64-5717-4562-b3fc...    postgres:15     running   172.21.5.16   5432/tcp
+```
+
+---
+
+### shell
+
+Åbn en interaktiv shell (pty) i en container.
+
+```bash
+nordkraft shell CONTAINER [-- PROGRAM ARG...]
+```
+
+```bash
+nordkraft shell myapp              # /bin/sh
+nordkraft shell myapp -- bash -l   # andet program
+```
+
+Virker som `kubectl exec -it`: fuld terminal, resize, `exit` lukker. Exit-koden fra shellen bliver CLI'ens.
+
+---
+
+### exec
+
+Kør én kommando i en container og afslut med dens exit-kode.
+
+```bash
+nordkraft exec CONTAINER [FLAG] -- KOMMANDO [ARG...]
+```
+
+**Flag:**
+
+| Flag | Kort | Default | Beskrivelse |
+|------|------|---------|-------------|
+| `--cwd` | | image-default | Arbejdsmappe i containeren |
+| `--env` | `-e` | - | Miljøvariabel `KEY=VALUE` (kan gentages) |
+| `--user` | | image-default | Kør som `uid[:gid]` |
+| `--timeout` | | `120` | Sekunder før kommandoen dræbes (exit 124) |
+| `--stdin` | | `false` | Send CLI'ens stdin til kommandoen |
+
+```bash
+nordkraft exec myapp -- ls -la /data
+echo "SELECT 1" | nordkraft exec db --stdin -- psql -U app
+```
+
+---
+
+### wait
+
+Vent på at containerens hovedproces slutter; afslut med dens exit-kode.
+
+```bash
+nordkraft wait CONTAINER [--timeout SEKUNDER]   # default 300; exit 124 ved timeout
 ```
 
 ---
