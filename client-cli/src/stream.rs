@@ -206,7 +206,45 @@ fn stream_url(container: &str, query: &[(String, String)]) -> String {
     format!("{base}/containers/{container}/stream?{qs}")
 }
 
-fn urlencode(s: &str) -> String {
+/// Block until the container's main process exits. Exit code 124 on timeout.
+pub async fn wait(container: &str, timeout_s: u64, json_output: bool) -> Result<i32, Error> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_s + 30))
+        .build()?;
+    let url = format!(
+        "{}/containers/{}/wait?timeout_s={}",
+        *crate::API_BASE_URL,
+        container,
+        timeout_s.max(1)
+    );
+    let resp = client.post(&url).send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("{status}: {text}").into());
+    }
+    let result: serde_json::Value = resp.json().await?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    }
+    if result["timed_out"].as_bool() == Some(true) {
+        if !json_output {
+            eprintln!("nordkraft wait: still running after {timeout_s}s");
+        }
+        return Ok(124);
+    }
+    match result["exit_code"].as_i64() {
+        Some(c) => Ok(c as i32),
+        None => {
+            if !json_output {
+                eprintln!("nordkraft wait: container has no running process");
+            }
+            Ok(1)
+        }
+    }
+}
+
+pub fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
