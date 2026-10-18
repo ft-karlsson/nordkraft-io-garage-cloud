@@ -12,6 +12,7 @@ use std::time::Duration;
 
 mod spec_ops;
 mod spinner;
+mod stream;
 mod tui;
 use spinner::Spinner;
 
@@ -156,6 +157,44 @@ enum Commands {
     /// List containers (shortcut for 'container list')
     #[command(alias = "ls")]
     List,
+    /// Interactive shell in a container (default /bin/sh)
+    ///
+    ///   nordkraft shell web
+    ///   nordkraft shell web -- bash -l
+    #[command(alias = "sh")]
+    Shell {
+        /// Container name, alias, or omit for interactive selection
+        container: Option<String>,
+        /// Command to run instead of /bin/sh (after --)
+        #[arg(last = true)]
+        cmd: Vec<String>,
+    },
+    /// Run a command in a container and exit with its status
+    ///
+    ///   nordkraft exec web -- ls -la /data
+    ///   echo hi | nordkraft exec web --stdin -- cat
+    Exec {
+        /// Container name or alias
+        container: String,
+        /// Working directory inside the container
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Environment variable KEY=VALUE (repeatable)
+        #[arg(long = "env", short = 'e', value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// Run as uid[:gid]
+        #[arg(long)]
+        user: Option<String>,
+        /// Seconds before the command is killed (exit 124)
+        #[arg(long, default_value = "120")]
+        timeout: u64,
+        /// Pass our stdin to the command
+        #[arg(long)]
+        stdin: bool,
+        /// Command and arguments (after --)
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
+    },
     /// Get container logs (shortcut for 'container logs')
     Logs {
         /// Container name, alias, or omit for interactive selection
@@ -887,7 +926,9 @@ fn spec_from_inspect(c: &ContainerInspectResponse) -> DeploymentSpec {
             "⚠".yellow(),
             unread.join(" and ")
         );
-        eprintln!("   Verify against the node before running 'nordkraft upgrade' on this container.");
+        eprintln!(
+            "   Verify against the node before running 'nordkraft upgrade' on this container."
+        );
     }
 
     // Parse memory from bytes to human string
@@ -1275,7 +1316,10 @@ fn normalise_api_url(input: &str) -> String {
     url
 }
 
-async fn handle_config(command: ConfigCommands, json_output: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_config(
+    command: ConfigCommands,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         ConfigCommands::SetApi { url } => {
             let url = normalise_api_url(&url);
@@ -1294,7 +1338,10 @@ async fn handle_config(command: ConfigCommands, json_output: bool) -> Result<(),
                 .unwrap_or(false);
 
             if json_output {
-                println!("{}", serde_json::json!({"api_url": url, "reachable": reachable}));
+                println!(
+                    "{}",
+                    serde_json::json!({"api_url": url, "reachable": reachable})
+                );
             } else {
                 println!("{} API endpoint set to {}", "✓".green(), url.cyan());
                 if reachable {
@@ -1834,6 +1881,16 @@ async fn main() {
         }
         Commands::Stop { container } => handle_stop_interactive(container, json_output).await,
         Commands::Start { container } => handle_start_interactive(container, json_output).await,
+        Commands::Shell { container, cmd } => handle_shell(container, cmd, json_output).await,
+        Commands::Exec {
+            container,
+            cwd,
+            env,
+            user,
+            timeout,
+            stdin,
+            cmd,
+        } => handle_exec(container, cmd, cwd, env, user, timeout, stdin, json_output).await,
         Commands::Remove { container, force } => {
             handle_remove_interactive(container, force, json_output).await
         }
@@ -2000,6 +2057,49 @@ async fn handle_container(
             handle_container_inspect(&container, json_output).await
         }
     }
+}
+
+async fn handle_shell(
+    container: Option<String>,
+    cmd: Vec<String>,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name = get_container_or_select(container, json_output).await?;
+    let code = stream::shell(&name, &cmd).await?;
+    std::process::exit(code);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_exec(
+    container: String,
+    cmd: Vec<String>,
+    cwd: Option<String>,
+    env: Vec<String>,
+    user: Option<String>,
+    timeout: u64,
+    stdin: bool,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name = resolve_alias(&container);
+    let stdin_data = if stdin {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)?;
+        Some(buf)
+    } else {
+        None
+    };
+    let code = stream::exec(
+        &name,
+        &cmd,
+        cwd.as_deref(),
+        &env,
+        user.as_deref(),
+        timeout,
+        stdin_data,
+        json_output,
+    )
+    .await?;
+    std::process::exit(code);
 }
 
 // Interactive wrapper functions for shortcuts
@@ -2573,7 +2673,8 @@ async fn handle_deploy(
         if result.network_mode.as_deref() == Some("bridge") {
             println!(
                 "   {}",
-                "(bridge mode: reached via the host's published port, not the container IP)".dimmed()
+                "(bridge mode: reached via the host's published port, not the container IP)"
+                    .dimmed()
             );
         }
     } else if let Some(ip) = &result.container_ip {
@@ -4091,8 +4192,8 @@ async fn fetch_stored_spec(
         }
     }
 
-    let stored: StoredConfigResponse = serde_json::from_str(&body)
-        .map_err(|e| format!("Failed to parse stored config: {}", e))?;
+    let stored: StoredConfigResponse =
+        serde_json::from_str(&body).map_err(|e| format!("Failed to parse stored config: {}", e))?;
 
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let c = stored.config;
@@ -5508,7 +5609,10 @@ async fn handle_registry_init(json_output: bool) -> Result<(), Box<dyn std::erro
     // only when *you* deploy from this registry. Nobody else gets them.
     let password = generate_registry_password()?;
     let mut env_vars = HashMap::new();
-    env_vars.insert("REGISTRY_USERNAME".to_string(), REGISTRY_USERNAME.to_string());
+    env_vars.insert(
+        "REGISTRY_USERNAME".to_string(),
+        REGISTRY_USERNAME.to_string(),
+    );
     env_vars.insert("REGISTRY_PASSWORD".to_string(), password.clone());
 
     // Deploy the registry container via the API
@@ -5614,7 +5718,11 @@ async fn handle_registry_push(
     }
 
     // Push to registry (TLS disabled — WireGuard handles encryption)
-    let mut push_args = vec!["push".to_string(), registry_tag.clone(), "--tls-verify=false".to_string()];
+    let mut push_args = vec![
+        "push".to_string(),
+        registry_tag.clone(),
+        "--tls-verify=false".to_string(),
+    ];
     if let (Some(user), Some(pass)) = (&config.username, &config.password) {
         push_args.push("--creds".to_string());
         push_args.push(format!("{user}:{pass}"));
@@ -5989,7 +6097,10 @@ fn wg_quick_command(action: &str) -> std::process::Command {
             .filter(|o| o.status.success())
             .map(|o| format!("{}/bin", String::from_utf8_lossy(&o.stdout).trim()))
             .unwrap_or_else(|| "/opt/homebrew/bin".to_string());
-        cmd.args(["env", &format!("PATH={brew_bin}:/usr/local/bin:/usr/bin:/bin")]);
+        cmd.args([
+            "env",
+            &format!("PATH={brew_bin}:/usr/local/bin:/usr/bin:/bin"),
+        ]);
     }
 
     cmd.args(["wg-quick", action, WG_INTERFACE]);
