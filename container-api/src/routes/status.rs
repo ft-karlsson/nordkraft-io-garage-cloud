@@ -1,7 +1,7 @@
 // routes/status.rs - Status and health check routes
 use crate::guards::AuthenticatedUser;
-use crate::AppState;
 use crate::storage::get_user_garage_subnet;
+use crate::AppState;
 use rocket::serde::json::Json;
 use sqlx::PgPool;
 

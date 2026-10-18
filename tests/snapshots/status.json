@@ -1,0 +1,10 @@
+{
+  "auth": "none (dev mode)",
+  "dev": true,
+  "mode": "hybrid",
+  "network_mode": "bridge",
+  "node_id": "<var>",
+  "status": "online",
+  "timestamp": "<var>",
+  "version": "<var>"
+}

@@ -912,7 +912,9 @@ async fn rocket() -> _ {
     // =========================================================
     if args.reset {
         if !dev {
-            error!("❌ --reset only works together with --dev (refusing to wipe a production node)");
+            error!(
+                "❌ --reset only works together with --dev (refusing to wipe a production node)"
+            );
             std::process::exit(2);
         }
         if let Err(e) = bootstrap::reset_dev(&db_pool, &config.container_runtime).await {

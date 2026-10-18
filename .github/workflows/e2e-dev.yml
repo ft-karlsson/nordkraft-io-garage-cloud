@@ -1,0 +1,91 @@
+name: E2E dev node
+
+# Installs a dev node on a clean Ubuntu runner with the installer, builds the
+# CLI, and runs scripts/smoke-dev.sh against it: deploy, published ports,
+# port allocation, logs, stop/start, rm --force, reset. No mocks.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (clippy, fmt, shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            container-api
+            client-cli
+      - name: shellcheck
+        run: |
+          sudo apt-get install -y -qq shellcheck >/dev/null
+          shellcheck -S warning scripts/*.sh
+      - name: clippy (container-api)
+        run: cd container-api && cargo clippy --all-targets -- -D warnings
+      - name: clippy (client-cli)
+        run: cd client-cli && cargo clippy --all-targets -- -D warnings
+      - name: fmt (container-api)
+        run: cd container-api && cargo fmt --check
+      - name: unit tests
+        run: cd container-api && cargo test
+
+  e2e:
+    name: Install dev node + smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            container-api
+            client-cli
+
+      # The repo's .cargo/config.toml names cross-compiler binaries; point
+      # them at the native toolchain (the installer does the same).
+      - name: Native toolchain shims
+        run: |
+          for t in gcc g++ ar; do sudo ln -sf /usr/bin/$t /usr/local/bin/x86_64-unknown-linux-gnu-$t; done
+
+      - name: Build CLI
+        run: cd client-cli && cargo build --release
+
+      - name: Install dev node (builds container-api)
+        run: sudo bash scripts/install-node.sh --dev --build-from "$PWD"
+
+      - name: Wait for API
+        run: |
+          for i in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:8001/api/status && break
+            sleep 1
+          done
+
+      - name: Smoke test
+        env:
+          NK: ${{ github.workspace }}/client-cli/target/release/nordkraft
+          API: http://127.0.0.1:8001/api
+          HOST: 127.0.0.1
+          IMAGE: nginx:alpine
+          EXPECT: nginx
+        run: bash scripts/smoke-dev.sh
+
+      - name: Node logs on failure
+        if: failure()
+        run: sudo journalctl -u nordkraft-node -n 200 --no-pager
+
+      - name: Snapshot diff on failure
+        if: failure()
+        run: git diff --no-color tests/snapshots || true

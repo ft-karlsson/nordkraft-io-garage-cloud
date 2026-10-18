@@ -104,7 +104,8 @@ fn pick_host_port(
     taken: &[PublishedPort],
     published_elsewhere: &std::collections::HashSet<u16>,
 ) -> u16 {
-    let in_use = |p: u16| taken.iter().any(|t| t.host_port == p) || published_elsewhere.contains(&p);
+    let in_use =
+        |p: u16| taken.iter().any(|t| t.host_port == p) || published_elsewhere.contains(&p);
     let free = |p: u16| std::net::TcpListener::bind((addr, p)).is_ok();
     if !in_use(wanted) && free(wanted) {
         return wanted;
@@ -496,7 +497,7 @@ impl ContainerManager {
             && !image.starts_with("ghcr.io/")
             && !image.starts_with("registry.k8s.io/")
             && image.contains(':')
-            && image.split('/').next().map_or(false, |host| {
+            && image.split('/').next().is_some_and(|host| {
                 host.contains(':') || host.parse::<std::net::Ipv4Addr>().is_ok()
             })
         {
@@ -554,10 +555,9 @@ impl ContainerManager {
             // Extract clean error for events — nerdctl dumps progress bars + ANSI codes
             let clean_error = stderr
                 .lines()
-                .filter(|l| {
+                .rfind(|l| {
                     l.contains("level=fatal") || l.contains("level=error") || l.contains("FATA")
                 })
-                .last()
                 .map(|l| {
                     // Strip nerdctl log prefix: time="..." level=fatal msg="..."
                     if let Some(msg_start) = l.find("msg=\"") {
@@ -584,7 +584,7 @@ impl ContainerManager {
             &event_tx,
             &container_name,
             "created",
-            &format!("Container created, verifying network"),
+            "Container created, verifying network",
             true,
         );
 
@@ -893,12 +893,21 @@ impl ContainerManager {
     async fn host_ports_in_use(&self) -> std::collections::HashSet<u16> {
         let mut set = std::collections::HashSet::new();
         let output = tokio::process::Command::new(&self.runtime_binary)
-            .args(["ps", "-a", "--format", "json", "--filter", "label=managed_by=nordkraft"])
+            .args([
+                "ps",
+                "-a",
+                "--format",
+                "json",
+                "--filter",
+                "label=managed_by=nordkraft",
+            ])
             .output()
             .await;
         let Ok(output) = output else { return set };
         for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let Ok(c) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            let Ok(c) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
             for pp in self.get_published_ports(&c) {
                 set.insert(pp.host_port);
             }
@@ -920,7 +929,9 @@ impl ContainerManager {
         let Ok(raw) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
             return vec![];
         };
-        let Some(c) = raw.as_array().and_then(|a| a.first()) else { return vec![] };
+        let Some(c) = raw.as_array().and_then(|a| a.first()) else {
+            return vec![];
+        };
         let labels = &c["Config"]["Labels"];
         let published: Vec<PublishedPort> = labels["app_published"]
             .as_str()
@@ -1023,7 +1034,12 @@ impl ContainerManager {
         // unless forced, in which case `rm -f` kills it straight away.
         if !force {
             let _ = tokio::process::Command::new(&self.runtime_binary)
-                .args(["stop", "-t", &self.stop_timeout.to_string(), &container_name])
+                .args([
+                    "stop",
+                    "-t",
+                    &self.stop_timeout.to_string(),
+                    &container_name,
+                ])
                 .output()
                 .await;
         }

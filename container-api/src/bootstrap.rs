@@ -174,9 +174,15 @@ pub async fn reset_dev(
     if !ids.is_empty() {
         let mut args = vec!["rm".to_string(), "-f".to_string()];
         args.extend(ids.iter().cloned());
-        let out = tokio::process::Command::new(runtime).args(&args).output().await?;
+        let out = tokio::process::Command::new(runtime)
+            .args(&args)
+            .output()
+            .await?;
         if !out.status.success() {
-            warn!("container cleanup: {}", String::from_utf8_lossy(&out.stderr));
+            warn!(
+                "container cleanup: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
     }
     info!("🧹 Dev reset: {} container(s) removed", ids.len());

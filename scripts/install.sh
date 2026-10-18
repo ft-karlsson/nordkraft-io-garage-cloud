@@ -131,9 +131,11 @@ install_wireguard_tools() {
 
 # Function to download and install
 install_nordkraft() {
-    local platform=$(detect_platform)
+    local platform
+    platform=$(detect_platform)
     local download_url="${BASE_URL}/nordkraft-${platform}.tar.gz"
-    local temp_dir=$(mktemp -d)
+    local temp_dir
+    temp_dir=$(mktemp -d)
     local temp_file="${temp_dir}/nordkraft.tar.gz"
     
     print_info "Detected platform: ${platform}"
@@ -199,7 +201,8 @@ install_nordkraft() {
 # Function to verify installation
 verify_installation() {
     if command_exists nordkraft; then
-        local version=$(nordkraft --version 2>/dev/null || echo "unknown")
+        local version
+        version=$(nordkraft --version 2>/dev/null || echo "unknown")
         print_status "Verified: ${version}"
         return 0
     else
@@ -246,7 +249,8 @@ main() {
     
     # Check if already installed
     if command_exists nordkraft; then
-        local current_version=$(nordkraft --version 2>/dev/null || echo "unknown")
+        local current_version
+        current_version=$(nordkraft --version 2>/dev/null || echo "unknown")
         print_status "Nordkraft already installed (${current_version})"
         
         if [ "$force" = true ]; then
