@@ -56,13 +56,18 @@ wait_http() {
   return 1
 }
 
-# normalise a JSON doc for snapshotting: drop values that change every run
+# normalise a JSON doc for snapshotting: drop values that change every run,
+# and keep only Nordkraft's own container labels (images and the runtime add
+# their own, e.g. nginx sets maintainer and stop-signal).
 norm() {
   jq -S '
     walk(
       if type == "object" then
-        with_entries(
-          select(.key | test("^(nerdctl|containerd\\.io|io\\.containerd)/") | not)
+        (if has("labels") and (.labels | type) == "object" then
+           .labels |= with_entries(select(.key | test("^(app_|managed_by$|owner_pubkey$|tenant_id$|user_|created_at$)")))
+         else . end)
+        | with_entries(
+          select(.key | test("^(nerdctl|containerd\\.io|io\\.containerd)[/.]") | not)
           | if (.key | IN("timestamp","created_at","updated_at","started_at","finished_at",
                           "container_id","name","container_name","hostname","container_ip","image","app_image",
                           "version","node_id","log-uri","state-dir")) then .value = "<var>"
