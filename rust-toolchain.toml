@@ -1,0 +1,4 @@
+# Pinned so a new stable Rust can't turn main red overnight; bump deliberately.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]

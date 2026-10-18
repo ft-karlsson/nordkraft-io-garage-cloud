@@ -28,6 +28,11 @@ jobs:
           workspaces: |
             container-api
             client-cli
+      # container-api/.cargo/config.toml names cross-compiler binaries;
+      # point them at the native toolchain.
+      - name: Native toolchain shims
+        run: |
+          for t in gcc g++ ar; do sudo ln -sf /usr/bin/$t /usr/local/bin/x86_64-unknown-linux-gnu-$t; done
       - name: shellcheck
         run: |
           sudo apt-get install -y -qq shellcheck >/dev/null
