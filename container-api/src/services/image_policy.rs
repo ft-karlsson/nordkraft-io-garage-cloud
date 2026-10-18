@@ -82,7 +82,11 @@ fn ipv4_in_cidr(ip: Ipv4Addr, cidr: &str) -> Result<bool, String> {
     if prefix > 32 {
         return Err(format!("subnet '{cidr}' has a prefix longer than 32"));
     }
-    let mask: u32 = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    let mask: u32 = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
     Ok((u32::from(ip) & mask) == (u32::from(net) & mask))
 }
 
@@ -100,8 +104,12 @@ mod tests {
 
     #[test]
     fn other_tenant_registry_is_refused() {
-        let err = validate_image_source("172.21.1.3:5001/garagecloud-dk:latest", SUBNET).unwrap_err();
-        assert!(err.contains("outside your container subnet 172.21.14.0/24"), "{err}");
+        let err =
+            validate_image_source("172.21.1.3:5001/garagecloud-dk:latest", SUBNET).unwrap_err();
+        assert!(
+            err.contains("outside your container subnet 172.21.14.0/24"),
+            "{err}"
+        );
         assert!(validate_image_source("172.21.15.3:5001/app", SUBNET).is_err());
     }
 

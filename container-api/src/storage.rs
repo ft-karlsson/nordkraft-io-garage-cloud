@@ -846,6 +846,7 @@ pub async fn select_garage_hardware_node(
 }
 
 /// Track container deployment in database
+#[allow(clippy::too_many_arguments)]
 pub async fn track_container_deployment(
     pool: &PgPool,
     container_id: &str,
@@ -935,12 +936,11 @@ pub async fn get_non_running_containers(
                     // Extract clean error — find the fatal/error line from nerdctl output
                     let clean = msg
                         .lines()
-                        .filter(|l| {
+                        .rfind(|l| {
                             l.contains("level=fatal")
                                 || l.contains("level=error")
                                 || l.contains("FATA")
                         })
-                        .last()
                         .map(|l| {
                             // Strip nerdctl log prefix: time="..." level=fatal msg="..."
                             if let Some(msg_start) = l.find("msg=\"") {

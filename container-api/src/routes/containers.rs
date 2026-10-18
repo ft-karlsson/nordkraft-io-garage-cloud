@@ -44,7 +44,10 @@ pub async fn deploy_container(
     if let Err(e) =
         crate::services::image_policy::validate_image_source(&deploy_req.image, &container_subnet)
     {
-        warn!("🚫 Image policy refused deploy for user {}: {}", user.0.id, e);
+        warn!(
+            "🚫 Image policy refused deploy for user {}: {}",
+            user.0.id, e
+        );
         return Json(serde_json::json!({ "error": e }));
     }
     let registry_auth = resolve_registry_auth(pool.inner(), &user.0.id, &deploy_req.image).await;
@@ -228,7 +231,10 @@ pub async fn deploy_container(
                 // Bridge mode: the container IP is internal to the host; what
                 // the caller can actually reach is the published port.
                 if app_state.container_manager.is_bridge() {
-                    let urls = app_state.container_manager.access_urls(&container_name).await;
+                    let urls = app_state
+                        .container_manager
+                        .access_urls(&container_name)
+                        .await;
                     response["network_mode"] = serde_json::json!("bridge");
                     response["access_urls"] = serde_json::json!(urls);
                 }
@@ -857,7 +863,10 @@ pub async fn upgrade_container(
     if let Err(e) =
         crate::services::image_policy::validate_image_source(&merged.image, &container_subnet)
     {
-        warn!("🚫 Image policy refused upgrade for user {}: {}", user.0.id, e);
+        warn!(
+            "🚫 Image policy refused upgrade for user {}: {}",
+            user.0.id, e
+        );
         return Json(serde_json::json!({ "error": e }));
     }
     let registry_auth = resolve_registry_auth(pool.inner(), &user.0.id, &merged.image).await;

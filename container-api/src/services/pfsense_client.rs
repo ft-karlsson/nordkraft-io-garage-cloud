@@ -1083,7 +1083,7 @@ mod tests {
 
     #[test]
     fn test_port_formatting() {
-        let single_port = vec![80];
+        let single_port = [80];
         let port_str = if single_port.len() == 1 {
             single_port[0].to_string()
         } else {
@@ -1095,7 +1095,7 @@ mod tests {
         };
         assert_eq!(port_str, "80");
 
-        let multi_ports = vec![80, 443, 8080];
+        let multi_ports = [80, 443, 8080];
         let port_str = multi_ports
             .iter()
             .map(|p| p.to_string())
