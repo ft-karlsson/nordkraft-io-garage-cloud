@@ -73,6 +73,9 @@ jobs:
             sleep 1
           done
 
+      - name: WebSocket client for the PTY check
+        run: pip3 install --quiet --break-system-packages websockets
+
       - name: Smoke test
         env:
           NK: ${{ github.workspace }}/client-cli/target/release/nordkraft

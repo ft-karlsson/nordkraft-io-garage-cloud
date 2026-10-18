@@ -6,6 +6,7 @@
     "image": "<var>",
     "ipv6_address": null,
     "ipv6_enabled": false,
+    "labels": {},
     "name": "<var>",
     "pod_id": null,
     "ports": [
@@ -26,6 +27,7 @@
     "image": "<var>",
     "ipv6_address": null,
     "ipv6_enabled": false,
+    "labels": {},
     "name": "<var>",
     "pod_id": null,
     "ports": [
