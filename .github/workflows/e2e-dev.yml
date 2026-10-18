@@ -30,7 +30,7 @@ jobs:
             client-cli
       - name: shellcheck
         run: |
-          sudo apt-get install -y -qq shellcheck >/dev/null
+          sudo apt-get install -y -qq shellcheck protobuf-compiler >/dev/null
           shellcheck -S warning scripts/*.sh
       - name: clippy (container-api)
         run: cd container-api && cargo clippy --all-targets -- -D warnings

@@ -13,6 +13,7 @@ mod models;
 mod routes;
 mod services;
 mod storage;
+mod stream;
 
 use config::AppConfig;
 use controller::OrchestratorService;
@@ -42,18 +43,25 @@ pub struct AppState {
     pub container_manager: Arc<ContainerManager>,
     pub route_manager: Arc<StaticRouteManager>,
     pub peer_cache: PeerCache,
+    /// containerd client for exec/shell sessions (connects lazily).
+    pub exec: Arc<stream::containerd_exec::ContainerdExec>,
 }
 
 impl AppState {
     pub fn new(config: AppConfig, peer_cache: PeerCache) -> Self {
         let container_manager = Arc::new(ContainerManager::new(&config));
         let route_manager = Arc::new(StaticRouteManager::new());
+        let exec = Arc::new(stream::containerd_exec::ContainerdExec::new(
+            &config.containerd_socket,
+            &config.containerd_namespace,
+        ));
 
         Self {
             config,
             container_manager,
             route_manager,
             peer_cache,
+            exec,
         }
     }
 
@@ -1236,7 +1244,12 @@ async fn rocket() -> _ {
             // Agent: no database, minimal routes
             rocket.mount(
                 "/api",
-                routes![routes::status::get_status, routes::nodes::list_nodes,],
+                routes![
+                    routes::status::get_status,
+                    routes::nodes::list_nodes,
+                    // exec/shell: the controller relays user streams here
+                    routes::stream::internal_stream,
+                ],
             )
         }
         _ => {
@@ -1254,6 +1267,10 @@ async fn rocket() -> _ {
                     routes::containers::inspect_container,
                     routes::containers::get_container_config_route,
                     routes::containers::upgrade_container,
+                    // exec / shell (kubectl model; hybrid serves local, else relays)
+                    routes::stream::container_stream,
+                    routes::stream::container_exec,
+                    routes::stream::internal_stream,
                     // Node operations
                     routes::nodes::list_nodes,
                     routes::nodes::register_node,
