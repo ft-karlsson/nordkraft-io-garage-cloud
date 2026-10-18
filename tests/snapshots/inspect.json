@@ -17,7 +17,6 @@
     "app_ports": "[{\"port\":80,\"protocol\":\"tcp\"}]",
     "app_published": "[{\"port\":80,\"host_port\":80,\"protocol\":\"tcp\"}]",
     "created_at": "<var>",
-    "io.containerd.image.config.stop-signal": "SIGTERM",
     "managed_by": "nordkraft",
     "owner_pubkey": "dev_key_placeholder",
     "tenant_id": "tenant-dev-user",
