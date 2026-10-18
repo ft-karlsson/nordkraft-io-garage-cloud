@@ -90,12 +90,19 @@ pub async fn connect_agent(
 /// Build the agent-side URL for a container stream. `query` is passed through
 /// verbatim — the controller does not reinterpret the client's request.
 pub fn agent_stream_url(agent_ip: &str, agent_port: u16, container: &str, query: &str) -> String {
-    let host = if agent_ip.contains(':') && !agent_ip.starts_with('[') {
-        format!("[{agent_ip}]")
+    format!(
+        "ws://{}:{agent_port}/api/internal/containers/{container}/stream?{query}",
+        host_for_url(agent_ip)
+    )
+}
+
+/// Bracket IPv6 literals for use in a URL.
+pub fn host_for_url(ip: &str) -> String {
+    if ip.contains(':') && !ip.starts_with('[') {
+        format!("[{ip}]")
     } else {
-        agent_ip.to_string()
-    };
-    format!("ws://{host}:{agent_port}/api/internal/containers/{container}/stream?{query}")
+        ip.to_string()
+    }
 }
 
 #[cfg(test)]

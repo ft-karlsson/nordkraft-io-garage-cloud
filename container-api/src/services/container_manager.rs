@@ -13,6 +13,7 @@
 //     - Parent interface: set by env
 
 use crate::config::{AppConfig, NetworkMode};
+use crate::models::SandboxSpec;
 use crate::models::{ContainerInfo, PortMapping, PortSpec, RegistryAuth};
 use crate::services::macvlan_manager::MacvlanManager;
 use crate::services::nats_service::{NatsMessage, NatsService, NatsSubjects};
@@ -224,6 +225,7 @@ impl ContainerManager {
         container_name: Option<String>,
         enable_ipv6: bool,
         registry_auth: Option<RegistryAuth>, // scoped pull credentials, tenant's own registry only
+        sandbox: Option<SandboxSpec>,        // per-container lifecycle + labels
         event_tx: Option<DeployEventTx>,
     ) -> Result<
         (
@@ -281,13 +283,21 @@ impl ContainerManager {
         }
 
         // Build command args
+        let sandbox = sandbox.unwrap_or_default();
+        let restart = sandbox
+            .lifecycle
+            .restart
+            .as_deref()
+            .and_then(crate::models::restart_policy_flag)
+            .map(str::to_string)
+            .unwrap_or_else(|| self.restart_policy.clone());
         let mut args = vec![
             "run".to_string(),
             "-d".to_string(),
             "--name".to_string(),
             container_name.clone(),
             "--restart".to_string(),
-            self.restart_policy.clone(),
+            restart,
             "--stop-timeout".to_string(),
             self.stop_timeout.to_string(),
         ];
@@ -368,6 +378,11 @@ impl ContainerManager {
             "--label".to_string(),
             format!("user_subnet={}", user_subnet),
         ]);
+        // Lifecycle lives on the container itself (the agent has no database):
+        // the reaper reads these labels. Seconds, 0 = never.
+        for (key, value) in sandbox_labels(&sandbox) {
+            args.extend_from_slice(&["--label".to_string(), format!("{key}={value}")]);
+        }
 
         // DNS configuration - use public DNS since we're on LAN
         args.extend_from_slice(&[
@@ -837,6 +852,7 @@ impl ContainerManager {
                 container_ip,
                 ipv6_address,
                 ipv6_enabled,
+                labels: user_labels(container["Labels"].as_str().unwrap_or("")),
             });
         }
 
@@ -1567,5 +1583,75 @@ pub fn log_kata_setup_status() {
         }
         error!("   Deployments with persistence=true will have EMPTY volumes!");
         error!("   Either fix the issues above or set DISABLE_KATA=true");
+    }
+}
+
+/// The `user.*` labels from a nerdctl `ps` label string ("a=b,c=d"), prefix
+/// stripped. Values may contain '=' but not ','.
+pub fn user_labels(labels: &str) -> HashMap<String, String> {
+    labels
+        .split(',')
+        .filter_map(|kv| kv.split_once('='))
+        .filter_map(|(k, v)| {
+            k.strip_prefix("user.")
+                .map(|k| (k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// Lifecycle + user labels as nerdctl label pairs.
+///   nordkraft.auto_stop / nordkraft.auto_delete / nordkraft.max_lifetime — seconds
+///   nordkraft.restart — the spec word (what was asked for; nerdctl holds the policy)
+///   user.<key> — free-form labels, kept out of Nordkraft's own namespace
+pub fn sandbox_labels(sandbox: &SandboxSpec) -> Vec<(String, String)> {
+    use crate::models::parse_duration_secs;
+    let mut out = Vec::new();
+    let lc = &sandbox.lifecycle;
+    if let Some(r) = &lc.restart {
+        out.push(("nordkraft.restart".into(), r.clone()));
+    }
+    for (name, value) in [
+        ("auto_stop", &lc.auto_stop),
+        ("auto_delete", &lc.auto_delete),
+        ("max_lifetime", &lc.max_lifetime),
+    ] {
+        if let Some(secs) = value.as_deref().and_then(parse_duration_secs) {
+            out.push((format!("nordkraft.{name}"), secs.to_string()));
+        }
+    }
+    let mut keys: Vec<_> = sandbox.labels.keys().collect();
+    keys.sort();
+    for k in keys {
+        out.push((format!("user.{k}"), sandbox.labels[k].clone()));
+    }
+    out
+}
+
+#[cfg(test)]
+mod sandbox_label_tests {
+    use super::*;
+
+    #[test]
+    fn labels_are_seconds_and_namespaced() {
+        let mut sb = SandboxSpec::default();
+        sb.lifecycle.auto_stop = Some("15m".into());
+        sb.lifecycle.max_lifetime = Some("0".into());
+        sb.lifecycle.restart = Some("never".into());
+        sb.labels.insert("workspace".into(), "ws-1".into());
+        let got = sandbox_labels(&sb);
+        assert!(got.contains(&("nordkraft.auto_stop".into(), "900".into())));
+        assert!(got.contains(&("nordkraft.max_lifetime".into(), "0".into())));
+        assert!(got.contains(&("nordkraft.restart".into(), "never".into())));
+        assert!(got.contains(&("user.workspace".into(), "ws-1".into())));
+        assert!(!got.iter().any(|(k, _)| k == "nordkraft.auto_delete"));
+    }
+
+    #[test]
+    fn user_labels_from_ps_string() {
+        let got =
+            user_labels("managed_by=nordkraft,user.workspace=ws-1,user.tier=a=b,owner_pubkey=k");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got["workspace"], "ws-1");
+        assert_eq!(got["tier"], "a=b");
     }
 }

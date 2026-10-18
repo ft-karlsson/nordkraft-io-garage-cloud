@@ -387,6 +387,134 @@ pub async fn container_exec(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// POST /containers/<id>/wait  — block until the container's main process exits
+// ---------------------------------------------------------------------------
+
+const WAIT_DEFAULT_TIMEOUT: u64 = 300;
+const WAIT_MAX_TIMEOUT: u64 = 3600;
+
+#[derive(Debug, serde::Serialize)]
+pub struct WaitResult {
+    /// Exit code of the main process; null if the container has no task
+    /// (never started, or already removed).
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+}
+
+/// Mastra/Daytona-style `wait`: returns when the container stops, or after
+/// `timeout_s` (default 300, max 3600) with `timed_out: true`. Long-poll;
+/// callers loop while timed_out.
+#[post("/containers/<container>/wait?<timeout_s>")]
+pub async fn container_wait(
+    container: String,
+    timeout_s: Option<u64>,
+    user: AuthenticatedUser,
+    app_state: &rocket::State<AppState>,
+    orchestrator: &rocket::State<crate::controller::OrchestratorService>,
+    pool: &rocket::State<sqlx::PgPool>,
+) -> Result<Json<WaitResult>, Refused> {
+    let timeout = Duration::from_secs(
+        timeout_s
+            .unwrap_or(WAIT_DEFAULT_TIMEOUT)
+            .clamp(1, WAIT_MAX_TIMEOUT),
+    );
+    let pubkey = user.0.wireguard_public_key.clone();
+    match place(&container, &user, app_state, orchestrator, pool).await? {
+        Placement::Local => wait_result(
+            app_state
+                .exec
+                .wait_container(&container, Some(&pubkey), timeout)
+                .await,
+        ),
+        Placement::Remote {
+            agent_ip,
+            agent_port,
+        } => {
+            let url = format!(
+                "http://{}:{}/api/internal/containers/{}/wait?timeout_s={}&owner={}",
+                relay::host_for_url(&agent_ip),
+                agent_port,
+                container,
+                timeout.as_secs(),
+                urlencode(&pubkey)
+            );
+            let client = reqwest::Client::builder()
+                .timeout(timeout + Duration::from_secs(15))
+                .build()
+                .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+            let resp = client
+                .post(&url)
+                .send()
+                .await
+                .map_err(|e| (Status::BadGateway, format!("agent: {e}")))?;
+            let status = resp.status();
+            let body = resp
+                .text()
+                .await
+                .map_err(|e| (Status::BadGateway, e.to_string()))?;
+            if !status.is_success() {
+                return Err((Status::BadGateway, format!("agent {status}: {body}")));
+            }
+            let r: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| (Status::BadGateway, format!("agent reply: {e}")))?;
+            Ok(Json(WaitResult {
+                exit_code: r["exit_code"].as_i64().map(|c| c as i32),
+                timed_out: r["timed_out"].as_bool().unwrap_or(false),
+            }))
+        }
+    }
+}
+
+#[post("/internal/containers/<container>/wait?<timeout_s>&<owner>")]
+pub async fn internal_wait(
+    container: String,
+    timeout_s: Option<u64>,
+    owner: Option<String>,
+    client: ClientIP,
+    app_state: &rocket::State<AppState>,
+) -> Result<Json<WaitResult>, Refused> {
+    let cfg = &app_state.config;
+    let trusted = client.0 == cfg.controller_internal_ip
+        || client.0 == "127.0.0.1"
+        || client.0 == "::1"
+        || cfg.dev_mode;
+    if !trusted {
+        return Err((Status::Forbidden, "internal endpoint".into()));
+    }
+    let owner = owner
+        .filter(|o| !o.is_empty())
+        .ok_or((Status::BadRequest, "owner required".to_string()))?;
+    let timeout = Duration::from_secs(
+        timeout_s
+            .unwrap_or(WAIT_DEFAULT_TIMEOUT)
+            .clamp(1, WAIT_MAX_TIMEOUT),
+    );
+    wait_result(
+        app_state
+            .exec
+            .wait_container(&container, Some(&owner), timeout)
+            .await,
+    )
+}
+
+fn wait_result(
+    r: Result<Option<i32>, crate::stream::containerd_exec::ExecError>,
+) -> Result<Json<WaitResult>, Refused> {
+    match r {
+        Ok(code) => Ok(Json(WaitResult {
+            exit_code: code,
+            timed_out: false,
+        })),
+        Err(e) if e.to_string() == "timeout" => Ok(Json(WaitResult {
+            exit_code: None,
+            timed_out: true,
+        })),
+        Err(e) if e.to_string() == "container not found" => Err((Status::NotFound, e.to_string())),
+        Err(e) => Err((Status::InternalServerError, e.to_string())),
+    }
+}
+
 /// Minimal percent-encoding for query values (WireGuard keys contain '+' and '/').
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

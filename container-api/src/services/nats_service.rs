@@ -97,6 +97,9 @@ pub enum NatsMessage {
         /// and for messages from controllers that predate this field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         registry_auth: Option<crate::models::RegistryAuth>,
+        /// Lifecycle + labels. Absent from older controllers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sandbox: Option<crate::models::SandboxSpec>,
     },
 
     // Container deletion
@@ -566,6 +569,7 @@ impl NatsService {
         enable_ipv6: bool,
         ipv6_address: Option<String>,
         registry_auth: Option<crate::models::RegistryAuth>,
+        sandbox: Option<crate::models::SandboxSpec>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let message = NatsMessage::ContainerAssignment {
             job_id,
@@ -586,6 +590,7 @@ impl NatsService {
             enable_ipv6,
             ipv6_address,
             registry_auth,
+            sandbox,
         };
 
         let subject = NatsSubjects::container_assignment_for_node(node_id);

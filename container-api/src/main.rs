@@ -1218,6 +1218,25 @@ async fn rocket() -> _ {
         }
     }
 
+    // Lifecycle reaper — any node that runs containers (agent / hybrid / dev)
+    if config.mode.is_agent() {
+        let pool_for_reaper = if matches!(config.mode, config::OperationMode::Hybrid) {
+            Some(db_pool.clone())
+        } else {
+            None
+        };
+        Arc::new(services::reaper::Reaper {
+            runtime_binary: config.container_runtime.clone(),
+            container_manager: Arc::clone(&app_state.container_manager),
+            exec: Arc::clone(&app_state.exec),
+            nats: nats_service.clone(),
+            pool: pool_for_reaper,
+            node_id: config.node_id.clone(),
+            interval: std::time::Duration::from_secs(30),
+        })
+        .spawn();
+    }
+
     // Log startup info
     log_startup_info(&config, nats_service.is_some());
 
@@ -1247,8 +1266,9 @@ async fn rocket() -> _ {
                 routes![
                     routes::status::get_status,
                     routes::nodes::list_nodes,
-                    // exec/shell: the controller relays user streams here
+                    // exec/shell/wait: the controller relays user requests here
                     routes::stream::internal_stream,
+                    routes::stream::internal_wait,
                 ],
             )
         }
@@ -1270,7 +1290,9 @@ async fn rocket() -> _ {
                     // exec / shell (kubectl model; hybrid serves local, else relays)
                     routes::stream::container_stream,
                     routes::stream::container_exec,
+                    routes::stream::container_wait,
                     routes::stream::internal_stream,
+                    routes::stream::internal_wait,
                     // Node operations
                     routes::nodes::list_nodes,
                     routes::nodes::register_node,

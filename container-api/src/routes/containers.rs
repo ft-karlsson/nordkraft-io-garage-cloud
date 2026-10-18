@@ -51,6 +51,30 @@ pub async fn deploy_container(
         return Json(serde_json::json!({ "error": e }));
     }
     let registry_auth = resolve_registry_auth(pool.inner(), &user.0.id, &deploy_req.image).await;
+    let sandbox = crate::models::SandboxSpec {
+        lifecycle: deploy_req.lifecycle.clone(),
+        labels: deploy_req.labels.clone(),
+    };
+    if let Some(bad) = [
+        &deploy_req.lifecycle.auto_stop,
+        &deploy_req.lifecycle.auto_delete,
+        &deploy_req.lifecycle.max_lifetime,
+    ]
+    .into_iter()
+    .flatten()
+    .find(|d| crate::models::parse_duration_secs(d).is_none())
+    {
+        return Json(
+            serde_json::json!({"error": format!("invalid lifecycle duration '{bad}' (use 90s, 15m, 2h, 1d or 0)")}),
+        );
+    }
+    if let Some(r) = &deploy_req.lifecycle.restart {
+        if crate::models::restart_policy_flag(r).is_none() {
+            return Json(
+                serde_json::json!({"error": format!("invalid restart policy '{r}' (always, unless-stopped, on-failure, never)")}),
+            );
+        }
+    }
 
     // Find best node
     let target_node = match select_garage_hardware_node(
@@ -181,6 +205,7 @@ pub async fn deploy_container(
                 Some(container_name.clone()),
                 deploy_req.enable_ipv6, // Pass bool, not Option<String>
                 registry_auth.clone(),
+                Some(sandbox.clone()),
                 None, // event_tx — local deploy, response is synchronous
             )
             .await
@@ -214,6 +239,7 @@ pub async fn deploy_container(
                     &deploy_req.volume_path,
                     &deploy_req.volume_size,
                     deploy_req.enable_ipv6,
+                    &sandbox,
                 );
                 if let Err(e) = store_container_config(pool.inner(), &user.0.id, &config).await {
                     warn!("Failed to store container config: {}", e);
@@ -278,6 +304,7 @@ pub async fn deploy_container(
                 enable_ipv6: deploy_req.enable_ipv6,
                 ipv6_address: None, // Will be assigned by agent via SLAAC
                 registry_auth: registry_auth.clone(),
+                sandbox: Some(sandbox.clone()),
             };
             info!("📤 Sending NATS assignment to node {}", target_node);
 
@@ -311,6 +338,7 @@ pub async fn deploy_container(
                         &deploy_req.volume_path,
                         &deploy_req.volume_size,
                         deploy_req.enable_ipv6,
+                        &sandbox,
                     );
                     if let Err(e) = store_container_config(pool.inner(), &user.0.id, &config).await
                     {
@@ -354,8 +382,11 @@ pub async fn deploy_container(
     }
 }
 
-#[get("/containers")]
+/// `?label=key=value` (repeatable) keeps only containers carrying every
+/// given user label — how an orchestrator finds "its" sandboxes.
+#[get("/containers?<label>")]
 pub async fn list_containers_route(
+    label: Vec<String>,
     user: AuthenticatedUser,
     app_state: &rocket::State<AppState>,
     orchestrator: &rocket::State<OrchestratorService>,
@@ -382,7 +413,7 @@ pub async fn list_containers_route(
             }
 
             return Json(serde_json::json!({
-                "containers": containers,
+                "containers": filter_by_labels(containers, &label),
                 "source": "multi-node"
             }));
         }
@@ -395,11 +426,32 @@ pub async fn list_containers_route(
         .await
     {
         Ok(containers) => Json(serde_json::json!({
-            "containers": containers,
+            "containers": filter_by_labels(containers, &label),
             "source": "local"
         })),
         Err(e) => Json(serde_json::json!({"error": e.to_string()})),
     }
+}
+
+fn filter_by_labels(
+    containers: Vec<crate::models::ContainerInfo>,
+    wanted: &[String],
+) -> Vec<crate::models::ContainerInfo> {
+    if wanted.is_empty() {
+        return containers;
+    }
+    let wanted: Vec<(&str, &str)> = wanted
+        .iter()
+        .map(|kv| kv.split_once('=').unwrap_or((kv.as_str(), "")))
+        .collect();
+    containers
+        .into_iter()
+        .filter(|c| {
+            wanted
+                .iter()
+                .all(|(k, v)| c.labels.get(*k).map(String::as_str) == Some(*v))
+        })
+        .collect()
 }
 
 #[delete("/containers/<container_id>?<force>")]
@@ -1039,6 +1091,10 @@ async fn upgrade_local(
             Some(container_name.to_string()), // preserve name
             merged.enable_ipv6,
             registry_auth,
+            Some(crate::models::SandboxSpec {
+                lifecycle: merged.lifecycle.clone(),
+                labels: merged.labels.clone(),
+            }),
             None, // event_tx — local upgrade, response is synchronous
         )
         .await

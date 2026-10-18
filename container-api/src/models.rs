@@ -34,6 +34,9 @@ pub struct ContainerInfo {
     pub ipv6_address: Option<String>,
     #[serde(default)]
     pub ipv6_enabled: bool,
+    /// User labels (the `user.*` runtime labels, prefix stripped).
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -80,6 +83,72 @@ impl std::fmt::Debug for RegistryAuth {
     }
 }
 
+// ============= SANDBOX LIFECYCLE =============
+
+/// Per-container lifecycle, in the `[lifecycle]` section of a .nk spec.
+/// The vocabulary follows Daytona/Mastra sandboxes so an orchestrator can
+/// map its own settings 1:1:
+///   restart       always | unless-stopped | on-failure | never
+///   auto_stop     stop after this long without an exec/shell session ("15m"; "0" = never)
+///   auto_delete   remove this long after the container stopped ("1h"; "0" = never)
+///   max_lifetime  stop this long after creation, whatever happens ("24h"; "0" = never)
+/// Durations: "90s", "15m", "2h", "1d" or plain seconds.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct LifecycleSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_stop: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_delete: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lifetime: Option<String>,
+}
+
+/// Lifecycle plus free-form labels, as carried on deploy/upgrade.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SandboxSpec {
+    #[serde(default)]
+    pub lifecycle: LifecycleSpec,
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+}
+
+impl SandboxSpec {
+    pub fn is_empty(&self) -> bool {
+        self.lifecycle == LifecycleSpec::default() && self.labels.is_empty()
+    }
+}
+
+/// Parse "90s" / "15m" / "2h" / "1d" / "300" into seconds. "0" means never
+/// and parses to Some(0); None is a parse error.
+pub fn parse_duration_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, mult) = match s.chars().last()? {
+        's' => (&s[..s.len() - 1], 1),
+        'm' => (&s[..s.len() - 1], 60),
+        'h' => (&s[..s.len() - 1], 3600),
+        'd' => (&s[..s.len() - 1], 86400),
+        c if c.is_ascii_digit() => (s, 1),
+        _ => return None,
+    };
+    num.trim().parse::<u64>().ok().map(|n| n * mult)
+}
+
+/// nerdctl's `--restart` value for a spec word; None when invalid.
+pub fn restart_policy_flag(word: &str) -> Option<&'static str> {
+    match word {
+        "always" => Some("always"),
+        "unless-stopped" => Some("unless-stopped"),
+        "on-failure" => Some("on-failure"),
+        "never" | "no" => Some("no"),
+        _ => None,
+    }
+}
+
 // ============= DEPLOYMENT =============
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +167,10 @@ pub struct DeployRequest {
     pub volume_size: Option<String>, // e.g. "1g", "512m" — default 1g
     #[serde(default)]
     pub enable_ipv6: bool,
+    #[serde(default)]
+    pub lifecycle: LifecycleSpec,
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
 }
 
 // ============= UPGRADE =============
@@ -122,6 +195,10 @@ pub struct UpgradeRequest {
     pub volume_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<LifecycleSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub labels: Option<HashMap<String, String>>,
 }
 
 /// Stored container config — the full set of deploy parameters.
@@ -140,6 +217,10 @@ pub struct ContainerConfig {
     pub volume_path: Option<String>,
     pub volume_size: String, // e.g. "1g" — allocated disk for quota
     pub enable_ipv6: bool,
+    #[serde(default)]
+    pub lifecycle: LifecycleSpec,
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
 }
 
 // ============= NODE =============
@@ -161,5 +242,29 @@ pub fn build_ipv6_url(ipv6_address: &str, port: u16) -> String {
         80 => format!("http://[{}]/", ipv6_address),
         443 => format!("https://[{}]/", ipv6_address),
         _ => format!("[{}]:{}", ipv6_address, port),
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_duration_secs("90s"), Some(90));
+        assert_eq!(parse_duration_secs("15m"), Some(900));
+        assert_eq!(parse_duration_secs("2h"), Some(7200));
+        assert_eq!(parse_duration_secs("1d"), Some(86400));
+        assert_eq!(parse_duration_secs("300"), Some(300));
+        assert_eq!(parse_duration_secs("0"), Some(0));
+        assert_eq!(parse_duration_secs("soon"), None);
+        assert_eq!(parse_duration_secs(""), None);
+    }
+
+    #[test]
+    fn restart_words() {
+        assert_eq!(restart_policy_flag("never"), Some("no"));
+        assert_eq!(restart_policy_flag("always"), Some("always"));
+        assert_eq!(restart_policy_flag("sometimes"), None);
     }
 }

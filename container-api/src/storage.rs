@@ -979,6 +979,7 @@ pub async fn get_non_running_containers(
                 container_ip: row.get("internal_ip"),
                 ipv6_address: None,
                 ipv6_enabled: false,
+                labels: Default::default(),
             }
         })
         .collect();
@@ -1407,7 +1408,7 @@ pub async fn check_plan_quota(
 //
 //   CREATE INDEX idx_container_config_user ON container_config(user_id);
 
-use crate::models::{ContainerConfig, PortSpec, UpgradeRequest};
+use crate::models::{ContainerConfig, PortSpec, SandboxSpec, UpgradeRequest};
 use std::collections::HashMap;
 
 /// Store the full deploy config after a successful deployment.
@@ -1554,6 +1555,14 @@ pub fn merge_upgrade(base: &ContainerConfig, upgrade: &UpgradeRequest) -> Contai
             .clone()
             .unwrap_or_else(|| base.volume_size.clone()),
         enable_ipv6: base.enable_ipv6, // never changes on upgrade
+        lifecycle: upgrade
+            .lifecycle
+            .clone()
+            .unwrap_or_else(|| base.lifecycle.clone()),
+        labels: upgrade
+            .labels
+            .clone()
+            .unwrap_or_else(|| base.labels.clone()),
     }
 }
 
@@ -1571,6 +1580,7 @@ pub fn build_container_config(
     volume_path: &Option<String>,
     volume_size: &Option<String>,
     enable_ipv6: bool,
+    sandbox: &SandboxSpec,
 ) -> ContainerConfig {
     ContainerConfig {
         container_name: container_name.to_string(),
@@ -1584,5 +1594,7 @@ pub fn build_container_config(
         volume_path: volume_path.clone(),
         volume_size: volume_size.clone().unwrap_or_else(|| "1g".to_string()),
         enable_ipv6,
+        lifecycle: sandbox.lifecycle.clone(),
+        labels: sandbox.labels.clone(),
     }
 }

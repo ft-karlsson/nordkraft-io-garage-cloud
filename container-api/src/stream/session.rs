@@ -61,6 +61,7 @@ pub async fn run(
         }
     };
     let exec_id = proc.exec_id.clone();
+    let container_id = proc.container_id.clone();
     debug!("session {exec_id}: started");
 
     let started = Instant::now();
@@ -110,6 +111,8 @@ pub async fn run(
                 }
             },
             _ = idle_tick.tick() => {
+                // A live session keeps the container "in use" for auto_stop.
+                exec.touch(&container_id);
                 if last_activity.elapsed() > limits.idle {
                     break Outcome::Idle;
                 }

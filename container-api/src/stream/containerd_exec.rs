@@ -12,7 +12,7 @@
 
 use containerd_client::services::v1::{
     containers_client::ContainersClient, tasks_client::TasksClient, CloseIoRequest,
-    DeleteProcessRequest, ExecProcessRequest, GetContainerRequest, KillRequest,
+    DeleteProcessRequest, ExecProcessRequest, GetContainerRequest, GetRequest, KillRequest,
     ListContainersRequest, ResizePtyRequest, StartRequest, WaitRequest,
 };
 use containerd_client::tonic::transport::Channel;
@@ -53,6 +53,8 @@ pub struct ExecSpec {
 /// A running exec process. See module docs.
 pub struct ExecProcess {
     pub exec_id: String,
+    /// containerd id of the container the process runs in.
+    pub container_id: String,
     /// The only writer to the process's stdin; `take()` it and drop for EOF.
     pub stdin: Option<mpsc::Sender<Vec<u8>>>,
     pub output: mpsc::Receiver<(u8, Vec<u8>)>,
@@ -70,10 +72,13 @@ struct ProcInner {
 }
 
 /// Lazily-connected containerd client, shared by every session on this node.
+/// Also the node's memory of when each container was last used by a
+/// session, which the lifecycle reaper reads for `auto_stop`.
 pub struct ContainerdExec {
     socket: PathBuf,
     ns: String,
     channel: OnceCell<Channel>,
+    activity: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
 
 impl ContainerdExec {
@@ -82,6 +87,26 @@ impl ContainerdExec {
             socket: socket.into(),
             ns: namespace.into(),
             channel: OnceCell::new(),
+            activity: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Record that a session used this container just now.
+    pub fn touch(&self, container_id: &str) {
+        if let Ok(mut m) = self.activity.lock() {
+            m.insert(container_id.to_string(), std::time::Instant::now());
+        }
+    }
+
+    /// Last session activity on this container since the node started.
+    pub fn last_activity(&self, container_id: &str) -> Option<std::time::Instant> {
+        self.activity.lock().ok()?.get(container_id).copied()
+    }
+
+    /// Drop activity records for containers that no longer exist.
+    pub fn retain_activity(&self, live: &std::collections::HashSet<String>) {
+        if let Ok(mut m) = self.activity.lock() {
+            m.retain(|id, _| live.contains(id));
         }
     }
 
@@ -162,6 +187,57 @@ impl ContainerdExec {
             .transpose()?
             .unwrap_or(serde_json::Value::Null);
         Ok((full.id, spec))
+    }
+
+    /// Block until the container's main process exits and return its exit
+    /// code — `Task.Wait` on the init process, so no polling. A container
+    /// that already stopped returns at once; one with no task (never
+    /// started, or already reaped by the runtime) is reported as `None`.
+    pub async fn wait_container(
+        &self,
+        name_or_id: &str,
+        owner_pubkey: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Option<i32>, ExecError> {
+        let (container_id, _) = self.resolve(name_or_id, owner_pubkey).await?;
+        let mut tasks = TasksClient::new(self.channel().await?);
+        let got = tasks
+            .get(with_ns(
+                GetRequest {
+                    container_id: container_id.clone(),
+                    exec_id: String::new(),
+                },
+                &self.ns,
+            ))
+            .await;
+        let process = match got {
+            Ok(r) => r.into_inner().process,
+            Err(e) if e.code() == containerd_client::tonic::Code::NotFound => return Ok(None),
+            Err(e) => return Err(format!("containerd get: {}", e.message()).into()),
+        };
+        if let Some(p) = &process {
+            // containerd.v1.types.Status::Stopped == 3
+            if p.status == 3 {
+                return Ok(Some(p.exit_status as i32));
+            }
+        }
+        let waited = tokio::time::timeout(
+            timeout,
+            tasks.wait(with_ns(
+                WaitRequest {
+                    container_id,
+                    exec_id: String::new(),
+                },
+                &self.ns,
+            )),
+        )
+        .await;
+        match waited {
+            Ok(Ok(r)) => Ok(Some(r.into_inner().exit_status as i32)),
+            Ok(Err(e)) if e.code() == containerd_client::tonic::Code::NotFound => Ok(None),
+            Ok(Err(e)) => Err(format!("containerd wait: {}", e.message()).into()),
+            Err(_) => Err("timeout".into()),
+        }
     }
 
     /// Start `spec.cmd` inside the container. The returned process is already
@@ -316,8 +392,10 @@ impl ContainerdExec {
         }
         drop(out_tx); // readers hold the only senders; `output` ends when they do
 
+        self.touch(&container_id);
         Ok(ExecProcess {
             exec_id,
+            container_id,
             stdin: Some(in_tx),
             output: out_rx,
             inner,

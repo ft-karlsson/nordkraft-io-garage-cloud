@@ -668,6 +668,7 @@ fn make_container_assignment_handler(
             enable_ipv6,
             ipv6_address: _, // Ignored - SLAAC used instead
             registry_auth,
+            sandbox,
         } = msg
         else {
             return;
@@ -723,6 +724,7 @@ fn make_container_assignment_handler(
                     Some(container_name.clone()),
                     enable_ipv6,
                     registry_auth,
+                    sandbox,
                     Some(event_tx),
                 )
                 .await;
@@ -969,6 +971,10 @@ fn make_container_upgrade_handler(
                     Some(container_name.clone()),
                     config.enable_ipv6,
                     registry_auth,
+                    Some(crate::models::SandboxSpec {
+                        lifecycle: config.lifecycle.clone(),
+                        labels: config.labels.clone(),
+                    }),
                     Some(event_tx),
                 )
                 .await;
