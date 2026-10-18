@@ -143,6 +143,16 @@ The script prints the agent's WireGuard public key. Add it as a peer on the
 controller, register the node in the `nodes` table, and the agent joins over
 NATS.
 
+Shell, exec and wait do not go over NATS: the controller opens a connection to
+the agent's own API at `<nodes.internal_ip>:8001` (`/api/internal/…`) and
+relays the stream. So the agent must listen on that address — the installer
+writes `BIND_ADDRESS=0.0.0.0` — and the firewall must accept TCP 8001 from the
+controller's address. The agent accepts `/api/internal/` only from
+`CONTROLLER_INTERNAL_IP`; everything else gets 403. Older hand-written agent
+configs with `BIND_ADDRESS=127.0.0.1` (or another port) need
+`BIND_ADDRESS=<LAN or WireGuard IP>` and `BIND_PORT=8001`, then a restart; a
+`502 agent did not answer` from the CLI is the symptom.
+
 ## Options
 
 ```
