@@ -1599,6 +1599,8 @@ struct ContainerInfo {
     ipv6_address: Option<String>,
     #[serde(default)]
     ipv6_enabled: bool,
+    #[serde(default)]
+    labels: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
