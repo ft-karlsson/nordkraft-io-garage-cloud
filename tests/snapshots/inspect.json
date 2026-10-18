@@ -1,0 +1,47 @@
+{
+  "command": [],
+  "container_id": "<var>",
+  "container_ip": "<var>",
+  "cpu_limit": 0.5,
+  "created_at": "<var>",
+  "env_vars": [],
+  "exit_code": 0,
+  "finished_at": "<var>",
+  "hostname": "<var>",
+  "image": "<var>",
+  "image_digest": null,
+  "ipv6_address": null,
+  "ipv6_enabled": false,
+  "labels": {
+    "app_image": "<var>",
+    "app_ports": "[{\"port\":80,\"protocol\":\"tcp\"}]",
+    "app_published": "[{\"port\":80,\"host_port\":80,\"protocol\":\"tcp\"}]",
+    "created_at": "<var>",
+    "io.containerd.image.config.stop-signal": "SIGTERM",
+    "managed_by": "nordkraft",
+    "owner_pubkey": "dev_key_placeholder",
+    "tenant_id": "tenant-dev-user",
+    "user_slot": "99",
+    "user_subnet": "172.21.99.0/24"
+  },
+  "memory_limit": 536870912,
+  "name": "<var>",
+  "node_id": "<var>",
+  "persistence_enabled": true,
+  "ports": [
+    {
+      "access_url": "<var>",
+      "ipv6_url": "<var>",
+      "port": 80,
+      "protocol": "tcp"
+    }
+  ],
+  "restart_count": null,
+  "runtime": "runc",
+  "started_at": "<var>",
+  "status": "running",
+  "volume_mounts": [
+    "tmpfs:/tmp",
+    "tmpfs:/var/tmp"
+  ]
+}

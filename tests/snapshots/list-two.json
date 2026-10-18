@@ -1,0 +1,42 @@
+[
+  {
+    "container_id": "<var>",
+    "container_ip": "<var>",
+    "created_at": "<var>",
+    "image": "<var>",
+    "ipv6_address": null,
+    "ipv6_enabled": false,
+    "name": "<var>",
+    "pod_id": null,
+    "ports": [
+      {
+        "access_url": "<var>",
+        "ipv6_url": "<var>",
+        "port": 80,
+        "protocol": "tcp"
+      }
+    ],
+    "status": "<state>",
+    "status_message": null
+  },
+  {
+    "container_id": "<var>",
+    "container_ip": "<var>",
+    "created_at": "<var>",
+    "image": "<var>",
+    "ipv6_address": null,
+    "ipv6_enabled": false,
+    "name": "<var>",
+    "pod_id": null,
+    "ports": [
+      {
+        "access_url": "<var>",
+        "ipv6_url": "<var>",
+        "port": 80,
+        "protocol": "tcp"
+      }
+    ],
+    "status": "<state>",
+    "status_message": null
+  }
+]
