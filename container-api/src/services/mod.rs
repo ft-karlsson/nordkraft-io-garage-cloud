@@ -11,4 +11,5 @@ pub mod nats_service;
 pub mod peer_resolver;
 pub mod persistence;
 pub mod pfsense_client;
+pub mod reaper;
 pub mod route_manager;

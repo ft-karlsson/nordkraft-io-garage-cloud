@@ -12,6 +12,7 @@ use std::time::Duration;
 
 mod spec_ops;
 mod spinner;
+mod stream;
 mod tui;
 use spinner::Spinner;
 
@@ -155,7 +156,57 @@ enum Commands {
     },
     /// List containers (shortcut for 'container list')
     #[command(alias = "ls")]
-    List,
+    List {
+        /// Only containers with this label (KEY=VALUE, repeatable)
+        #[arg(long = "label", short = 'l', value_name = "KEY=VALUE")]
+        label: Vec<String>,
+    },
+    /// Wait for a container's main process to exit; exit with its code
+    Wait {
+        /// Container name or alias
+        container: String,
+        /// Give up after this many seconds (exit 124)
+        #[arg(long, default_value = "300")]
+        timeout: u64,
+    },
+    /// Interactive shell in a container (default /bin/sh)
+    ///
+    ///   nordkraft shell web
+    ///   nordkraft shell web -- bash -l
+    #[command(alias = "sh")]
+    Shell {
+        /// Container name, alias, or omit for interactive selection
+        container: Option<String>,
+        /// Command to run instead of /bin/sh (after --)
+        #[arg(last = true)]
+        cmd: Vec<String>,
+    },
+    /// Run a command in a container and exit with its status
+    ///
+    ///   nordkraft exec web -- ls -la /data
+    ///   echo hi | nordkraft exec web --stdin -- cat
+    Exec {
+        /// Container name or alias
+        container: String,
+        /// Working directory inside the container
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Environment variable KEY=VALUE (repeatable)
+        #[arg(long = "env", short = 'e', value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// Run as uid[:gid]
+        #[arg(long)]
+        user: Option<String>,
+        /// Seconds before the command is killed (exit 124)
+        #[arg(long, default_value = "120")]
+        timeout: u64,
+        /// Pass our stdin to the command
+        #[arg(long)]
+        stdin: bool,
+        /// Command and arguments (after --)
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
+    },
     /// Get container logs (shortcut for 'container logs')
     Logs {
         /// Container name, alias, or omit for interactive selection
@@ -298,7 +349,11 @@ enum AuthCommands {
 enum ContainerCommands {
     /// List your containers
     #[command(alias = "ls")]
-    List,
+    List {
+        /// Only containers with this label (KEY=VALUE, repeatable)
+        #[arg(long = "label", short = 'l', value_name = "KEY=VALUE")]
+        label: Vec<String>,
+    },
     /// Deploy a new container
     Deploy(Box<DeployArgs>),
     /// Start a stopped container
@@ -411,6 +466,26 @@ struct DeployArgs {
     /// Command to run (overrides image default)
     #[arg(long, value_name = "CMD")]
     command: Option<String>,
+
+    /// Restart policy: always, unless-stopped, on-failure, never
+    #[arg(long, value_name = "POLICY")]
+    restart: Option<String>,
+
+    /// Stop after this long with no exec/shell activity (e.g. 15m; 0 = never)
+    #[arg(long, value_name = "DURATION")]
+    auto_stop: Option<String>,
+
+    /// Remove this long after the container stopped (e.g. 1h; 0 = never)
+    #[arg(long, value_name = "DURATION")]
+    auto_delete: Option<String>,
+
+    /// Stop this long after creation, whatever happens (e.g. 24h; 0 = never)
+    #[arg(long, value_name = "DURATION")]
+    max_lifetime: Option<String>,
+
+    /// Label KEY=VALUE (repeatable); filter with `nordkraft list --label`
+    #[arg(long = "label", short = 'l', value_name = "KEY=VALUE")]
+    label: Vec<String>,
 }
 
 // ============= INGRESS COMMANDS =============
@@ -644,6 +719,56 @@ struct DeploymentSpec {
     env: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "PlacementSpec::is_empty")]
     placement: PlacementSpec,
+    /// Sandbox lifecycle: restart policy and the auto_stop / auto_delete /
+    /// max_lifetime timers ("15m", "2h", "0" = never).
+    #[serde(default, skip_serializing_if = "LifecycleSpec::is_empty")]
+    lifecycle: LifecycleSpec,
+    /// Free-form labels, filterable with `nordkraft list --label k=v`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    labels: HashMap<String, String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+struct LifecycleSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restart: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_stop: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_delete: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_lifetime: Option<String>,
+}
+
+impl LifecycleSpec {
+    fn is_empty(&self) -> bool {
+        *self == LifecycleSpec::default()
+    }
+
+    fn from_flags(
+        restart: &Option<String>,
+        auto_stop: &Option<String>,
+        auto_delete: &Option<String>,
+        max_lifetime: &Option<String>,
+    ) -> Self {
+        LifecycleSpec {
+            restart: restart.clone(),
+            auto_stop: auto_stop.clone(),
+            auto_delete: auto_delete.clone(),
+            max_lifetime: max_lifetime.clone(),
+        }
+    }
+}
+
+/// "k=v" flags → map; a bare key gets an empty value.
+fn labels_from_flags(flags: &[String]) -> HashMap<String, String> {
+    flags
+        .iter()
+        .map(|kv| match kv.split_once('=') {
+            Some((k, v)) => (k.to_string(), v.to_string()),
+            None => (kv.clone(), String::new()),
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -847,6 +972,13 @@ fn spec_from_deploy_args(
                 .or_else(|| args.garage.clone()),
             hardware: args.hardware.clone(),
         },
+        lifecycle: LifecycleSpec::from_flags(
+            &args.restart,
+            &args.auto_stop,
+            &args.auto_delete,
+            &args.max_lifetime,
+        ),
+        labels: labels_from_flags(&args.label),
     }
 }
 
@@ -887,7 +1019,9 @@ fn spec_from_inspect(c: &ContainerInspectResponse) -> DeploymentSpec {
             "⚠".yellow(),
             unread.join(" and ")
         );
-        eprintln!("   Verify against the node before running 'nordkraft upgrade' on this container.");
+        eprintln!(
+            "   Verify against the node before running 'nordkraft upgrade' on this container."
+        );
     }
 
     // Parse memory from bytes to human string
@@ -953,6 +1087,23 @@ fn spec_from_inspect(c: &ContainerInspectResponse) -> DeploymentSpec {
             garage: None, // not available from inspect
             hardware: None,
         },
+        lifecycle: LifecycleSpec {
+            restart: c.labels.get("nordkraft.restart").cloned(),
+            auto_stop: c.labels.get("nordkraft.auto_stop").map(|s| format!("{s}s")),
+            auto_delete: c
+                .labels
+                .get("nordkraft.auto_delete")
+                .map(|s| format!("{s}s")),
+            max_lifetime: c
+                .labels
+                .get("nordkraft.max_lifetime")
+                .map(|s| format!("{s}s")),
+        },
+        labels: c
+            .labels
+            .iter()
+            .filter_map(|(k, v)| k.strip_prefix("user.").map(|k| (k.to_string(), v.clone())))
+            .collect(),
     }
 }
 
@@ -1275,7 +1426,10 @@ fn normalise_api_url(input: &str) -> String {
     url
 }
 
-async fn handle_config(command: ConfigCommands, json_output: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_config(
+    command: ConfigCommands,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         ConfigCommands::SetApi { url } => {
             let url = normalise_api_url(&url);
@@ -1294,7 +1448,10 @@ async fn handle_config(command: ConfigCommands, json_output: bool) -> Result<(),
                 .unwrap_or(false);
 
             if json_output {
-                println!("{}", serde_json::json!({"api_url": url, "reachable": reachable}));
+                println!(
+                    "{}",
+                    serde_json::json!({"api_url": url, "reachable": reachable})
+                );
             } else {
                 println!("{} API endpoint set to {}", "✓".green(), url.cyan());
                 if reachable {
@@ -1442,6 +1599,8 @@ struct ContainerInfo {
     ipv6_address: Option<String>,
     #[serde(default)]
     ipv6_enabled: bool,
+    #[serde(default)]
+    labels: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1486,6 +1645,10 @@ struct DeployRequest {
     target_garage: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hardware_preference: Option<String>,
+    #[serde(skip_serializing_if = "LifecycleSpec::is_empty")]
+    lifecycle: LifecycleSpec,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    labels: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1533,6 +1696,10 @@ struct CliUpgradeRequest {
     volume_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     volume_size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lifecycle: Option<LifecycleSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    labels: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1828,12 +1995,23 @@ async fn main() {
         // Shortcuts with interactive selection
         Commands::Deploy(args) => handle_deploy(*args, json_output).await,
         Commands::Push { image } => handle_registry_push(&image, json_output).await,
-        Commands::List => handle_container_list(json_output).await,
+        Commands::List { label } => handle_container_list(&label, json_output).await,
+        Commands::Wait { container, timeout } => handle_wait(container, timeout, json_output).await,
         Commands::Logs { container, lines } => {
             handle_logs_interactive(container, lines, json_output).await
         }
         Commands::Stop { container } => handle_stop_interactive(container, json_output).await,
         Commands::Start { container } => handle_start_interactive(container, json_output).await,
+        Commands::Shell { container, cmd } => handle_shell(container, cmd, json_output).await,
+        Commands::Exec {
+            container,
+            cwd,
+            env,
+            user,
+            timeout,
+            stdin,
+            cmd,
+        } => handle_exec(container, cmd, cwd, env, user, timeout, stdin, json_output).await,
         Commands::Remove { container, force } => {
             handle_remove_interactive(container, force, json_output).await
         }
@@ -1968,7 +2146,7 @@ async fn handle_container(
     json_output: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        ContainerCommands::List => handle_container_list(json_output).await,
+        ContainerCommands::List { label } => handle_container_list(&label, json_output).await,
         ContainerCommands::Deploy(args) => handle_deploy(*args, json_output).await,
         ContainerCommands::Start { container } => {
             let container = get_container_or_select(container, json_output).await?;
@@ -2000,6 +2178,59 @@ async fn handle_container(
             handle_container_inspect(&container, json_output).await
         }
     }
+}
+
+async fn handle_shell(
+    container: Option<String>,
+    cmd: Vec<String>,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name = get_container_or_select(container, json_output).await?;
+    let code = stream::shell(&name, &cmd).await?;
+    std::process::exit(code);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_exec(
+    container: String,
+    cmd: Vec<String>,
+    cwd: Option<String>,
+    env: Vec<String>,
+    user: Option<String>,
+    timeout: u64,
+    stdin: bool,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name = resolve_alias(&container);
+    let stdin_data = if stdin {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)?;
+        Some(buf)
+    } else {
+        None
+    };
+    let code = stream::exec(
+        &name,
+        &cmd,
+        cwd.as_deref(),
+        &env,
+        user.as_deref(),
+        timeout,
+        stdin_data,
+        json_output,
+    )
+    .await?;
+    std::process::exit(code);
+}
+
+async fn handle_wait(
+    container: String,
+    timeout: u64,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name = resolve_alias(&container);
+    let code = stream::wait(&name, timeout, json_output).await?;
+    std::process::exit(code);
 }
 
 // Interactive wrapper functions for shortcuts
@@ -2037,7 +2268,10 @@ async fn handle_remove_interactive(
     handle_container_remove_opts(&container, force, json_output).await
 }
 
-async fn handle_container_list(json_output: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_container_list(
+    labels: &[String],
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let client = create_client()?;
 
     let sp = if json_output {
@@ -2046,7 +2280,15 @@ async fn handle_container_list(json_output: bool) -> Result<(), Box<dyn std::err
         Some(Spinner::start(spinner::LIST_MESSAGES))
     };
 
-    let url = format!("{}/containers", *API_BASE_URL);
+    let mut url = format!("{}/containers", *API_BASE_URL);
+    if !labels.is_empty() {
+        let qs = labels
+            .iter()
+            .map(|l| format!("label={}", stream::urlencode(l)))
+            .collect::<Vec<_>>()
+            .join("&");
+        url = format!("{url}?{qs}");
+    }
     let response = client.get(&url).send().await?;
 
     if !response.status().is_success() {
@@ -2200,6 +2442,15 @@ async fn handle_deploy(
             name: args.name.or(Some(spec.deployment.name.clone())),
             alias: args.alias.clone(),
             command: spec.deployment.command.clone(),
+            restart: spec.lifecycle.restart.clone(),
+            auto_stop: spec.lifecycle.auto_stop.clone(),
+            auto_delete: spec.lifecycle.auto_delete.clone(),
+            max_lifetime: spec.lifecycle.max_lifetime.clone(),
+            label: spec
+                .labels
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect(),
         }
     } else if args.image.is_empty() && !json_output {
         // If no image provided and not JSON mode, offer interactive
@@ -2447,6 +2698,13 @@ async fn handle_deploy(
         enable_ipv6: args.ipv6,
         target_garage: args.garage.clone(),
         hardware_preference: args.hardware.clone(),
+        lifecycle: LifecycleSpec::from_flags(
+            &args.restart,
+            &args.auto_stop,
+            &args.auto_delete,
+            &args.max_lifetime,
+        ),
+        labels: labels_from_flags(&args.label),
     };
 
     if !json_output {
@@ -2573,7 +2831,8 @@ async fn handle_deploy(
         if result.network_mode.as_deref() == Some("bridge") {
             println!(
                 "   {}",
-                "(bridge mode: reached via the host's published port, not the container IP)".dimmed()
+                "(bridge mode: reached via the host's published port, not the container IP)"
+                    .dimmed()
             );
         }
     } else if let Some(ip) = &result.container_ip {
@@ -3358,6 +3617,8 @@ async fn handle_upgrade_interactive(
         memory_limit: Some(spec.resources.memory.clone()),
         volume_path: spec.storage.volume_path.clone(),
         volume_size: Some(spec.storage.volume_size.clone()),
+        lifecycle: Some(spec.lifecycle.clone()),
+        labels: Some(spec.labels.clone()),
     };
 
     let client = create_client()?;
@@ -4057,6 +4318,10 @@ struct StoredContainerConfig {
     volume_size: String,
     #[serde(default)]
     enable_ipv6: bool,
+    #[serde(default)]
+    lifecycle: LifecycleSpec,
+    #[serde(default)]
+    labels: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4091,8 +4356,8 @@ async fn fetch_stored_spec(
         }
     }
 
-    let stored: StoredConfigResponse = serde_json::from_str(&body)
-        .map_err(|e| format!("Failed to parse stored config: {}", e))?;
+    let stored: StoredConfigResponse =
+        serde_json::from_str(&body).map_err(|e| format!("Failed to parse stored config: {}", e))?;
 
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let c = stored.config;
@@ -4126,6 +4391,8 @@ async fn fetch_stored_spec(
             garage: None,
             hardware: None,
         },
+        lifecycle: c.lifecycle,
+        labels: c.labels,
     }))
 }
 
@@ -5463,6 +5730,11 @@ fn prompt_deploy_interactive() -> Result<DeployArgs, Box<dyn std::error::Error>>
         command: None,
         alias: None,
         volume_size,
+        restart: None,
+        auto_stop: None,
+        auto_delete: None,
+        max_lifetime: None,
+        label: vec![],
     })
 }
 
@@ -5508,7 +5780,10 @@ async fn handle_registry_init(json_output: bool) -> Result<(), Box<dyn std::erro
     // only when *you* deploy from this registry. Nobody else gets them.
     let password = generate_registry_password()?;
     let mut env_vars = HashMap::new();
-    env_vars.insert("REGISTRY_USERNAME".to_string(), REGISTRY_USERNAME.to_string());
+    env_vars.insert(
+        "REGISTRY_USERNAME".to_string(),
+        REGISTRY_USERNAME.to_string(),
+    );
     env_vars.insert("REGISTRY_PASSWORD".to_string(), password.clone());
 
     // Deploy the registry container via the API
@@ -5529,6 +5804,8 @@ async fn handle_registry_init(json_output: bool) -> Result<(), Box<dyn std::erro
         enable_ipv6: false,
         target_garage: None,
         hardware_preference: None,
+        lifecycle: LifecycleSpec::default(),
+        labels: HashMap::new(),
     };
 
     let url = format!("{}/containers/deploy", *API_BASE_URL);
@@ -5614,7 +5891,11 @@ async fn handle_registry_push(
     }
 
     // Push to registry (TLS disabled — WireGuard handles encryption)
-    let mut push_args = vec!["push".to_string(), registry_tag.clone(), "--tls-verify=false".to_string()];
+    let mut push_args = vec![
+        "push".to_string(),
+        registry_tag.clone(),
+        "--tls-verify=false".to_string(),
+    ];
     if let (Some(user), Some(pass)) = (&config.username, &config.password) {
         push_args.push("--creds".to_string());
         push_args.push(format!("{user}:{pass}"));
@@ -5989,7 +6270,10 @@ fn wg_quick_command(action: &str) -> std::process::Command {
             .filter(|o| o.status.success())
             .map(|o| format!("{}/bin", String::from_utf8_lossy(&o.stdout).trim()))
             .unwrap_or_else(|| "/opt/homebrew/bin".to_string());
-        cmd.args(["env", &format!("PATH={brew_bin}:/usr/local/bin:/usr/bin:/bin")]);
+        cmd.args([
+            "env",
+            &format!("PATH={brew_bin}:/usr/local/bin:/usr/bin:/bin"),
+        ]);
     }
 
     cmd.args(["wg-quick", action, WG_INTERFACE]);

@@ -35,7 +35,7 @@ jobs:
           for t in gcc g++ ar; do sudo ln -sf /usr/bin/$t /usr/local/bin/x86_64-unknown-linux-gnu-$t; done
       - name: shellcheck
         run: |
-          sudo apt-get install -y -qq shellcheck >/dev/null
+          sudo apt-get install -y -qq shellcheck protobuf-compiler >/dev/null
           shellcheck -S warning scripts/*.sh
       - name: clippy (container-api)
         run: cd container-api && cargo clippy --all-targets -- -D warnings
@@ -49,7 +49,7 @@ jobs:
   e2e:
     name: Install dev node + smoke test
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -68,8 +68,16 @@ jobs:
       - name: Build CLI
         run: cd client-cli && cargo build --release
 
-      - name: Install dev node (builds container-api)
-        run: sudo bash scripts/install-node.sh --dev --build-from "$PWD"
+      # Build the node here, where rust-cache keeps the target dir, rather than
+      # letting the installer build cold in /var/tmp (containerd-client alone
+      # is minutes on a 2-core runner). Same binary, same install path.
+      - name: Build container-api
+        run: |
+          sudo apt-get install -y -qq protobuf-compiler >/dev/null
+          cd container-api && cargo build --release
+
+      - name: Install dev node
+        run: sudo bash scripts/install-node.sh --dev --binary "$PWD/container-api/target/release/container-api"
 
       - name: Wait for API
         run: |
@@ -77,6 +85,9 @@ jobs:
             curl -fsS http://127.0.0.1:8001/api/status && break
             sleep 1
           done
+
+      - name: WebSocket client for the PTY check
+        run: pip3 install --quiet --break-system-packages websockets
 
       - name: Smoke test
         env:

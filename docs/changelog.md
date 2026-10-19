@@ -4,6 +4,41 @@
 
 ---
 
+## Oktober 2026 — v0.3.43
+
+**Shell og exec i dine containere**
+
+`nordkraft shell myapp` giver dig en rigtig terminal i containeren, `nordkraft exec myapp -- cmd`
+kører én kommando og afslutter med dens exit-kode. Begge er bygget som `kubectl exec`:
+én strøm over WireGuard, som controlleren sender uændret videre til den node containeren
+kører på, og som noden kobler direkte på containerd. Ingen ekstra login — netværket er
+adgangskontrollen. Virker ens for Kata og runc.
+
+Til scripts og orkestratorer findes det samme som `POST /containers/{id}/exec` (bufferet,
+med `cwd`, `env`, `stdin`, `timeout_s`) og som WebSocket på `/containers/{id}/stream`.
+
+**Livscyklus i spec'en**
+
+En container kan nu rydde op efter sig selv. I `.nk`-spec'en eller som flag på `deploy`:
+
+```toml
+[lifecycle]
+restart      = "never"   # always | unless-stopped | on-failure | never
+auto_stop    = "15m"     # stop efter 15 min uden shell/exec-aktivitet
+auto_delete  = "1h"      # slet 1 time efter stop
+max_lifetime = "24h"     # stop senest 24 timer efter oprettelse
+
+[labels]
+workspace = "ws-42"
+```
+
+`nordkraft list --label workspace=ws-42` finder dem igen, og `nordkraft wait myjob` venter på
+at et job bliver færdigt og giver dig dets exit-kode. Se [Sandboxes](guides/sandboxes.md).
+
+**Til dig der bygger selv:** `protobuf-compiler` er nu en build-afhængighed (containerd's gRPC-bindings).
+
+---
+
 ## Oktober 2026 — v0.3.42
 
 **Privat registry med adgangskode**

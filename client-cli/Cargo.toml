@@ -1,6 +1,6 @@
 [package]
 name = "nordkraft"
-version = "0.3.42"
+version = "0.3.43"
 edition = "2021"
 description = "Nordkraft Garage Cloud CLI - Secure Container Hosting"
 authors = ["Nordkraft.io"]
@@ -26,6 +26,9 @@ chrono = { version = "0.4", features = ["serde"] }
 crossterm = "0.29.0"
 ratatui = "0.30.0"
 toml_edit = "0.25.11"
+# shell/exec: WebSocket stream to the node (plain ws over WireGuard)
+tokio-tungstenite = "0.21"
+futures = "0.3"
 
 [profile.release]
 opt-level = 3

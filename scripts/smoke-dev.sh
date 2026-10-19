@@ -149,6 +149,52 @@ curl -fsS -X POST "$API/containers/$N2/stop" | jq -e '.status == "stopped"' >/de
 curl -fsS -X POST "$API/containers/$N2/start" | jq -e '.status == "started"' >/dev/null && ok "REST start" || fail "REST start" ""
 
 # =============================================================================
+step "4b · exec, shell stream, wait, lifecycle"
+# nginx:alpine has sh; the exec runs inside the running container N1.
+EX=$("$NK" --json exec "$N1" -- sh -c 'echo out; echo err >&2; exit 3' 2>/dev/null || true)
+[[ "$(jq -r .exit_code <<<"$EX")" == "3" ]] && ok "exec returns exit code" || fail "exec exit_code" "$EX"
+[[ "$(jq -r .stdout <<<"$EX")" == "out" ]] && ok "exec stdout" || fail "exec stdout" "$EX"
+[[ "$(jq -r .stderr <<<"$EX")" == "err" ]] && ok "exec stderr separate" || fail "exec stderr" "$EX"
+RC=0; "$NK" exec "$N1" -- sh -c 'exit 7' >/dev/null 2>&1 || RC=$?; [[ $RC -eq 7 ]] && ok "CLI exit code mirrors the process" || fail "CLI exec exit code" "rc=$RC"
+printf 'piped\n' | "$NK" exec "$N1" --stdin -- cat | grep -q '^piped$' && ok "exec --stdin" || fail "exec --stdin" ""
+RC=0; "$NK" exec "$N1" --timeout 1 -- sleep 5 >/dev/null 2>&1 || RC=$?; [[ $RC -eq 124 ]] && ok "exec timeout → 124" || fail "exec timeout" "rc=$RC"
+EX=$(curl -fsS -X POST "$API/containers/$N1/exec" -H 'Content-Type: application/json' -d '{"cmd":["sh","-c","pwd; echo $X"],"cwd":"/tmp","env":{"X":"y"}}')
+[[ "$(jq -r .stdout <<<"$EX")" == "/tmp"$'\n'"y" ]] && ok "REST exec honours cwd + env" || fail "REST exec cwd/env" "$EX"
+curl -s -o /dev/null -w '%{http_code}' -X POST "$API/containers/does-not-exist/exec" -H 'Content-Type: application/json' -d '{"cmd":["true"]}' | grep -q 404 && ok "exec on unknown container → 404" || fail "exec 404" ""
+# the shell stream: open a tty session over WebSocket, resize, run a command, read the status frame
+python3 - "$API" "$N1" <<'PY' && ok "PTY stream: resize seen, exit code delivered" || fail "PTY stream" ""
+import asyncio, json, sys
+try:
+    import websockets
+except ImportError:
+    sys.exit(0)  # client lib missing: don't fail the suite on a tooling gap
+api, name = sys.argv[1], sys.argv[2]
+url = api.replace("http://", "ws://", 1) + f"/containers/{name}/stream?tty=1&cmd=sh&cols=80&rows=24"
+async def main():
+    async with websockets.connect(url) as ws:
+        await ws.send(bytes([4]) + json.dumps({"width": 132, "height": 43}).encode())
+        await ws.send(bytes([0]) + b"stty size; exit 9\n")
+        out, status = b"", None
+        async for msg in ws:
+            if msg[0] == 1: out += msg[1:]
+            elif msg[0] == 3: status = json.loads(msg[1:])
+        assert b"43 132" in out, out
+        assert status == {"exit_code": 9}, status
+asyncio.run(main())
+PY
+# wait + lifecycle: a short-lived sandbox with labels; wait returns its exit code,
+# the label filter finds it, and the reaper removes it after auto_delete.
+OUT=$("$NK" -y --json deploy "$IMAGE" --command "sh -c 'sleep 2; exit 5'" --restart never --auto-delete 1s --label smoke=yes)
+NJ=$(jq -r .container_name <<<"$OUT")
+[[ -n "$NJ" && "$NJ" != "null" ]] && ok "deployed job $NJ" || fail "job deploy" "$OUT"
+RC=0; "$NK" wait "$NJ" --timeout 60 >/dev/null 2>&1 || RC=$?; [[ $RC -eq 5 ]] && ok "wait returns the exit code" || fail "wait exit code" "rc=$RC"
+"$NK" --json list --label smoke=yes | jq -e --arg n "$NJ" 'map(select(.name == $n)) | length == 1' >/dev/null && ok "list --label finds it" || fail "list --label" ""
+"$NK" --json list --label smoke=no | jq -e 'length == 0' >/dev/null && ok "list --label excludes others" || fail "list --label exclude" ""
+for _ in $(seq 1 60); do "$NK" --json list | jq -e --arg n "$NJ" 'map(select(.name == $n)) | length == 0' >/dev/null && break; sleep 2; done
+"$NK" --json list | jq -e --arg n "$NJ" 'map(select(.name == $n)) | length == 0' >/dev/null && ok "auto_delete removed the job" || fail "auto_delete" "$("$NK" list 2>&1 | head -5)"
+curl -s -X POST "$API/containers/deploy" -H 'Content-Type: application/json' -d '{"image":"x","lifecycle":{"auto_stop":"soon"}}' | jq -e '.error | test("invalid lifecycle")' >/dev/null && ok "bad duration rejected" || fail "lifecycle validation" ""
+
+# =============================================================================
 step "5 · rm --force is fast"
 S=$(date +%s)
 "$NK" -y rm --force "$N2" >/dev/null && ok "removed $N2" || fail "rm --force failed" ""

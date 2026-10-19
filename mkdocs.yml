@@ -53,6 +53,7 @@ nav:
     - Environment variabler: guides/environment.md
     - Persistent storage: guides/storage.md
     - Custom domæner: guides/domains.md
+    - Sandboxes (shell, exec, livscyklus): guides/sandboxes.md
   - Reference:
     - CLI kommandoer: reference/cli.md
     - API: reference/api.md

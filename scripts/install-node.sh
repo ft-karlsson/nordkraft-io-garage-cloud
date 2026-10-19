@@ -208,7 +208,8 @@ section "Phase 2: Nordkraft binary"
 if [[ -n "$BUILD_FROM" ]]; then
   [[ -f "$BUILD_FROM/container-api/Cargo.toml" ]] || error "--build-from: $BUILD_FROM/container-api/Cargo.toml not found (inside OrbStack your Mac home is at /Users/<you>, not ~)"
   log "Building container-api from $BUILD_FROM"
-  apt-get install -y -qq build-essential pkg-config >/dev/null
+  # protobuf-compiler: containerd-client generates its gRPC bindings at build time
+  apt-get install -y -qq build-essential pkg-config protobuf-compiler >/dev/null
   # The repo's .cargo/config.toml names cross-compiler binaries even for native
   # builds; point those names at the system toolchain.
   for t in gcc g++ ar; do ln -sf "/usr/bin/$t" "/usr/local/bin/${ARCH}-unknown-linux-gnu-$t"; done

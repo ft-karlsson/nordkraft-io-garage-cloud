@@ -64,6 +64,10 @@ pub struct AppConfig {
     pub public_host: Option<String>,
     // Seconds to wait for SIGTERM before SIGKILL on stop (default 30)
     pub container_stop_timeout: u32,
+    // containerd gRPC socket + namespace, used for exec/shell sessions.
+    // nerdctl's default namespace is "default"; the socket is root-owned.
+    pub containerd_socket: String,
+    pub containerd_namespace: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -277,5 +281,9 @@ pub fn init_config() -> AppConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(30),
+        containerd_socket: env::var("CONTAINERD_SOCKET")
+            .unwrap_or_else(|_| "/run/containerd/containerd.sock".to_string()),
+        containerd_namespace: env::var("CONTAINERD_NAMESPACE")
+            .unwrap_or_else(|_| "default".to_string()),
     }
 }

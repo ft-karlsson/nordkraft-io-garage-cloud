@@ -6,3 +6,4 @@ pub mod ingress;
 pub mod ipv6;
 pub mod nodes;
 pub mod status;
+pub mod stream;

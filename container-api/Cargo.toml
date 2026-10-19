@@ -1,6 +1,6 @@
 [package]
 name = "container-api"
-version = "0.3.42"
+version = "0.3.43"
 edition = "2021"
 
 [dependencies]
@@ -34,3 +34,13 @@ instant-acme = "0.8.5"
 x509-parser = "0.16"
 idna = "1"
 psl = "2"
+
+# Sandbox exec/PTY: containerd gRPC (Task.Exec) on the agent, WebSocket stream
+# relayed through the controller — kubectl/kubelet model, nothing over NATS.
+containerd-client = "0.9"
+tonic = "0.14"
+prost-types = "0.14"
+prost = "0.14"
+rocket_ws = "0.1.1"
+tokio-tungstenite = "0.21"
+nix = { version = "0.31", features = ["term", "fs"] }
