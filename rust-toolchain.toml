@@ -1,4 +1,13 @@
-# Pinned so a new stable Rust can't turn main red overnight; bump deliberately.
+# The one place the Rust toolchain is pinned. rustup reads this on every
+# machine and in every CI job (via `rustup show`), so a bump here moves lint,
+# e2e, release builds and developer laptops together. Targets are listed in
+# full so the cross-compiling release jobs never need their own copy.
 [toolchain]
 channel = "1.97.0"
 components = ["clippy", "rustfmt"]
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]
