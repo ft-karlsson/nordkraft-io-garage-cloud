@@ -35,6 +35,26 @@ workspace = "ws-42"
 `nordkraft list --label workspace=ws-42` finder dem igen, og `nordkraft wait myjob` venter på
 at et job bliver færdigt og giver dig dets exit-kode. Se [Sandboxes](guides/sandboxes.md).
 
+**Mastra-provider**
+
+`@nordkraft/mastra` (i repoet under `integrations/mastra`) lader en [Mastra](https://mastra.ai)-agent
+bruge en Nordkraft-container som sin sandbox — et selvhostet, open source alternativ til Daytona
+og E2B. `start()` finder eller deployer containeren, agentens `execute_command` kører over
+exec-strømmen, og livscyklussen (`autoStopInterval`, `autoDeleteInterval`) bliver containerens
+egen. Se [Mastra-guiden](guides/mastra.md).
+
+**Exec uden stdin**
+
+En exec uden `stdin` (REST uden feltet, strømmen med `stdin=false`, `nordkraft exec` uden
+`--stdin`) tilknytter ikke længere nogen stdin: processen læser EOF fra `/dev/null`, og noden
+lukker aldrig stdin gennem containerd. Det retter tab af output på Kata Containers, hvor en
+stdin-lukning afbryder læsningen af stdout. Exec *med* stdin er stadig berørt — se
+[kendte problemer](troubleshooting/known-issues.md).
+
+Rettet samtidig: en exec der fejlede ved start (fx mod en container hvis micro-VM stadig
+bootede) efterlod tre blokerede tråde i noden; efter ~170 fejl kunne ingen exec på noden
+længere koble sig på. Nu frigives trådene på alle fejlveje.
+
 **Til dig der bygger selv:** `protobuf-compiler` er nu en build-afhængighed (containerd's gRPC-bindings).
 
 ---

@@ -60,10 +60,18 @@ Svar: `{"exit_code": 0, "stdout": "hej\n", "stderr": "", "duration_ms": 41, "tru
 `exit_code` er `null` og `error` sat hvis processen ikke kunne startes eller blev dræbt ved timeout.
 Output klippes ved 1 MiB (`truncated: true`). `timeout_s` default 120, max 3600.
 
+Udelades `stdin`, læser processen EOF fra `/dev/null` med det samme (som `kubectl exec` uden
+`-i`). `"stdin": ""` giver en tilknyttet, tom stdin der lukkes straks.
+
 **`GET /containers/{id}/stream`** — opgraderes til WebSocket.
 
-Query: `tty=true|false`, `cmd=` (gentages, default `/bin/sh`), `cwd=`, `env=K=V` (gentages),
-`user=`, `cols=`, `rows=`.
+Query: `tty=true|false`, `stdin=true|false` (default `true`), `cmd=` (gentages, default `/bin/sh`),
+`cwd=`, `env=K=V` (gentages), `user=`, `cols=`, `rows=`.
+
+`stdin=false` tilknytter ingen stdin: processen får EOF fra `/dev/null`, stdin-frames ignoreres,
+og noden lukker aldrig stdin gennem containerd. Brug det til kommandoer der ikke læser input —
+på Kata Containers kan output skrevet efter en stdin-lukning ellers gå tabt
+(se [kendte problemer](../troubleshooting/known-issues.md)).
 
 Frames er binære; første byte er kanalen (samme protokol som Kubernetes' `v4.channel.k8s.io`):
 

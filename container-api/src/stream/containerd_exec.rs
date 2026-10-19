@@ -48,6 +48,13 @@ pub struct ExecSpec {
     pub user: Option<String>,
     pub tty: bool,
     pub initial_size: Option<Resize>,
+    /// Attach a stdin stream. `false` is kubectl's `exec` without `-i`: no
+    /// stdin FIFO is created and the process reads EOF from `/dev/null` at
+    /// once, so no `CloseIO` is ever issued for it. That matters on Kata:
+    /// kata-agent (seen on 3.25 and 3.32) cancels the shim's pending stdout
+    /// read when stdin is closed, and whatever the process prints after that
+    /// point is lost. Callers that never write stdin should pass `false`.
+    pub stdin: bool,
 }
 
 /// A running exec process. See module docs.
@@ -257,10 +264,15 @@ impl ContainerdExec {
             std::os::unix::fs::PermissionsExt::from_mode(0o700),
         )?;
 
+        // A TTY always has stdin (it is the terminal). Without one, the caller
+        // decides; see `ExecSpec::stdin`.
+        let with_stdin = spec.tty || spec.stdin;
         let stdin_p = fifo_dir.join("stdin");
         let stdout_p = fifo_dir.join("stdout");
         let stderr_p = fifo_dir.join("stderr");
-        mkfifo(&stdin_p, Mode::S_IRUSR | Mode::S_IWUSR)?;
+        if with_stdin {
+            mkfifo(&stdin_p, Mode::S_IRUSR | Mode::S_IWUSR)?;
+        }
         mkfifo(&stdout_p, Mode::S_IRUSR | Mode::S_IWUSR)?;
         if !spec.tty {
             mkfifo(&stderr_p, Mode::S_IRUSR | Mode::S_IWUSR)?;
@@ -270,9 +282,13 @@ impl ContainerdExec {
         // opens its ends only once the process starts. So open ours on
         // blocking threads now, issue Exec + Start, then collect the opens —
         // the Go client does the same with containerd/fifo, using polling.
-        let open_stdin = {
+        let open_stdin = if with_stdin {
             let p = stdin_p.clone();
-            tokio::task::spawn_blocking(move || std::fs::OpenOptions::new().write(true).open(p))
+            Some(tokio::task::spawn_blocking(move || {
+                std::fs::OpenOptions::new().write(true).open(p)
+            }))
+        } else {
+            None
         };
         let open_stdout = {
             let p = stdout_p.clone();
@@ -291,7 +307,11 @@ impl ContainerdExec {
             container_id: container_id.clone(),
             exec_id: exec_id.clone(),
             terminal: spec.tty,
-            stdin: stdin_p.to_string_lossy().into_owned(),
+            stdin: if with_stdin {
+                stdin_p.to_string_lossy().into_owned()
+            } else {
+                String::new()
+            },
             stdout: stdout_p.to_string_lossy().into_owned(),
             stderr: if spec.tty {
                 String::new()
@@ -335,12 +355,20 @@ impl ContainerdExec {
             ))
             .await;
         if let Err(e) = started {
+            // The opener threads are blocked in open(2) on FIFOs the shim never
+            // touched; unlinking the FIFOs does not wake them. Open the far ends
+            // first or every failed start leaks three blocking-pool threads, and
+            // ~170 failures later no exec on this node can attach stdio at all.
+            unblock_fifos(&fifo_dir, spec.tty);
             inner.cleanup().await;
             return Err(format!("containerd start: {}", e.message()).into());
         }
-        // All three opens must complete now that the shim holds its ends.
+        // All opens must complete now that the shim holds its ends.
         let opened = tokio::time::timeout(FIFO_OPEN_TIMEOUT, async {
-            let stdin = open_stdin.await??;
+            let stdin = match open_stdin {
+                Some(h) => Some(h.await??),
+                None => None,
+            };
             let stdout = open_stdout.await??;
             let stderr = match open_stderr {
                 Some(h) => Some(h.await??),
@@ -371,19 +399,21 @@ impl ContainerdExec {
 
         // ---- IO pumps -------------------------------------------------------
         let (out_tx, out_rx) = mpsc::channel::<(u8, Vec<u8>)>(64);
-        let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(64);
-
-        let mut stdin_f = tokio::fs::File::from_std(stdin_f);
-        let stdin_inner = inner.clone();
-        tokio::spawn(async move {
-            while let Some(chunk) = in_rx.recv().await {
-                if stdin_f.write_all(&chunk).await.is_err() {
-                    break;
+        let in_tx = stdin_f.map(|stdin_f| {
+            let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(64);
+            let mut stdin_f = tokio::fs::File::from_std(stdin_f);
+            let stdin_inner = inner.clone();
+            tokio::spawn(async move {
+                while let Some(chunk) = in_rx.recv().await {
+                    if stdin_f.write_all(&chunk).await.is_err() {
+                        break;
+                    }
                 }
-            }
-            drop(stdin_f);
-            // Tell the shim the client is done writing (EOF in the container).
-            let _ = stdin_inner.close_stdin().await;
+                drop(stdin_f);
+                // Tell the shim the client is done writing (EOF in the container).
+                let _ = stdin_inner.close_stdin().await;
+            });
+            in_tx
         });
 
         spawn_reader(tokio::fs::File::from_std(stdout_f), STDOUT, out_tx.clone());
@@ -396,7 +426,7 @@ impl ContainerdExec {
         Ok(ExecProcess {
             exec_id,
             container_id,
-            stdin: Some(in_tx),
+            stdin: in_tx,
             output: out_rx,
             inner,
         })
@@ -549,7 +579,11 @@ fn build_process_spec(oci: &serde_json::Value, spec: &ExecSpec) -> serde_json::V
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     p["terminal"] = serde_json::Value::Bool(spec.tty);
-    p["args"] = serde_json::json!(spec.cmd);
+    p["args"] = serde_json::json!(if spec.tty || spec.stdin {
+        spec.cmd.clone()
+    } else {
+        without_stdin(&spec.cmd)
+    });
     if let Some(cwd) = &spec.cwd {
         p["cwd"] = serde_json::Value::String(cwd.clone());
     } else if p
@@ -584,7 +618,25 @@ fn build_process_spec(oci: &serde_json::Value, spec: &ExecSpec) -> serde_json::V
     p
 }
 
+/// Run `cmd` with stdin redirected from `/dev/null`.
+///
+/// containerd has no "no stdin" for an exec process: with no FIFO the runc
+/// shim gives the process `/dev/null`, but the Kata agent keeps a pipe open
+/// that only `CloseIO` would ever close — and `cat` then waits forever. The
+/// redirect makes both runtimes behave like `kubectl exec` without `-i`.
+/// `exec` keeps the pid, so signals and `Kill` still reach the real process.
+fn without_stdin(cmd: &[String]) -> Vec<String> {
+    let mut wrapped = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "exec \"$0\" \"$@\" </dev/null".to_string(),
+    ];
+    wrapped.extend(cmd.iter().cloned());
+    wrapped
+}
+
 /// Open-and-close the far ends of our FIFOs so blocked opener threads return.
+/// Missing FIFOs (no stdin attached) are simply skipped.
 fn unblock_fifos(dir: &Path, tty: bool) {
     use std::os::unix::fs::OpenOptionsExt;
     let _ = std::fs::OpenOptions::new()
@@ -631,7 +683,31 @@ mod tests {
             user: Some("1000:1000".into()),
             tty,
             initial_size: None,
+            stdin: true,
         }
+    }
+
+    #[test]
+    fn no_stdin_redirects_from_dev_null() {
+        let mut s = spec(false);
+        s.stdin = false;
+        let p = build_process_spec(&serde_json::Value::Null, &s);
+        assert_eq!(
+            p["args"],
+            serde_json::json!([
+                "/bin/sh",
+                "-c",
+                "exec \"$0\" \"$@\" </dev/null",
+                "sh",
+                "-c",
+                "id"
+            ])
+        );
+        // A TTY is its own stdin: never wrapped.
+        let mut t = spec(true);
+        t.stdin = false;
+        let p = build_process_spec(&serde_json::Value::Null, &t);
+        assert_eq!(p["args"], serde_json::json!(["sh", "-c", "id"]));
     }
 
     #[test]
@@ -695,7 +771,36 @@ mod live {
             user: None,
             tty,
             initial_size: None,
+            stdin: true,
         }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_no_stdin_gets_eof_and_keeps_all_output() {
+        let mut spec = base(
+            &[
+                "/bin/sh",
+                "-c",
+                "cat; for i in 1 2 3 4 5; do echo line $i; sleep 0.05; done",
+            ],
+            false,
+        );
+        spec.stdin = false;
+        let mut p = backend().spawn(spec).await.expect("spawn");
+        assert!(p.stdin.is_none());
+        let mut out = Vec::new();
+        while let Some((ch, b)) = p.output.recv().await {
+            if ch == STDOUT {
+                out.extend(b);
+            }
+        }
+        assert_eq!(p.wait().await.unwrap(), 0);
+        p.finish().await;
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "line 1\nline 2\nline 3\nline 4\nline 5\n"
+        );
     }
 
     #[tokio::test]

@@ -6,6 +6,45 @@ Denne side viser kendte bugs og deres status fra den seneste Mark I test (Januar
 
 ## 🐛 Aktive Bugs
 
+### Exec med stdin: output efter EOF går tabt på Kata Containers
+**Severity:** 🟡 MEDIUM  
+**Status:** Omgået i 0.3.43 for exec uden stdin; exec *med* stdin er stadig berørt  
+**Opdaget:** 19. oktober 2026
+
+**Problem:**
+
+Når stdin lukkes for en proces startet med stdin tilknyttet (stdin-EOF → containerd
+`CloseIO`), afbryder kata-agent shim'ens igangværende læsning af stdout. Alt processen
+skriver efter det tidspunkt går tabt. Set på Kata 3.25.0 og 3.32.0 — upstreams
+"drain after exit" (3.28+) redder kun output der allerede er på vej inden for 500 ms.
+
+```bash
+echo "SELECT 1" | nordkraft exec db --stdin -- psql -U app
+# psql læser stdin til EOF og printer så resultatet → resultatet kan mangle på Kata
+```
+
+**Omgåelse (0.3.43):** En exec *uden* stdin tilknytter ikke længere nogen stdin — processen
+læser EOF fra `/dev/null`, og `CloseIO` kaldes aldrig. Det dækker `nordkraft exec` uden
+`--stdin`, REST-exec uden `stdin`-felt, strømmen med `stdin=false` og Mastras
+`executeCommand`, og gør output komplet på alle runtimes. Brug kun `--stdin` når kommandoen
+skal have input, og giv den helst input på en anden måde (fil, argument, heredoc i `sh -c`).
+
+**Fix:** Kommer. Planen er at føre stdin ind via en FIFO i containeren fra en separat
+exec-proces, så hovedprocessen aldrig får `CloseIO`. Indtil da er `shell`, `--stdin` og
+Mastras `processes.spawn` med stdin de eneste berørte veje. runc-noder er ikke berørt.
+
+**Stor stdin er også skrøbelig på Kata:** læser processen langsommere end noden skubber
+(fx `cat > fil` på virtiofs), skriver kata-agent kun hvad der er plads til i 64 KiB-pipen,
+og shim'en opgiver resten. Så kan `--stdin` med mere end ~64 KiB ende klippet — set på både
+3.25.0 og 3.32.0. Mastra-provideren sender derfor filer via miljøvariabler (32 KiB pr. exec),
+ikke stdin.
+
+**Kata 3.32.0 blev afprøvet 19. oktober 2026 og rullet tilbage samme aften:** den rettede
+ingen af delene, og `nerdctl exec -i` med pipet stdin låste en shim fast (`state unknown`).
+Noderne kører 3.25.0.
+
+---
+
 ### Bug #1: CPU og Memory Limits Anvendes Ikke
 **Severity:** 🔴 HØJ  
 **Status:** Identificeret, fix i gang  

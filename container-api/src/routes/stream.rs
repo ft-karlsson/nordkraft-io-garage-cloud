@@ -51,23 +51,34 @@ pub struct StreamQuery {
     pub user: Option<String>,
     pub cols: Option<u16>,
     pub rows: Option<u16>,
+    /// Attach stdin (default true, as kubectl's `-i`). `stdin=false` gives the
+    /// process EOF from /dev/null and never closes stdin through containerd —
+    /// use it for commands that will not read input. See ExecSpec::stdin.
+    pub stdin: Option<String>,
     /// Internal route only: owner pubkey the controller already verified.
     pub owner: Option<String>,
 }
 
+fn truthy(v: Option<&str>) -> Option<bool> {
+    match v.map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("1") | Some("true") | Some("yes") | Some("on") => Some(true),
+        Some("0") | Some("false") | Some("no") | Some("off") => Some(false),
+        _ => None,
+    }
+}
+
 impl StreamQuery {
     fn is_tty(&self) -> bool {
-        matches!(
-            self.tty
-                .as_deref()
-                .map(|s| s.to_ascii_lowercase())
-                .as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
+        truthy(self.tty.as_deref()).unwrap_or(false)
+    }
+
+    fn wants_stdin(&self) -> bool {
+        truthy(self.stdin.as_deref()).unwrap_or(true)
     }
 
     fn into_spec(self, container: String, owner_pubkey: Option<String>) -> ExecSpec {
         let tty = self.is_tty();
+        let stdin = self.wants_stdin();
         let cmd = if self.cmd.is_empty() {
             vec!["/bin/sh".to_string()]
         } else {
@@ -85,6 +96,7 @@ impl StreamQuery {
                 (Some(width), Some(height)) => Some(Resize { width, height }),
                 _ => None,
             },
+            stdin,
         }
     }
 }
@@ -317,7 +329,10 @@ pub async fn container_exec(
     );
     let pubkey = user.0.wireguard_public_key.clone();
     let env: Vec<String> = req.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    // No `stdin` in the request means the process gets /dev/null; `"stdin": ""`
+    // attaches an empty stream that is closed at once.
     let stdin = req.stdin.map(String::into_bytes);
+    let with_stdin = stdin.is_some();
 
     let (to_session_tx, to_session_rx) = mpsc::channel::<Vec<u8>>(64);
     let (from_session_tx, from_session_rx) = mpsc::channel::<Vec<u8>>(64);
@@ -334,6 +349,7 @@ pub async fn container_exec(
                 user: req.user,
                 tty: false,
                 initial_size: None,
+                stdin: with_stdin,
             };
             let limits = session::Limits {
                 idle: timeout,
@@ -347,7 +363,11 @@ pub async fn container_exec(
             agent_ip,
             agent_port,
         } => {
-            let mut query = vec![("tty", "false".to_string()), ("owner", pubkey)];
+            let mut query = vec![
+                ("tty", "false".to_string()),
+                ("stdin", with_stdin.to_string()),
+                ("owner", pubkey),
+            ];
             for c in &req.cmd {
                 query.push(("cmd", c.clone()));
             }
@@ -536,5 +556,14 @@ mod tests {
     #[test]
     fn urlencode_wg_key() {
         assert_eq!(urlencode("a+b/c="), "a%2Bb%2Fc%3D");
+    }
+
+    #[test]
+    fn stdin_defaults_to_attached() {
+        assert_eq!(truthy(None), None);
+        assert_eq!(truthy(Some("false")), Some(false));
+        assert_eq!(truthy(Some("0")), Some(false));
+        assert_eq!(truthy(Some("TRUE")), Some(true));
+        assert_eq!(truthy(Some("maybe")), None);
     }
 }

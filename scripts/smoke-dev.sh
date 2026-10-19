@@ -160,6 +160,12 @@ printf 'piped\n' | "$NK" exec "$N1" --stdin -- cat | grep -q '^piped$' && ok "ex
 RC=0; "$NK" exec "$N1" --timeout 1 -- sleep 5 >/dev/null 2>&1 || RC=$?; [[ $RC -eq 124 ]] && ok "exec timeout → 124" || fail "exec timeout" "rc=$RC"
 EX=$(curl -fsS -X POST "$API/containers/$N1/exec" -H 'Content-Type: application/json' -d '{"cmd":["sh","-c","pwd; echo $X"],"cwd":"/tmp","env":{"X":"y"}}')
 [[ "$(jq -r .stdout <<<"$EX")" == "/tmp"$'\n'"y" ]] && ok "REST exec honours cwd + env" || fail "REST exec cwd/env" "$EX"
+# output written after the first chunk, and after stdin would have closed, must all arrive
+EX=$(curl -fsS -X POST "$API/containers/$N1/exec" -H 'Content-Type: application/json' -d '{"cmd":["sh","-c","for i in 1 2 3 4 5; do echo line $i; sleep 0.05; done; seq 1 2000 | tail -1"]}')
+[[ "$(jq -r .stdout <<<"$EX")" == $'line 1\nline 2\nline 3\nline 4\nline 5\n2000' ]] && ok "exec keeps every line of output" || fail "exec output truncated" "$EX"
+# no stdin in the request → the process reads EOF at once instead of blocking
+EX=$(curl -fsS -X POST "$API/containers/$N1/exec" -H 'Content-Type: application/json' -d '{"cmd":["sh","-c","cat; echo after"],"timeout_s":10}')
+[[ "$(jq -r .stdout <<<"$EX")" == "after" && "$(jq -r .exit_code <<<"$EX")" == "0" ]] && ok "exec without stdin gets EOF from /dev/null" || fail "exec without stdin blocked" "$EX"
 curl -s -o /dev/null -w '%{http_code}' -X POST "$API/containers/does-not-exist/exec" -H 'Content-Type: application/json' -d '{"cmd":["true"]}' | grep -q 404 && ok "exec on unknown container → 404" || fail "exec 404" ""
 # the shell stream: open a tty session over WebSocket, resize, run a command, read the status frame
 python3 - "$API" "$N1" <<'PY' && ok "PTY stream: resize seen, exit code delivered" || fail "PTY stream" ""

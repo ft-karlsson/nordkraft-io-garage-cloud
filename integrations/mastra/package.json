@@ -1,0 +1,56 @@
+{
+  "name": "@nordkraft/mastra",
+  "version": "0.1.0",
+  "description": "Nordkraft Garage Cloud sandbox provider for Mastra workspaces — sovereign, open-source Kata micro-VM sandboxes",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:live": "NORDKRAFT_LIVE=1 vitest run test/live.test.ts",
+    "example:workspace": "node --import tsx examples/workspace.ts",
+    "example:agent": "node --import tsx examples/agent.ts"
+  },
+  "peerDependencies": {
+    "@mastra/core": ">=1.67.0-0 <2.0.0-0"
+  },
+  "devDependencies": {
+    "@mastra/core": "1.78.0",
+    "@types/node": "^22.20.1",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11",
+    "ws": "^8.18.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ft-karlsson/nordkraft-io-garage-cloud",
+    "directory": "integrations/mastra"
+  },
+  "keywords": [
+    "mastra",
+    "sandbox",
+    "nordkraft",
+    "kata-containers",
+    "agent",
+    "workspace"
+  ]
+}

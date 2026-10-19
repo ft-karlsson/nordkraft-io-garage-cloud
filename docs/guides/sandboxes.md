@@ -109,3 +109,6 @@ forventer: `create` → `POST /containers/deploy` med `lifecycle` og `labels`,
 `exec` → `POST /containers/{id}/exec`, `stop`/`destroy` → de eksisterende
 endpoints, `wait` → `POST /containers/{id}/wait`, og en interaktiv terminal
 → WebSocket på `/containers/{id}/stream`. Se [API-referencen](../reference/api.md#exec-shell-og-wait).
+
+Til Mastra findes en færdig provider, `@nordkraft/mastra`, så en agent kan bruge en
+Nordkraft-container som sin sandbox. Se [Mastra-guiden](mastra.md).

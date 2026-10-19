@@ -188,12 +188,15 @@ pub async fn collect(
     max_bytes: usize,
 ) -> ExecResult {
     let t0 = Instant::now();
+    // Only a caller that attached stdin gets an EOF frame; without stdin the
+    // process reads /dev/null (see ExecSpec::stdin) and the frame would only
+    // trigger a needless CloseIO.
     if let Some(data) = stdin {
         let _ = to_session
             .send(protocol::frame(protocol::STDIN, &data))
             .await;
+        let _ = to_session.send(protocol::frame(protocol::STDIN, &[])).await;
     }
-    let _ = to_session.send(protocol::frame(protocol::STDIN, &[])).await;
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -272,6 +275,7 @@ mod live {
             user: None,
             tty: false,
             initial_size: None,
+            stdin: true,
         }
     }
 

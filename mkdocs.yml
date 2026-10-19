@@ -54,6 +54,7 @@ nav:
     - Persistent storage: guides/storage.md
     - Custom domæner: guides/domains.md
     - Sandboxes (shell, exec, livscyklus): guides/sandboxes.md
+    - Mastra (AI-agenter i en sandbox): guides/mastra.md
   - Reference:
     - CLI kommandoer: reference/cli.md
     - API: reference/api.md

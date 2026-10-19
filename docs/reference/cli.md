@@ -144,7 +144,7 @@ nordkraft exec CONTAINER [FLAG] -- KOMMANDO [ARG...]
 | `--env` | `-e` | - | Miljøvariabel `KEY=VALUE` (kan gentages) |
 | `--user` | | image-default | Kør som `uid[:gid]` |
 | `--timeout` | | `120` | Sekunder før kommandoen dræbes (exit 124) |
-| `--stdin` | | `false` | Send CLI'ens stdin til kommandoen |
+| `--stdin` | | `false` | Send CLI'ens stdin til kommandoen. Uden flaget læser kommandoen EOF fra `/dev/null` |
 
 ```bash
 nordkraft exec myapp -- ls -la /data
