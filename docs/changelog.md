@@ -4,6 +4,20 @@
 
 ---
 
+## Oktober 2026 — v0.3.44
+
+**`exec` holder sin timeout — også på tværs af noder**
+
+En `exec` mod en container på en anden node end controlleren ignorerede `timeout_s`; `sleep 10`
+med timeout 2 kørte alle 10 sekunder. Rettet, og e2e-testen kører nu også relæ-vejen.
+
+**`deploy` med `"wait": true`**
+
+Svarer først når containeren kører og `exec` virker. Uden flaget er deploy som før: svar med det
+samme, hent status med `nordkraft list`. Fundet med den første Mastra-provider mod garagen.
+
+---
+
 ## Oktober 2026 — v0.3.43
 
 **Shell og exec i dine containere**

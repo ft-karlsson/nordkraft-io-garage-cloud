@@ -171,6 +171,14 @@ pub struct DeployRequest {
     pub lifecycle: LifecycleSpec,
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// Block until the container is running (or failed) before answering —
+    /// the sandbox-API contract: when deploy returns, exec works. Remote
+    /// deploys otherwise answer "scheduled" while the agent is still pulling
+    /// the image. Default false keeps the CLI's streaming UX unchanged.
+    #[serde(default)]
+    pub wait: bool,
+    /// Upper bound for `wait`, seconds (default 120, max 600).
+    pub wait_timeout_s: Option<u64>,
 }
 
 // ============= UPGRADE =============

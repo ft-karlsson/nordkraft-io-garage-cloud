@@ -103,6 +103,9 @@ export class NordkraftSandbox extends MastraSandbox<string> {
         image: this.image,
         name: this.container,
         command: ['sleep', 'infinity'],
+        // Sandbox contract: deploy returns when exec works (needs node ≥ 0.3.44).
+        wait: true,
+        wait_timeout_s: 180,
         lifecycle: { restart: 'never', auto_stop: '30m', auto_delete: '2h' },
         labels: { 'mastra.provider': 'nordkraft', 'mastra.sandbox': this.sandboxKey, ...this.labels },
       }),
