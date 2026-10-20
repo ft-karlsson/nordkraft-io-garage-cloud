@@ -335,8 +335,9 @@ impl ContainerdExec {
             ))
             .await;
         if let Err(e) = started {
+            unblock_fifos(&fifo_dir, spec.tty);
             inner.cleanup().await;
-            return Err(format!("containerd start: {}", e.message()).into());
+            return Err(start_error(&spec.cmd[0], e.message()).into());
         }
         // All three opens must complete now that the shim holds its ends.
         let opened = tokio::time::timeout(FIFO_OPEN_TIMEOUT, async {
@@ -584,6 +585,59 @@ fn build_process_spec(oci: &serde_json::Value, spec: &ExecSpec) -> serde_json::V
     p
 }
 
+/// Turn the runtime's Start failure into what a shell would have said.
+///
+/// containerd (and the Kata shim in particular) answer a missing binary with
+/// an Internal error whose message embeds a Go stack trace. Nobody — least
+/// of all a model reading tool output — should see that. "not found" becomes
+/// the shell's own `sh: cmd: not found`; anything else is trimmed to its
+/// first line.
+pub fn start_error(argv0: &str, msg: &str) -> StartError {
+    let first = msg.lines().next().unwrap_or(msg).trim();
+    if first.contains("not found") || first.contains("no such file") {
+        StartError::NotFound(argv0.to_string())
+    } else if first.contains("permission denied") {
+        StartError::NotExecutable(argv0.to_string())
+    } else {
+        // "cannot enter container <id>, with err rpc error: code = Internal desc = …"
+        let desc = first.rsplit("desc = ").next().unwrap_or(first);
+        StartError::Other(desc.to_string())
+    }
+}
+
+/// Why a process could not be started. Mirrors the shell's exit codes so
+/// callers can report it exactly like a failed command.
+#[derive(Debug)]
+pub enum StartError {
+    /// argv[0] does not exist in the container → exit 127
+    NotFound(String),
+    /// argv[0] exists but cannot be executed → exit 126
+    NotExecutable(String),
+    Other(String),
+}
+
+impl StartError {
+    pub fn exit_code(&self) -> Option<i32> {
+        match self {
+            StartError::NotFound(_) => Some(127),
+            StartError::NotExecutable(_) => Some(126),
+            StartError::Other(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartError::NotFound(c) => write!(f, "sh: {c}: not found"),
+            StartError::NotExecutable(c) => write!(f, "sh: {c}: Permission denied"),
+            StartError::Other(m) => write!(f, "cannot start process: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for StartError {}
+
 /// Open-and-close the far ends of our FIFOs so blocked opener threads return.
 fn unblock_fifos(dir: &Path, tty: bool) {
     use std::os::unix::fs::OpenOptionsExt;
@@ -665,6 +719,21 @@ mod tests {
             .unwrap()
             .iter()
             .any(|e| e.as_str().unwrap().starts_with("TERM=")));
+    }
+
+    #[test]
+    fn start_errors_read_like_a_shell() {
+        let kata = "cannot enter container abc, with err rpc error: code = Internal desc = the file mkdir -p /work was not found\n\nStack backtrace:\n   0: <unknown>";
+        let e = start_error("mkdir -p /work", kata);
+        assert_eq!(e.to_string(), "sh: mkdir -p /work: not found");
+        assert_eq!(e.exit_code(), Some(127));
+        let e = start_error("/bin/x", "OCI runtime exec failed: exec failed: unable to start container process: exec: \"/bin/x\": stat /bin/x: no such file or directory");
+        assert_eq!(e.exit_code(), Some(127));
+        let e = start_error("./run.sh", "exec: \"./run.sh\": permission denied");
+        assert_eq!(e.exit_code(), Some(126));
+        let e = start_error("x", "cannot enter container abc, with err rpc error: code = Internal desc = container is paused\nStack backtrace:\n 0: x");
+        assert_eq!(e.to_string(), "cannot start process: container is paused");
+        assert_eq!(e.exit_code(), None);
     }
 
     #[test]

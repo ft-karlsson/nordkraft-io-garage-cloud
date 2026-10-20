@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use super::containerd_exec::{ContainerdExec, ExecSpec};
+use super::containerd_exec::{ContainerdExec, ExecSpec, StartError};
 use super::protocol::{self, Resize, Status};
 
 /// Frames from the client (already stripped of WebSocket envelope).
@@ -53,6 +53,25 @@ pub async fn run(
     let mut proc = match exec.spawn(spec).await {
         Ok(p) => p,
         Err(e) => {
+            // A command the user's own shell would have refused ("not found",
+            // "permission denied") is the user's result, not a node problem:
+            // deliver it exactly as sh would — message on stderr, exit 127/126
+            // — and keep it out of the node's log beyond debug.
+            if let Some(se) = e.downcast_ref::<StartError>() {
+                if let Some(code) = se.exit_code() {
+                    debug!("exec refused by runtime: {se}");
+                    let _ = outgoing
+                        .send(protocol::frame(
+                            protocol::STDERR,
+                            format!("{se}\n").as_bytes(),
+                        ))
+                        .await;
+                    let _ = outgoing
+                        .send(protocol::status_frame(&Status::exited(code)))
+                        .await;
+                    return Some(code);
+                }
+            }
             warn!("exec spawn failed: {e}");
             let _ = outgoing
                 .send(protocol::status_frame(&Status::failed(e.to_string())))

@@ -12,7 +12,7 @@ const t0 = Date.now();
 const start = await sandbox.start();
 console.log('start:', start, `${Date.now() - t0} ms`);
 
-const r1 = await sandbox.executeCommand('sh', ['-c', 'echo hello from $(hostname); python3 --version']);
+const r1 = await sandbox.executeCommand('echo hello from $(hostname); python3 --version'); // shell line, as Mastra sends it
 console.log('exec 1:', r1.exitCode, r1.stdout.trim(), `${r1.executionTimeMs} ms`);
 
 await sandbox.writeFiles([{ path: '/work/hello.py', content: 'import sys; print("args:", sys.argv[1:]); sys.exit(3)\n' }]);
