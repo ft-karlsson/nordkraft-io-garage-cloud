@@ -729,8 +729,17 @@ pub async fn start_container(
         {
             Ok(_) => {
                 if wait_flag(&wait) {
-                    let up = wait_until_up(app_state, orchestrator, &user, &container_id, wait_limit(wait_timeout_s)).await;
-                    return Json(serde_json::json!({"status": if up { "running" } else { "timeout" }}));
+                    let up = wait_until_up(
+                        app_state,
+                        orchestrator,
+                        &user,
+                        &container_id,
+                        wait_limit(wait_timeout_s),
+                    )
+                    .await;
+                    return Json(
+                        serde_json::json!({"status": if up { "running" } else { "timeout" }}),
+                    );
                 }
                 Json(serde_json::json!({"status": "started"}))
             }
@@ -754,7 +763,14 @@ pub async fn start_container(
             serde_json::json!({"status": "start_broadcast"})
         };
         if wait_flag(&wait) {
-            let up = wait_until_up(app_state, orchestrator, &user, &container_id, wait_limit(wait_timeout_s)).await;
+            let up = wait_until_up(
+                app_state,
+                orchestrator,
+                &user,
+                &container_id,
+                wait_limit(wait_timeout_s),
+            )
+            .await;
             let mut v = initiated;
             v["status"] = serde_json::json!(if up { "running" } else { "timeout" });
             return Json(v);
