@@ -1291,6 +1291,8 @@ async fn rocket() -> _ {
                     routes::stream::container_stream,
                     routes::stream::container_exec,
                     routes::stream::container_wait,
+                    routes::stream::container_file_put,
+                    routes::stream::container_file_get,
                     routes::stream::internal_stream,
                     routes::stream::internal_wait,
                     // Node operations

@@ -29,9 +29,11 @@ læser EOF fra `/dev/null`, og `CloseIO` kaldes aldrig. Det dækker `nordkraft e
 `executeCommand`, og gør output komplet på alle runtimes. Brug kun `--stdin` når kommandoen
 skal have input, og giv den helst input på en anden måde (fil, argument, heredoc i `sh -c`).
 
-**Fix:** Kommer. Planen er at føre stdin ind via en FIFO i containeren fra en separat
-exec-proces, så hovedprocessen aldrig får `CloseIO`. Indtil da er `shell`, `--stdin` og
-Mastras `processes.spawn` med stdin de eneste berørte veje. runc-noder er ikke berørt.
+**Fix:** Deploy med `--sandbox`. Så kører nordkraft-sandboxd som PID 1 og serverer exec,
+shell og filer fra indersiden af VM'en — intet går gennem runtimens exec-vej, og stdin, output
+efter EOF og store uploads virker fuldt ud. Det er sådan Mastra-provideren deployer. Problemet
+består kun for `exec`/`shell` med stdin i *almindelige* containere på Kata-noder; runc-noder er
+ikke berørt.
 
 **Stor stdin er også skrøbelig på Kata:** læser processen langsommere end noden skubber
 (fx `cat > fil` på virtiofs), skriver kata-agent kun hvad der er plads til i 64 KiB-pipen,

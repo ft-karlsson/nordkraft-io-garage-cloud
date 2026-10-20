@@ -74,6 +74,13 @@ export interface DeployRequest {
   architecture?: string;
   lifecycle?: LifecycleSpec;
   labels?: Record<string, string>;
+  /**
+   * Run nordkraft-sandboxd as the container's entrypoint: exec, process
+   * streams, PTYs and file transfer are then served from inside the micro-VM
+   * instead of through the runtime's exec path. `command` (if any) runs as
+   * the daemon's child; without one the sandbox idles.
+   */
+  sandbox?: boolean;
 }
 
 export interface DeployResponse {
@@ -226,6 +233,37 @@ export class NordkraftClient {
   /** Long-poll until the container's main process exits. */
   async wait(name: string, timeoutS = 300): Promise<WaitResult> {
     return this.request('POST', `/containers/${encodeURIComponent(name)}/wait?timeout_s=${timeoutS}`);
+  }
+
+  /**
+   * Upload a file into a sandbox (one deployed with `sandbox: true`). The
+   * controller streams it to nordkraft-sandboxd inside the container, which
+   * creates parent directories and writes atomically.
+   */
+  async putFile(name: string, path: string, content: Uint8Array, mode?: number): Promise<{ path: string; bytes: number }> {
+    const qs = new URLSearchParams({ path });
+    if (mode !== undefined) qs.set('mode', mode.toString(8));
+    const url = `${this.apiUrl}/containers/${encodeURIComponent(name)}/files?${qs}`;
+    const res = await this._fetch(url, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: content as unknown as BodyInit,
+    });
+    const text = await res.text();
+    if (!res.ok) throw new NordkraftApiError(`PUT files ${path} → ${res.status}${text ? `: ${text}` : ''}`, res.status, text);
+    return JSON.parse(text) as { path: string; bytes: number };
+  }
+
+  /** Download a file from a sandbox. */
+  async getFile(name: string, path: string): Promise<Buffer> {
+    const qs = new URLSearchParams({ path });
+    const url = `${this.apiUrl}/containers/${encodeURIComponent(name)}/files?${qs}`;
+    const res = await this._fetch(url);
+    if (!res.ok) {
+      const text = await res.text();
+      throw new NordkraftApiError(`GET files ${path} → ${res.status}${text ? `: ${text}` : ''}`, res.status, text);
+    }
+    return Buffer.from(await res.arrayBuffer());
   }
 
   /** WebSocket URL for an exec/shell session. */

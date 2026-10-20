@@ -56,10 +56,10 @@ bruger.
 
 | Mastra | Nordkraft |
 |---|---|
-| `start()` | finder containeren med label `mastra-sandbox-id=<id>`, starter den hvis den er stoppet, ellers `deploy` |
-| `executeCommand()` | `sh -c …` over strømmen, uden stdin |
-| `processes.spawn()` | samme strøm med stdin; `kill()` lukker strømmen, og noden dræber processen |
-| `writeFiles()` | `base64 -d > fil` via den bufferede exec |
+| `start()` | finder containeren med label `mastra-sandbox-id=<id>`, starter den hvis den er stoppet, ellers `deploy` med `sandbox: true` |
+| `executeCommand()` | `sh -c …` over strømmen til nordkraft-sandboxd, uden stdin |
+| `processes.spawn()` | samme strøm med stdin; `kill()` lukker strømmen, og daemonen dræber processen |
+| `writeFiles()` | `PUT /containers/{id}/files` — daemonen skriver filen atomisk inde i VM'en |
 | `stop()` / `destroy()` | `stop` / `rm --force` |
 | `autoStopInterval`, `autoDeleteInterval`, `maxLifetimeMinutes` | containerens [livscyklus](sandboxes.md#livscyklus), som noden selv håndhæver |
 
@@ -103,6 +103,6 @@ NORDKRAFT_API_URL=http://172.20.0.254:8001/api npm run example:workspace
 - Output over 1 MiB pr. kommando klippes (det gælder også `nordkraft exec`).
 - Port-URL'er (`networking.getPortUrl`) peger på container-IP'en på dit WireGuard-net,
   ikke en offentlig adresse. Brug [ingress](domains.md) hvis noget skal være offentligt.
-- På Kata-noder kan output skrevet *efter* at stdin lukkes gå tabt for processer startet
-  *med* stdin (`processes.spawn` + `closeStdin()`). `executeCommand` er ikke berørt.
-  Se [kendte problemer](../troubleshooting/known-issues.md).
+- Provideren bruger nordkraft-sandboxd (deploy med `sandbox: true`). Vil du køre mod en
+  node uden daemonen, sæt `daemon: false`; så gælder begrænsningerne for runtimens exec-vej
+  på Kata, se [kendte problemer](../troubleshooting/known-issues.md).

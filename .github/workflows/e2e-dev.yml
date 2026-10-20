@@ -44,6 +44,15 @@ jobs:
         run: cd container-api && cargo fmt --check
       - name: unit tests
         run: cd container-api && cargo test
+      # nordkraft-sandboxd: static musl binary linked with rustup's rust-lld (no musl-gcc needed)
+      - name: clippy + fmt + tests (sandboxd)
+        run: |
+          cd sandboxd
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+          cargo build --release --target x86_64-unknown-linux-musl
+          file target/x86_64-unknown-linux-musl/release/sandboxd | grep -q 'static'
 
   e2e:
     name: Install dev node + smoke test

@@ -164,7 +164,7 @@ enum Outcome {
 
 /// Buffered, non-interactive exec: run to completion and collect output.
 /// This is what `POST /containers/<id>/exec` returns to Mastra-style callers.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ExecResult {
     pub exit_code: Option<i32>,
     pub stdout: String,

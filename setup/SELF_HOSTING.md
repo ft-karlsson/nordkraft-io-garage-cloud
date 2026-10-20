@@ -172,6 +172,22 @@ configs with `BIND_ADDRESS=127.0.0.1` (or another port) need
 The script is idempotent; re-running keeps existing keys, database password
 and `config.env` unless `--force`.
 
+## Sandboxes: nordkraft-sandboxd on the node
+
+`nordkraft deploy --sandbox` (API `"sandbox": true`) needs the sandbox daemon on every
+node that runs containers. It is a single static binary the agent bind-mounts into each
+sandbox as its entrypoint; the installer does not ship it yet, so build and copy it:
+
+```bash
+cd sandboxd
+cargo build --release --target x86_64-unknown-linux-musl     # or aarch64-unknown-linux-musl
+sudo install -D -m 0755 target/x86_64-unknown-linux-musl/release/sandboxd /opt/nordkraft/sandboxd/sandboxd
+```
+
+The agent looks for it at `SANDBOXD_PATH` (default `/opt/nordkraft/sandboxd/sandboxd`) and
+refuses a `--sandbox` deploy with a clear error when it is missing. Ordinary containers never
+use it. Details in [`sandboxd/README.md`](../sandboxd/README.md).
+
 ## CLI endpoint
 
 ```

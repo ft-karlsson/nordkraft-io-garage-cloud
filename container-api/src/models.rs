@@ -105,6 +105,32 @@ pub struct LifecycleSpec {
     pub max_lifetime: Option<String>,
 }
 
+/// The in-sandbox daemon (nordkraft-sandboxd) a sandbox container runs as
+/// its entrypoint. Present only for containers deployed with `sandbox: true`.
+/// The token is minted by the controller per container, handed to the node
+/// in the deploy, and presented by the controller on every exec, stream or
+/// file transfer. Printed as `<redacted>`.
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DaemonSpec {
+    pub token: String,
+    /// Port the daemon listens on inside the container.
+    #[serde(default = "default_daemon_port")]
+    pub port: u16,
+}
+
+pub fn default_daemon_port() -> u16 {
+    7777
+}
+
+impl std::fmt::Debug for DaemonSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonSpec")
+            .field("token", &"<redacted>")
+            .field("port", &self.port)
+            .finish()
+    }
+}
+
 /// Lifecycle plus free-form labels, as carried on deploy/upgrade.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SandboxSpec {
@@ -112,11 +138,17 @@ pub struct SandboxSpec {
     pub lifecycle: LifecycleSpec,
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// Run nordkraft-sandboxd as the container's entrypoint. Absent for
+    /// ordinary app containers and in messages from older controllers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon: Option<DaemonSpec>,
 }
 
 impl SandboxSpec {
     pub fn is_empty(&self) -> bool {
-        self.lifecycle == LifecycleSpec::default() && self.labels.is_empty()
+        self.lifecycle == LifecycleSpec::default()
+            && self.labels.is_empty()
+            && self.daemon.is_none()
     }
 }
 
@@ -171,6 +203,12 @@ pub struct DeployRequest {
     pub lifecycle: LifecycleSpec,
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// Deploy as a sandbox: the container's entrypoint becomes
+    /// nordkraft-sandboxd, which runs `command` (if any) as a child and serves
+    /// exec, process streams, PTYs and file transfer from inside the micro-VM.
+    /// Without a `command` the sandbox idles and waits for exec.
+    #[serde(default)]
+    pub sandbox: bool,
 }
 
 // ============= UPGRADE =============
@@ -221,6 +259,10 @@ pub struct ContainerConfig {
     pub lifecycle: LifecycleSpec,
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// The sandbox daemon this container runs, with the token the controller
+    /// uses to reach it. Absent for ordinary containers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandboxd: Option<DaemonSpec>,
 }
 
 // ============= NODE =============

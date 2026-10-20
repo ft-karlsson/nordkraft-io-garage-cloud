@@ -1,0 +1,10 @@
+# Static Linux binaries from any host, linked with the lld that ships with
+# rustup — no musl-gcc or cross toolchain needed. The result runs in every
+# image, including distroless ones and Alpine (musl) ones.
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "linker-flavor=ld.lld", "-C", "link-self-contained=yes", "-C", "target-feature=+crt-static"]
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "linker-flavor=ld.lld", "-C", "link-self-contained=yes", "-C", "target-feature=+crt-static"]

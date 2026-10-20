@@ -486,6 +486,12 @@ struct DeployArgs {
     /// Label KEY=VALUE (repeatable); filter with `nordkraft list --label`
     #[arg(long = "label", short = 'l', value_name = "KEY=VALUE")]
     label: Vec<String>,
+
+    /// Deploy as a sandbox: nordkraft-sandboxd becomes the entrypoint and runs
+    /// --command (if any) as a child; exec, shell and files are served from
+    /// inside the micro-VM. Without --command the sandbox idles.
+    #[arg(long)]
+    sandbox: bool,
 }
 
 // ============= INGRESS COMMANDS =============
@@ -1649,6 +1655,8 @@ struct DeployRequest {
     lifecycle: LifecycleSpec,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     labels: HashMap<String, String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    sandbox: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1675,6 +1683,9 @@ struct DeployResponse {
     access_urls: Vec<String>,
     #[serde(default)]
     network_mode: Option<String>,
+    /// The container runs nordkraft-sandboxd as its entrypoint (`--sandbox`).
+    #[serde(default)]
+    sandbox: bool,
 }
 
 // Upgrade
@@ -2451,6 +2462,7 @@ async fn handle_deploy(
                 .iter()
                 .map(|(k, v)| format!("{}={}", k, v))
                 .collect(),
+            sandbox: args.sandbox,
         }
     } else if args.image.is_empty() && !json_output {
         // If no image provided and not JSON mode, offer interactive
@@ -2705,6 +2717,7 @@ async fn handle_deploy(
             &args.max_lifetime,
         ),
         labels: labels_from_flags(&args.label),
+        sandbox: args.sandbox,
     };
 
     if !json_output {
@@ -5735,6 +5748,7 @@ fn prompt_deploy_interactive() -> Result<DeployArgs, Box<dyn std::error::Error>>
         auto_delete: None,
         max_lifetime: None,
         label: vec![],
+        sandbox: false,
     })
 }
 
@@ -5806,6 +5820,7 @@ async fn handle_registry_init(json_output: bool) -> Result<(), Box<dyn std::erro
         hardware_preference: None,
         lifecycle: LifecycleSpec::default(),
         labels: HashMap::new(),
+        sandbox: false,
     };
 
     let url = format!("{}/containers/deploy", *API_BASE_URL);

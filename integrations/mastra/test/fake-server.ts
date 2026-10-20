@@ -40,6 +40,8 @@ export interface StreamOpen {
 export class FakeNordkraft {
   readonly containers = new Map<string, FakeContainer>();
   readonly execCalls: ExecCall[] = [];
+  /** Files uploaded through PUT /containers/:name/files, keyed by "name:path". */
+  readonly files = new Map<string, { bytes: Buffer; mode?: string }>();
   readonly streams: StreamOpen[] = [];
   readonly calls: string[] = [];
   /** Deploy answers `scheduled` and the container only turns Up after this many ms. */
@@ -139,11 +141,31 @@ export class FakeNordkraft {
       });
     }
 
-    const m = /^\/containers\/([^/]+)(?:\/(start|stop|exec|wait))?$/.exec(path);
+    const m = /^\/containers\/([^/]+)(?:\/(start|stop|exec|wait|files))?$/.exec(path);
     if (!m) return this.fail(res, 404, 'no route');
     const name = decodeURIComponent(m[1]!);
     const c = this.containers.get(name);
     const action = m[2];
+
+    if (action === 'files') {
+      if (!c) return this.fail(res, 404, 'container not found');
+      if (!c.deployBody.sandbox) return this.fail(res, 400, 'file transfer needs a sandbox (deploy with "sandbox": true)');
+      const filePath = url.searchParams.get('path') ?? '';
+      if (req.method === 'PUT') {
+        const chunks: Buffer[] = [];
+        for await (const ch of req) chunks.push(ch as Buffer);
+        const bytes = Buffer.concat(chunks);
+        this.files.set(`${name}:${filePath}`, { bytes, mode: url.searchParams.get('mode') ?? undefined });
+        return this.json(res, { path: filePath, bytes: bytes.length });
+      }
+      if (req.method === 'GET') {
+        const f = this.files.get(`${name}:${filePath}`);
+        if (!f) return this.fail(res, 404, 'no such file');
+        res.writeHead(200, { 'content-type': 'application/octet-stream' });
+        res.end(f.bytes);
+        return;
+      }
+    }
 
     if (req.method === 'DELETE' && !action) {
       if (!c) return this.json(res, { error: `Container '${name}' not found` });

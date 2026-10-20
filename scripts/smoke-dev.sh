@@ -201,6 +201,30 @@ for _ in $(seq 1 60); do "$NK" --json list | jq -e --arg n "$NJ" 'map(select(.na
 curl -s -X POST "$API/containers/deploy" -H 'Content-Type: application/json' -d '{"image":"x","lifecycle":{"auto_stop":"soon"}}' | jq -e '.error | test("invalid lifecycle")' >/dev/null && ok "bad duration rejected" || fail "lifecycle validation" ""
 
 # =============================================================================
+step "4c · sandbox: nordkraft-sandboxd as entrypoint"
+# Needs the daemon installed on the node (SANDBOXD_PATH, default /opt/nordkraft/sandboxd/sandboxd).
+OUT=$("$NK" -y --json deploy alpine:3.21 --sandbox --restart never --auto-delete 5m --label smoke=sandbox 2>&1 || true)
+NS=$(jq -r .container_name <<<"$OUT" 2>/dev/null)
+if [[ "$(jq -r .sandbox <<<"$OUT" 2>/dev/null)" == "true" && -n "$NS" && "$NS" != "null" ]]; then
+  ok "sandbox deployed $NS"
+  for _ in $(seq 1 30); do curl -fsS -m 5 -X POST "$API/containers/$NS/exec" -H 'Content-Type: application/json' -d '{"cmd":["true"]}' 2>/dev/null | jq -e '.exit_code == 0' >/dev/null && break; sleep 1; done
+  EX=$(curl -fsS -X POST "$API/containers/$NS/exec" -H 'Content-Type: application/json' -d '{"cmd":["sh","-c","ps -o pid,comm | head -2; cat; echo after"],"timeout_s":10}')
+  [[ "$(jq -r .stdout <<<"$EX")" == *"sandboxd"* && "$(jq -r .stdout <<<"$EX")" == *"after" ]] && ok "sandboxd is PID 1 and exec without stdin gets EOF" || fail "sandbox exec" "$EX"
+  # stdin after EOF and >64 KiB stdin: the cases the runtime exec path loses
+  EX=$(python3 -c "import json;print(json.dumps({'cmd':['sh','-c','n=\$(wc -c); echo got \$n'],'stdin':'x'*300000,'timeout_s':10}))" | curl -fsS -X POST "$API/containers/$NS/exec" -H 'Content-Type: application/json' --data-binary @-)
+  [[ "$(jq -r .stdout <<<"$EX")" == "got 300000" ]] && ok "300 KB stdin arrives whole, output after EOF kept" || fail "sandbox stdin" "$EX"
+  head -c 3000000 /dev/urandom > /tmp/nk-blob; SUM=$(md5sum /tmp/nk-blob | cut -d' ' -f1)
+  curl -fsS -X PUT --data-binary @/tmp/nk-blob "$API/containers/$NS/files?path=/tmp/up/blob.bin&mode=600" | jq -e '.bytes == 3000000' >/dev/null && ok "3 MB file upload" || fail "file upload" ""
+  EX=$(curl -fsS -X POST "$API/containers/$NS/exec" -H 'Content-Type: application/json' -d '{"cmd":["sh","-c","md5sum /tmp/up/blob.bin | cut -d\" \" -f1; stat -c %a /tmp/up/blob.bin"]}')
+  [[ "$(jq -r .stdout <<<"$EX")" == "$SUM"$'\n'"600" ]] && ok "uploaded file intact with mode 600" || fail "upload content" "$EX"
+  curl -fsS "$API/containers/$NS/files?path=/tmp/up/blob.bin" | md5sum | cut -d' ' -f1 | grep -qx "$SUM" && ok "file download matches" || fail "file download" ""
+  rm -f /tmp/nk-blob
+  "$NK" -y rm --force "$NS" >/dev/null || true
+else
+  echo "  – sandbox step skipped (deploy --sandbox failed: $(jq -r '.error // .' <<<"$OUT" 2>/dev/null | head -c 160))"
+fi
+
+# =============================================================================
 step "5 · rm --force is fast"
 S=$(date +%s)
 "$NK" -y rm --force "$N2" >/dev/null && ok "removed $N2" || fail "rm --force failed" ""

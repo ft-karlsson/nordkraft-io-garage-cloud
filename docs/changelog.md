@@ -35,6 +35,17 @@ workspace = "ws-42"
 `nordkraft list --label workspace=ws-42` finder dem igen, og `nordkraft wait myjob` venter på
 at et job bliver færdigt og giver dig dets exit-kode. Se [Sandboxes](guides/sandboxes.md).
 
+**nordkraft-sandboxd: en daemon inde i sandboxen**
+
+`nordkraft deploy alpine --sandbox` (API: `"sandbox": true`) gør en lille statisk daemon til
+containerens PID 1. Den kører `--command` som sit barn og serverer exec, shell, terminaler og
+filoverførsel fra indersiden af micro-VM'en, på containerens egen adresse, med et token pr.
+container. Det er samme model som Daytona og E2B bruger — og det omgår Kata-runtimens
+exec-vej helt, hvor stdin og output efter EOF kunne gå tabt. `nordkraft exec`, `shell` og
+Mastra-provideren vælger daemonen automatisk for sådan en container; nye endpoints
+`PUT/GET /containers/{id}/files` flytter filer ind og ud. Almindelige containere er uændrede.
+Binæren ligger på noden i `/opt/nordkraft/sandboxd/sandboxd` (`SANDBOXD_PATH`).
+
 **Mastra-provider**
 
 `@nordkraft/mastra` (i repoet under `integrations/mastra`) lader en [Mastra](https://mastra.ai)-agent

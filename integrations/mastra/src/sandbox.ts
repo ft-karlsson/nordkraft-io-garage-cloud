@@ -50,8 +50,19 @@ export interface NordkraftSandboxOptions extends Omit<MastraSandboxOptions, 'pro
   sandboxId?: string;
   /** OCI image. Needs `/bin/sh`. @default "alpine:3.21" */
   image?: string;
-  /** Main process; the sandbox lives as long as it does. @default ["tail","-f","/dev/null"] */
+  /**
+   * Main process. With the daemon (default) it runs as the daemon's child and
+   * the sandbox idles when omitted; with `daemon: false` it must keep the
+   * container alive itself. @default ["tail","-f","/dev/null"] when daemon is off
+   */
   command?: string[];
+  /**
+   * Run nordkraft-sandboxd inside the container (deploy `sandbox: true`).
+   * Commands, streams and file uploads then never touch the runtime's exec
+   * path. Set `false` to use plain containers on nodes without the daemon.
+   * @default true
+   */
+  daemon?: boolean;
   resources?: NordkraftResources;
   /**
    * Environment baked into the container at creation and also applied as the
@@ -135,7 +146,9 @@ export class NordkraftSandbox extends MastraSandbox<ContainerInfo> {
   readonly image: string;
   readonly user?: string;
   readonly timeout: number;
-  private readonly command: string[];
+  /** Whether this sandbox runs nordkraft-sandboxd as its entrypoint. */
+  readonly daemon: boolean;
+  private readonly command?: string[];
   private readonly resources?: NordkraftResources;
   private readonly creationEnv: Record<string, string>;
   private readonly labels: Record<string, string>;
@@ -174,7 +187,9 @@ export class NordkraftSandbox extends MastraSandbox<ContainerInfo> {
     this.client = new NordkraftClient({ apiUrl: options.apiUrl, fetch: fetchImpl });
     this.attachName = options.sandboxId;
     this.image = options.image ?? DEFAULT_IMAGE;
-    this.command = options.command ?? DEFAULT_COMMAND;
+    this.daemon = options.daemon ?? true;
+    // Under the daemon an idle sandbox needs no keep-alive process.
+    this.command = options.command ?? (this.daemon ? undefined : DEFAULT_COMMAND);
     this.user = options.user;
     this.timeout = timeout;
     this.resources = options.resources;
@@ -311,7 +326,8 @@ export class NordkraftSandbox extends MastraSandbox<ContainerInfo> {
   protected async create(): Promise<void> {
     const req: DeployRequest = {
       image: this.image,
-      command: this.command,
+      ...(this.command && { command: this.command }),
+      ...(this.daemon && { sandbox: true }),
       ...(Object.keys(this.creationEnv).length > 0 && { env_vars: this.creationEnv }),
       ...(this.ports.length > 0 && { ports: this.ports.map(port => ({ port, protocol: 'tcp' })) }),
       ...(this.resources?.cpu !== undefined && { cpu_limit: this.resources.cpu }),
@@ -514,6 +530,7 @@ export class NordkraftSandbox extends MastraSandbox<ContainerInfo> {
       metadata: {
         apiUrl: this.client.apiUrl,
         image: this.image,
+        daemon: this.daemon,
         lifecycle: this.lifecycle,
         ...(c && {
           containerName: c.name,
@@ -528,7 +545,9 @@ export class NordkraftSandbox extends MastraSandbox<ContainerInfo> {
   getInstructions(): string {
     const parts = [
       `Nordkraft sandbox: an isolated Kata micro-VM container (image ${this.image}) on Nordkraft Garage Cloud, reached over WireGuard.`,
-      'Commands run through /bin/sh; background processes are supported.',
+      this.daemon
+        ? 'Commands run through /bin/sh via the in-sandbox daemon; stdin, background processes and file uploads are fully supported.'
+        : 'Commands run through /bin/sh; background processes are supported.',
     ];
     if (this.workingDirectory) parts.push(`Default working directory: ${this.workingDirectory}.`);
     parts.push(`Command timeout: ${Math.ceil(this.timeout / 1000)}s.`);
@@ -586,8 +605,13 @@ export class NordkraftSandbox extends MastraSandbox<ContainerInfo> {
     const CHUNK = 32 * 1024;
     for (const file of files) {
       const bytes = Buffer.isBuffer(file.content) ? file.content : Buffer.from(file.content);
-      const b64 = bytes.toString('base64');
       const path = file.path.startsWith('/') || !this.workingDirectory ? file.path : `${this.workingDirectory}/${file.path}`;
+      if (this.daemon) {
+        // Native upload: the controller streams the bytes to the daemon in the VM.
+        await this.retryOnDead(() => this.client.putFile(this.containerName, path, bytes, file.mode));
+        continue;
+      }
+      const b64 = bytes.toString('base64');
       const q = shellQuote(path);
       const steps: Array<{ script: string; env?: Record<string, string> }> = [];
       if (b64.length === 0) {

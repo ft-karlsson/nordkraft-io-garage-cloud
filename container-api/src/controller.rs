@@ -974,6 +974,7 @@ fn make_container_upgrade_handler(
                     Some(crate::models::SandboxSpec {
                         lifecycle: config.lifecycle.clone(),
                         labels: config.labels.clone(),
+                        daemon: config.sandboxd.clone(),
                     }),
                     Some(event_tx),
                 )

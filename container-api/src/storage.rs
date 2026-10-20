@@ -1563,6 +1563,7 @@ pub fn merge_upgrade(base: &ContainerConfig, upgrade: &UpgradeRequest) -> Contai
             .labels
             .clone()
             .unwrap_or_else(|| base.labels.clone()),
+        sandboxd: base.sandboxd.clone(), // a sandbox stays a sandbox, same token
     }
 }
 
@@ -1596,5 +1597,6 @@ pub fn build_container_config(
         enable_ipv6,
         lifecycle: sandbox.lifecycle.clone(),
         labels: sandbox.labels.clone(),
+        sandboxd: sandbox.daemon.clone(),
     }
 }

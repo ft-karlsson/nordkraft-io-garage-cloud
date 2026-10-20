@@ -92,3 +92,21 @@ Kald igen mens `timed_out` er `true`. Max 3600 sekunder pr. kald.
 
 Alle tre virker ens uanset hvilken node containeren kører på: controlleren videresender
 strømmen uændret til noden over WireGuard.
+
+### Sandboxes med nordkraft-sandboxd
+
+`POST /containers/deploy` med `"sandbox": true` gør **nordkraft-sandboxd** til containerens
+entrypoint. Daemonen kører `command` (hvis angivet) som sit barn — uden `command` venter
+sandboxen bare på exec — og serverer exec, strømme, terminaler og filer fra *indersiden* af
+micro-VM'en på containerens egen adresse. `exec`, `stream` og `shell` bruger automatisk
+daemonen for sådan en container; intet går gennem runtimens exec-vej, og stdin, output efter
+EOF og store uploads virker fuldt ud også på Kata. Svaret på deploy har `"sandbox": true`.
+
+**`PUT /containers/{id}/files?path=/abs/sti[&mode=755]`** — kun sandboxes. Body er filens
+indhold (op til 256 MiB). Mapper oprettes, filen skrives atomisk. Svar: `{"path": "...", "bytes": 3000000}`.
+
+**`GET /containers/{id}/files?path=/abs/sti`** — streamer filen tilbage. `404` hvis den ikke findes.
+
+Daemonen autentificerer controlleren med et token pr. container, som controlleren opretter ved
+deploy og gemmer i containerens config (`GET /containers/{id}/config` viser det til ejeren).
+Den lytter på port 7777 inde i containeren; porten er kun nåelig fra WireGuard-nettet.

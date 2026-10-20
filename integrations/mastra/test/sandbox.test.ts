@@ -53,13 +53,15 @@ describe('lifecycle', () => {
     expect(c.labels).toEqual({ team: 'x', [SANDBOX_ID_LABEL]: 'test-sandbox' });
     expect(c.deployBody).toMatchObject({
       image: 'alpine:3.21',
-      command: ['tail', '-f', '/dev/null'],
+      sandbox: true,
       cpu_limit: 1,
       memory_limit: '1g',
       volume_size: '2g',
       env_vars: { FOO: 'bar' },
       lifecycle: { restart: 'never', auto_stop: '30m', auto_delete: '120m', max_lifetime: '1440m' },
     });
+    // Under the daemon an idle sandbox needs no keep-alive command.
+    expect(c.deployBody.command).toBeUndefined();
     // The working directory is created through the buffered exec, not the stream.
     expect(api.execCalls.some(e => e.body.cmd[2]?.includes('mkdir -p /workspace'))).toBe(true);
 
@@ -104,6 +106,14 @@ describe('lifecycle', () => {
     const b = make({ id: 'other', sandboxId: a.sandboxId });
     expect(await b.start()).toEqual({ outcome: 'connected' });
     expect(b.sandboxId).toBe(a.sandboxId);
+  });
+
+  it('daemon: false deploys a plain container with a keep-alive command', async () => {
+    const sb = make({ daemon: false });
+    await sb.start();
+    const body = api.containers.get(sb.sandboxId!)!.deployBody;
+    expect(body.sandbox).toBeUndefined();
+    expect(body.command).toEqual(['tail', '-f', '/dev/null']);
   });
 
   it('ephemeral maps to auto_delete 1s', async () => {
@@ -224,8 +234,24 @@ describe('commands over the stream', () => {
 });
 
 describe('writeFiles', () => {
-  it('uploads base64 through env in 32 KiB pieces with mkdir, append and chmod — never stdin', async () => {
+  it('uploads through the sandbox file endpoint when the daemon is on', async () => {
     const sb = make();
+    await sb.start();
+    api.execCalls.length = 0;
+    const big = Buffer.alloc(3 * 1024 * 1024, 9);
+    await sb.writeFiles([
+      { path: 'nested/dir/big.bin', content: big, mode: 0o640 },
+      { path: '/abs/run.sh', content: '#!/bin/sh\necho hi\n' },
+    ]);
+    const stored = api.files.get(`${sb.sandboxId}:/workspace/nested/dir/big.bin`)!;
+    expect(stored.bytes.equals(big)).toBe(true);
+    expect(stored.mode).toBe('640');
+    expect(api.files.get(`${sb.sandboxId}:/abs/run.sh`)!.bytes.toString()).toBe('#!/bin/sh\necho hi\n');
+    expect(api.execCalls).toHaveLength(0);
+  });
+
+  it('falls back to base64 through env in 32 KiB pieces with mkdir, append and chmod — never stdin', async () => {
+    const sb = make({ daemon: false });
     await sb.start();
     api.execCalls.length = 0;
     const big = Buffer.alloc(60 * 1024, 1); // 80 KiB of base64 → three pieces

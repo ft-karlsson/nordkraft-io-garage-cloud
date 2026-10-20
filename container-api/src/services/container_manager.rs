@@ -116,6 +116,9 @@ fn pick_host_port(
         .unwrap_or(wanted)
 }
 
+/// Where the sandbox daemon appears inside a sandbox container.
+pub const SANDBOXD_MOUNT: &str = "/opt/nordkraft/sandboxd";
+
 pub struct ContainerManager {
     runtime_binary: String, // "nerdctl" or "podman"
     use_kata: bool,
@@ -127,6 +130,8 @@ pub struct ContainerManager {
     bridge_publish_addr: String,
     public_host: Option<String>,
     stop_timeout: u32,
+    /// nordkraft-sandboxd binary on this node, bind-mounted into sandboxes.
+    sandboxd_path: String,
 }
 
 impl ContainerManager {
@@ -158,6 +163,7 @@ impl ContainerManager {
             use_kata,
             kata_runtime_class: config.kata_runtime_class.clone(),
             restart_policy: config.container_restart_policy.clone(),
+            sandboxd_path: config.sandboxd_path.clone(),
             persistence: PersistenceManager::new(),
             macvlan: MacvlanManager::with_defaults(),
             network_mode: config.network_mode,
@@ -359,6 +365,33 @@ impl ContainerManager {
         // Add Kata runtime if enabled
         if self.use_kata {
             args.extend_from_slice(&["--runtime".to_string(), self.kata_runtime_class.clone()]);
+        }
+
+        // Sandbox: nordkraft-sandboxd becomes PID 1. The image's command (or
+        // the deploy's `command`) runs as its child; exec, streams, PTYs and
+        // files are served from inside the micro-VM on the container's own
+        // address, so none of it crosses the runtime's exec path. The binary
+        // is mounted read-only outside /tmp (which is noexec here).
+        if let Some(daemon) = &sandbox.daemon {
+            if !std::path::Path::new(&self.sandboxd_path).is_file() {
+                return Err(format!(
+                    "sandbox daemon not installed on this node: {} missing (SANDBOXD_PATH)",
+                    self.sandboxd_path
+                )
+                .into());
+            }
+            args.extend_from_slice(&[
+                "-v".to_string(),
+                format!("{}:{SANDBOXD_MOUNT}:ro", self.sandboxd_path),
+                "--entrypoint".to_string(),
+                SANDBOXD_MOUNT.to_string(),
+                "-e".to_string(),
+                format!("NORDKRAFT_SANDBOX_TOKEN={}", daemon.token),
+                "-e".to_string(),
+                format!("NORDKRAFT_SANDBOX_PORT={}", daemon.port),
+                "--label".to_string(),
+                format!("nordkraft.sandboxd={}", daemon.port),
+            ]);
         }
 
         // Labels for ownership tracking

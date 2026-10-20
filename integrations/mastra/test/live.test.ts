@@ -44,6 +44,17 @@ describe.skipIf(!live)('live Nordkraft sandbox', () => {
       await cat.closeStdin();
       expect((await cat.wait()).stdout).toBe('piped\n');
 
+      // Output printed after stdin EOF, and stdin larger than a pipe buffer:
+      // both were lost through the runtime's exec path on Kata.
+      const after = await sandbox.processes.spawn('n=$(wc -l); seq 1 300 | tail -1; echo got $n lines', { stdinMode: 'pipe' });
+      await after.sendStdin('a\nb\nc\n');
+      await after.closeStdin();
+      expect((await after.wait()).stdout).toBe('300\ngot 3 lines\n');
+      const sink = await sandbox.processes.spawn('cat > /workspace/stdin.bin; wc -c < /workspace/stdin.bin', { stdinMode: 'pipe' });
+      await sink.sendStdin('y'.repeat(600 * 1024));
+      await sink.closeStdin();
+      expect((await sink.wait()).stdout).toBe(`${600 * 1024}\n`);
+
       const slow = await sandbox.executeCommand!('sleep 30', [], { timeout: 1_500 });
       expect(slow.exitCode).toBe(124);
 

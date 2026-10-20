@@ -36,7 +36,7 @@ It runs on hardware you already own. A Raspberry Pi and an old PC are enough. An
 - **IPv4 and IPv6 support** — works out of the box, globally routable when you need it
 - **Optional HTTPS ingress** — real certificates, real domains, when you need them
 - **Bring your own domain** — point `customer1.net` at your container; verification and TLS are handled automatically (see `setup/CUSTOM_DOMAINS.md`)
-- **Sandboxes for AI agents** — `exec`, an interactive shell and a lifecycle (auto-stop, auto-delete) per container, plus a [Mastra](https://mastra.ai) sandbox provider in [`integrations/mastra`](integrations/mastra) — a sovereign, open-source alternative to Daytona or E2B
+- **Sandboxes for AI agents** — `deploy --sandbox` puts [`nordkraft-sandboxd`](sandboxd) (a 1.7 MB static daemon) inside the micro-VM to serve exec, shells, PTYs and file transfer; lifecycle (auto-stop, auto-delete) per container; plus a [Mastra](https://mastra.ai) sandbox provider in [`integrations/mastra`](integrations/mastra) — a sovereign, open-source alternative to Daytona or E2B
 
 ---
 

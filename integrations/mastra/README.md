@@ -54,10 +54,10 @@ the Nordkraft Cloud address) or the `apiUrl` option.
 
 | Mastra | Nordkraft |
 |---|---|
-| `sandbox.start()` | find the container labelled `mastra-sandbox-id=<id>` and start it if stopped, else `POST /containers/deploy` |
-| `executeCommand(cmd)` | `sh -c cmd` over the stream, stdin detached (`stdin=false`) |
+| `sandbox.start()` | find the container labelled `mastra-sandbox-id=<id>` and start it if stopped, else `POST /containers/deploy` with `sandbox: true` |
+| `executeCommand(cmd)` | `sh -c cmd` over the stream to nordkraft-sandboxd, stdin detached (`stdin=false`) |
 | `processes.spawn(cmd)` | same stream, stdin attached; `sendStdin` / `closeStdin` / `kill` map to stdin frames and closing the socket |
-| `writeFiles([...])` | base64 in an environment variable, 32 KiB per buffered exec, decoded with `base64 -d` in the container (no stdin involved, see below) |
+| `writeFiles([...])` | `PUT /containers/{id}/files` — streamed to the daemon, written atomically with the requested mode |
 | `networking.getPortUrl(p)` | `http://<container-ip>:<p>` on your WireGuard network (not public) |
 | `stop()` / `destroy()` | `POST /containers/{id}/stop` / `DELETE /containers/{id}?force=true` |
 | `autoStopInterval`, `autoDeleteInterval`, `maxLifetimeMinutes`, `ephemeral` | the container's `lifecycle` spec, enforced by the node even when your process is gone |
@@ -88,18 +88,21 @@ npm test          # unit tests against a fake controller that runs commands in a
 npm run test:live # against a real controller; deploys and removes one sandbox
 ```
 
-## Notes on stdin and Kata
+## How commands reach the sandbox
 
-A process that is spawned without stdin (`executeCommand`, or `stdinMode: 'ignore'`) reads
-EOF from `/dev/null` straight away and the node never has to close stdin through containerd.
-That matters on Kata Containers: closing stdin there (observed on 3.25 and 3.32) cancels the
-shim's pending stdout read and whatever the process prints afterwards is lost. With stdin
-attached (`processes.spawn` default) `closeStdin()` does go through containerd, so on a Kata
-node output printed *after* EOF may be truncated; output printed before it is fine. Large
-stdin is fragile there too: when the process drains stdin slower than the node pushes it, the
-Kata agent short-writes the 64 KiB pipe and the rest is dropped. That is why `writeFiles`
-never uses stdin. Prefer `executeCommand`, `writeFiles` plus a file redirect, or a heredoc
-for commands that read stdin to EOF and then print. runc nodes are not affected.
+By default the provider deploys with `sandbox: true`, which makes **nordkraft-sandboxd**
+the container's entrypoint: a small static daemon (PID 1) that runs your `command` as a
+child and serves exec, process streams, PTYs and file transfer from inside the micro-VM on
+the container's own address, authenticated with a per-container token. The controller
+relays to it, so nothing a sandbox does goes through the container runtime's exec path.
+That is the same model Daytona and E2B use, and it is what makes stdin, output after EOF
+and large uploads reliable on Kata Containers.
+
+`daemon: false` deploys a plain container instead and falls back to the runtime's exec
+path (`tail -f /dev/null` keeps it alive, `writeFiles` ships base64 through environment
+variables). On Kata that path can lose output printed after stdin EOF and truncate stdin
+larger than one pipe buffer; `executeCommand` is safe either way. Use it only on nodes
+without the daemon installed.
 
 ## License
 

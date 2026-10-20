@@ -68,6 +68,10 @@ pub struct AppConfig {
     // nerdctl's default namespace is "default"; the socket is root-owned.
     pub containerd_socket: String,
     pub containerd_namespace: String,
+    // nordkraft-sandboxd: the static binary bind-mounted into sandbox
+    // containers as their entrypoint, and the port it listens on inside.
+    pub sandboxd_path: String,
+    pub sandboxd_port: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -285,5 +289,11 @@ pub fn init_config() -> AppConfig {
             .unwrap_or_else(|_| "/run/containerd/containerd.sock".to_string()),
         containerd_namespace: env::var("CONTAINERD_NAMESPACE")
             .unwrap_or_else(|_| "default".to_string()),
+        sandboxd_path: env::var("SANDBOXD_PATH")
+            .unwrap_or_else(|_| "/opt/nordkraft/sandboxd/sandboxd".to_string()),
+        sandboxd_port: env::var("SANDBOXD_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(7777),
     }
 }

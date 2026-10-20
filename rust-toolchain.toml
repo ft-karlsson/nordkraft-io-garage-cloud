@@ -10,4 +10,7 @@ targets = [
   "aarch64-unknown-linux-gnu",
   "x86_64-apple-darwin",
   "aarch64-apple-darwin",
+  # sandboxd is a static musl binary, linked with rustup's own rust-lld.
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-musl",
 ]

@@ -51,9 +51,15 @@ pub async fn deploy_container(
         return Json(serde_json::json!({ "error": e }));
     }
     let registry_auth = resolve_registry_auth(pool.inner(), &user.0.id, &deploy_req.image).await;
+    // A sandbox gets nordkraft-sandboxd as its entrypoint and a fresh token the
+    // controller keeps in the stored config and presents on every exec.
     let sandbox = crate::models::SandboxSpec {
         lifecycle: deploy_req.lifecycle.clone(),
         labels: deploy_req.labels.clone(),
+        daemon: deploy_req.sandbox.then(|| crate::models::DaemonSpec {
+            token: new_sandbox_token(),
+            port: app_state.config.sandboxd_port,
+        }),
     };
     if let Some(bad) = [
         &deploy_req.lifecycle.auto_stop,
@@ -252,6 +258,7 @@ pub async fn deploy_container(
                     "container_name": container_name,
                     "container_ip": container_ip,
                     "ports": ports,
+                    "sandbox": sandbox.daemon.is_some(),
                 });
 
                 // Bridge mode: the container IP is internal to the host; what
@@ -350,6 +357,7 @@ pub async fn deploy_container(
                         "garage": target_garage,
                         "node": target_node,
                         "container_name": container_name,
+                        "sandbox": sandbox.daemon.is_some(),
                         "container_ip": allocated_ip.clone().unwrap_or_else(|| "pending".to_string()),
                         "message": "Container scheduled for deployment on remote node. \
                                    Use 'nordkraft list' to check deployment status.",
@@ -997,6 +1005,15 @@ pub async fn upgrade_container(
     }
 }
 
+/// 256 random bits, hex. Lives in the container's environment and the stored
+/// config; only the controller (and the owner, via their config) ever sees it.
+fn new_sandbox_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Credentials for the tenant's own private registry, when the image points at one.
 /// Any other registry (public hostname, or an address the policy rejected) gets None.
 async fn resolve_registry_auth(
@@ -1094,6 +1111,7 @@ async fn upgrade_local(
             Some(crate::models::SandboxSpec {
                 lifecycle: merged.lifecycle.clone(),
                 labels: merged.labels.clone(),
+                daemon: merged.sandboxd.clone(),
             }),
             None, // event_tx — local upgrade, response is synchronous
         )

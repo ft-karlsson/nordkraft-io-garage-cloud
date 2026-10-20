@@ -102,6 +102,21 @@ nordkraft wait app-1234            # blokerer til processen slutter, exit 3
 `wait` returnerer containerens exit-kode (124 hvis `--timeout` løber ud
 først). Sæt `restart = "never"` på jobs — ellers starter platformen dem igen.
 
+## Rigtige sandboxes: `--sandbox`
+
+```bash
+nordkraft deploy python:3.12-alpine --sandbox --auto-stop 15m --auto-delete 1h
+nordkraft exec <navn> -- python3 -c 'print(40+2)'
+echo "data" | nordkraft exec <navn> --stdin -- sh -c 'cat; echo done'
+```
+
+Med `--sandbox` bliver containerens PID 1 **nordkraft-sandboxd**, en lille daemon der kører
+dit `--command` som sit barn (uden `--command` venter sandboxen bare) og serverer exec,
+shell, terminaler og filer fra indersiden af micro-VM'en. Forskellen mærkes på Kata-noder:
+stdin, output efter EOF og store uploads virker fuldt ud, fordi intet går gennem runtimens
+exec-vej. Filer flyttes med `PUT/GET /containers/{id}/files` (se [API](../reference/api.md#sandboxes-med-nordkraft-sandboxd)).
+Almindelige deploys er uændrede.
+
 ## For orkestratorer (Mastra, Daytona-stil)
 
 Begreberne er valgt så de passer direkte på hvad en sandbox-orkestrator

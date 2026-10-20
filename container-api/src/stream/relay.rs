@@ -87,6 +87,41 @@ pub async fn connect_agent(
     Ok(ws)
 }
 
+/// Controller leg to nordkraft-sandboxd inside a sandbox container: same
+/// relay, but authenticated with the container's token.
+pub async fn connect_daemon(
+    url: &str,
+    token: &str,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    ExecError,
+> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = url.into_client_request()?;
+    req.headers_mut().insert(
+        "authorization",
+        format!("Bearer {token}")
+            .parse()
+            .map_err(|_| "token is not a valid header value")?,
+    );
+    let (ws, _resp) = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio_tungstenite::connect_async(req),
+    )
+    .await
+    .map_err(|_| "sandbox did not answer within 10s")??;
+    Ok(ws)
+}
+
+/// The daemon's stream URL. `query` is the client's query, passed through
+/// verbatim — the daemon speaks the same vocabulary as the controller.
+pub fn daemon_stream_url(container_ip: &str, port: u16, query: &str) -> String {
+    format!(
+        "ws://{}:{port}/v1/stream?{query}",
+        host_for_url(container_ip)
+    )
+}
+
 /// Build the agent-side URL for a container stream. `query` is passed through
 /// verbatim — the controller does not reinterpret the client's request.
 pub fn agent_stream_url(agent_ip: &str, agent_port: u16, container: &str, query: &str) -> String {

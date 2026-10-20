@@ -107,13 +107,63 @@ impl StreamQuery {
 
 enum Placement {
     Local,
-    Remote { agent_ip: String, agent_port: u16 },
+    Remote {
+        agent_ip: String,
+        agent_port: u16,
+    },
+    /// A sandbox: talk to nordkraft-sandboxd on the container's own address.
+    /// Nothing here goes through the runtime's exec path.
+    Daemon {
+        ip: String,
+        port: u16,
+        token: String,
+    },
 }
 
-/// Ownership + placement in one step. Local containers are checked against
-/// the runtime's owner label (no DB involved, so dev mode works); remote
-/// ones against the containers table, then the owning node's WG address.
+/// Ownership + placement in one step. Sandboxes (stored config carries a
+/// daemon token) are reached directly; other local containers are checked
+/// against the runtime's owner label (no DB involved, so dev mode works);
+/// remote ones against the containers table, then the owning node's WG address.
 async fn place(
+    container: &str,
+    user: &AuthenticatedUser,
+    app_state: &AppState,
+    orchestrator: &crate::controller::OrchestratorService,
+    pool: &sqlx::PgPool,
+) -> Result<Placement, Refused> {
+    if let Some(p) = place_daemon(container, user, pool).await? {
+        return Ok(p);
+    }
+    place_runtime(container, user, app_state, orchestrator, pool).await
+}
+
+/// The daemon placement alone, when the container is a sandbox.
+async fn place_daemon(
+    container: &str,
+    user: &AuthenticatedUser,
+    pool: &sqlx::PgPool,
+) -> Result<Option<Placement>, Refused> {
+    let cfg = match crate::storage::get_container_config(pool, container, &user.0.id).await {
+        Ok(Some(cfg)) => cfg,
+        _ => return Ok(None),
+    };
+    let Some(daemon) = cfg.sandboxd else {
+        return Ok(None);
+    };
+    let ip = crate::storage::get_container_ipv4(pool, &cfg.container_name, &user.0.id)
+        .await
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?
+        .filter(|ip| !ip.is_empty() && ip != "pending")
+        .ok_or((Status::BadGateway, "sandbox has no address yet".to_string()))?;
+    Ok(Some(Placement::Daemon {
+        ip,
+        port: daemon.port,
+        token: daemon.token,
+    }))
+}
+
+/// Where the runtime runs the container: this node, or a remote agent.
+async fn place_runtime(
     container: &str,
     user: &AuthenticatedUser,
     app_state: &AppState,
@@ -194,6 +244,29 @@ pub async fn container_stream(
     let limits = session::Limits::default();
 
     match placement {
+        Placement::Daemon { ip, port, token } => {
+            let query = origin.query().map(|s| s.as_str()).unwrap_or("");
+            let url = relay::daemon_stream_url(&ip, port, query);
+            info!(
+                "🖥️  stream {} relayed to sandboxd at {}:{} for {}",
+                container, ip, port, user.0.email
+            );
+            let daemon_ws = relay::connect_daemon(&url, &token)
+                .await
+                .map_err(|e| (Status::BadGateway, format!("sandbox: {e}")))?;
+            Ok(ws.channel(move |duplex| {
+                Box::pin(async move {
+                    let (user_to_daemon_tx, user_to_daemon_rx) = mpsc::channel::<Vec<u8>>(64);
+                    let (daemon_to_user_tx, daemon_to_user_rx) = mpsc::channel::<Vec<u8>>(64);
+                    let daemon_side = tokio::spawn(async move {
+                        relay::pump_ws(daemon_ws, daemon_to_user_tx, user_to_daemon_rx).await
+                    });
+                    relay::pump_ws(duplex, user_to_daemon_tx, daemon_to_user_rx).await;
+                    daemon_side.abort();
+                    Ok(())
+                })
+            }))
+        }
         Placement::Local => {
             info!(
                 "🖥️  stream {} local tty={} for {}",
@@ -297,14 +370,18 @@ pub async fn internal_stream(
 // POST /containers/<id>/exec  — buffered
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct ExecRequest {
     pub cmd: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stdin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_s: Option<u64>,
 }
 
@@ -327,6 +404,33 @@ pub async fn container_exec(
             .unwrap_or(EXEC_DEFAULT_TIMEOUT)
             .clamp(1, EXEC_MAX_TIMEOUT),
     );
+    if let Placement::Daemon { ip, port, token } = &placement {
+        // Same request and reply shapes: the daemon is a drop-in for the
+        // containerd path, so the JSON passes straight through.
+        let url = format!("http://{}:{port}/v1/exec", relay::host_for_url(ip));
+        let client = reqwest::Client::builder()
+            .timeout(timeout + Duration::from_secs(15))
+            .build()
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        let resp = client
+            .post(&url)
+            .bearer_auth(token)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| (Status::BadGateway, format!("sandbox: {e}")))?;
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| (Status::BadGateway, e.to_string()))?;
+        if !status.is_success() {
+            return Err((Status::BadGateway, format!("sandbox {status}: {body}")));
+        }
+        let result: session::ExecResult = serde_json::from_str(&body)
+            .map_err(|e| (Status::BadGateway, format!("sandbox reply: {e}")))?;
+        return Ok(Json(result));
+    }
     let pubkey = user.0.wireguard_public_key.clone();
     let env: Vec<String> = req.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
     // No `stdin` in the request means the process gets /dev/null; `"stdin": ""`
@@ -338,6 +442,7 @@ pub async fn container_exec(
     let (from_session_tx, from_session_rx) = mpsc::channel::<Vec<u8>>(64);
 
     match placement {
+        Placement::Daemon { .. } => unreachable!("handled above"),
         Placement::Local => {
             let exec = app_state.exec.clone();
             let spec = ExecSpec {
@@ -440,7 +545,10 @@ pub async fn container_wait(
             .clamp(1, WAIT_MAX_TIMEOUT),
     );
     let pubkey = user.0.wireguard_public_key.clone();
-    match place(&container, &user, app_state, orchestrator, pool).await? {
+    // `wait` is about the container's main process, which the runtime owns
+    // for sandboxes too — so it always takes the runtime placement.
+    match place_runtime(&container, &user, app_state, orchestrator, pool).await? {
+        Placement::Daemon { .. } => unreachable!("place_runtime never yields Daemon"),
         Placement::Local => wait_result(
             app_state
                 .exec
@@ -533,6 +641,124 @@ fn wait_result(
         Err(e) if e.to_string() == "container not found" => Err((Status::NotFound, e.to_string())),
         Err(e) => Err((Status::InternalServerError, e.to_string())),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Files in and out of a sandbox — proxied to nordkraft-sandboxd
+// ---------------------------------------------------------------------------
+
+/// Largest upload accepted in one request (buffered on the controller).
+const FILE_UPLOAD_LIMIT_MIB: u64 = 256;
+
+async fn daemon_placement_or_400(
+    container: &str,
+    user: &AuthenticatedUser,
+    pool: &sqlx::PgPool,
+) -> Result<(String, u16, String), Refused> {
+    match place_daemon(container, user, pool).await? {
+        Some(Placement::Daemon { ip, port, token }) => Ok((ip, port, token)),
+        _ => Err((
+            Status::BadRequest,
+            "file transfer needs a sandbox (deploy with \"sandbox\": true)".into(),
+        )),
+    }
+}
+
+/// `PUT /containers/<id>/files?path=/abs/file[&mode=755]` with the file as the
+/// body. Parent directories are created; the write is atomic on the far end.
+#[put("/containers/<container>/files?<path>&<mode>", data = "<data>")]
+pub async fn container_file_put(
+    container: String,
+    path: String,
+    mode: Option<String>,
+    data: rocket::Data<'_>,
+    user: AuthenticatedUser,
+    pool: &rocket::State<sqlx::PgPool>,
+) -> Result<Json<serde_json::Value>, Refused> {
+    use rocket::data::ToByteUnit;
+    let (ip, port, token) = daemon_placement_or_400(&container, &user, pool).await?;
+    let body = data
+        .open(FILE_UPLOAD_LIMIT_MIB.mebibytes())
+        .into_bytes()
+        .await
+        .map_err(|e| (Status::BadRequest, format!("reading upload: {e}")))?;
+    if !body.is_complete() {
+        return Err((
+            Status::PayloadTooLarge,
+            format!("upload exceeds {FILE_UPLOAD_LIMIT_MIB} MiB"),
+        ));
+    }
+    let mut url = format!(
+        "http://{}:{port}/v1/files?path={}",
+        relay::host_for_url(&ip),
+        urlencode(&path)
+    );
+    if let Some(m) = &mode {
+        url.push_str(&format!("&mode={}", urlencode(m)));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    let resp = client
+        .put(&url)
+        .bearer_auth(&token)
+        .body(body.into_inner())
+        .send()
+        .await
+        .map_err(|e| (Status::BadGateway, format!("sandbox: {e}")))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| (Status::BadGateway, e.to_string()))?;
+    if !status.is_success() {
+        return Err((Status::BadGateway, format!("sandbox {status}: {text}")));
+    }
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| (Status::BadGateway, format!("sandbox reply: {e}")))?;
+    Ok(Json(v))
+}
+
+/// `GET /containers/<id>/files?path=/abs/file` streams the file back.
+#[get("/containers/<container>/files?<path>")]
+pub async fn container_file_get(
+    container: String,
+    path: String,
+    user: AuthenticatedUser,
+    pool: &rocket::State<sqlx::PgPool>,
+) -> Result<rocket::response::stream::ByteStream![Vec<u8>], Refused> {
+    use futures::StreamExt;
+    let (ip, port, token) = daemon_placement_or_400(&container, &user, pool).await?;
+    let url = format!(
+        "http://{}:{port}/v1/files?path={}",
+        relay::host_for_url(&ip),
+        urlencode(&path)
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    let resp = client
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| (Status::BadGateway, format!("sandbox: {e}")))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err((Status::NotFound, "no such file".into()));
+    }
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err((Status::BadGateway, format!("sandbox {status}: {text}")));
+    }
+    let mut chunks = resp.bytes_stream();
+    Ok(rocket::response::stream::ByteStream! {
+        while let Some(Ok(chunk)) = chunks.next().await {
+            yield chunk.to_vec();
+        }
+    })
 }
 
 /// Minimal percent-encoding for query values (WireGuard keys contain '+' and '/').
