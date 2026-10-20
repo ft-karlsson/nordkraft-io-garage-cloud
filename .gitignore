@@ -7,3 +7,4 @@ Claude outputs/
 database-backups-dev/
 *.dump
 *.sql.gz
+dist/
