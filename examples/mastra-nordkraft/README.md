@@ -111,24 +111,30 @@ runc instead of Kata — the API is the same.
 Full details: [`setup/SELF_HOSTING.md`](../../setup/SELF_HOSTING.md).
 
 ```bash
-brew install orbstack
-orb create ubuntu:24.04 nordkraft
+brew install orbstack                # once
+orb create ubuntu:24.04 nordkraft    # once; skip if `orb list` already shows it
 
-# build container-api inside the VM and install it as a dev node (one command, a few minutes)
-REPO=$(pwd)   # run from the repo root
-orb -m nordkraft sudo bash $REPO/scripts/install-node.sh --dev --build-from $REPO
+# from the repo root: build container-api inside the VM and install it as a dev node
+orb -m nordkraft sudo bash $PWD/scripts/install-node.sh --dev --build-from $PWD
+# add --reset to wipe the dev database and containers, --force to rewrite its config
+```
 
-# the CLI on the Mac, pointed at the VM (OrbStack forwards :8001 to localhost)
-cargo build --release -p nordkraft && cp target/release/nordkraft /usr/local/bin/
-nordkraft config set-api http://127.0.0.1:8001
-nordkraft status             # shows "DEV MODE · bridge · no auth"
+The `nordkraft` CLI you already have works against the dev node too; OrbStack
+forwards the VM's :8001 to localhost. `API_BASE_URL` overrides the API for the
+current shell without touching your cloud setting (`nordkraft config set-api`
+makes it sticky, `config reset-api` undoes it):
+
+```bash
+export API_BASE_URL=http://127.0.0.1:8001/api
+nordkraft status                     # shows "DEV MODE · bridge · no auth"
+nordkraft -y deploy nginx:alpine -p 80 && curl -s http://nordkraft.orb.local | head -3
 ```
 
 Then the example, with the API pointed at the VM instead of the cloud:
 
 ```bash
 cd examples/mastra-nordkraft
-cp .env.example .env         # set MISTRAL_API_KEY
+cp .env.example .env                 # set MISTRAL_API_KEY
 npm install
 set -a; . ./.env; set +a
 export NORDKRAFT_API=http://127.0.0.1:8001/api
@@ -138,6 +144,7 @@ npm run agent
 ```
 
 Same output as in A, just faster (no WireGuard hop) and without VM isolation.
+`unset API_BASE_URL NORDKRAFT_API` and you are back on the cloud.
 
 Useful while developing:
 
@@ -148,7 +155,8 @@ orb -m nordkraft sudo bash $REPO/scripts/install-node.sh --dev --reset   # wipe 
 ```
 
 After changing `container-api`, re-run the `install-node.sh --dev --build-from`
-line; it rebuilds and restarts the node.
+line; it rebuilds and restarts the node. (No CLI build needed; if you do want
+a local one: `cd client-cli && cargo build --release`.)
 
 ---
 
