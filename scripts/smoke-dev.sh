@@ -218,6 +218,13 @@ RC=0; "$NK" wait "$NJ" --timeout 60 >/dev/null 2>&1 || RC=$?; [[ $RC -eq 5 ]] &&
 for _ in $(seq 1 60); do "$NK" --json list | jq -e --arg n "$NJ" 'map(select(.name == $n)) | length == 0' >/dev/null && break; sleep 2; done
 "$NK" --json list | jq -e --arg n "$NJ" 'map(select(.name == $n)) | length == 0' >/dev/null && ok "auto_delete removed the job" || fail "auto_delete" "$("$NK" list 2>&1 | head -5)"
 curl -s -X POST "$API/containers/deploy" -H 'Content-Type: application/json' -d '{"image":"x","lifecycle":{"auto_stop":"soon"}}' | jq -e '.error | test("invalid lifecycle")' >/dev/null && ok "bad duration rejected" || fail "lifecycle validation" ""
+# deploy with wait=true must return only when exec works — no sleep in between.
+DW=$(curl -fsS -X POST "$API/containers/deploy" -H 'Content-Type: application/json' -d "{\"image\":\"$IMAGE\",\"wait\":true,\"lifecycle\":{\"restart\":\"never\",\"auto_delete\":\"1h\"}}")
+NW=$(jq -r .container_name <<<"$DW")
+[[ "$(jq -r .status <<<"$DW")" == "deployed" && -n "$NW" && "$NW" != "null" ]] && ok "deploy wait=true → deployed" || fail "deploy wait" "$DW"
+EX=$(curl -fsS -X POST "$API/containers/$NW/exec" -H 'Content-Type: application/json' -d '{"cmd":["sh","-c","echo ready"]}')
+[[ "$(jq -r .stdout <<<"$EX")" == "ready" ]] && ok "exec works immediately after deploy wait=true" || fail "exec right after deploy" "$EX"
+"$NK" -y rm --force "$NW" >/dev/null 2>&1 || true
 
 # =============================================================================
 step "5 · rm --force is fast"

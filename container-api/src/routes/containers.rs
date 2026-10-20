@@ -8,6 +8,7 @@ use crate::storage::build_ipv6_url;
 use crate::storage::*;
 use crate::AppState;
 use rocket::serde::json::Json;
+use std::time::Duration;
 use tracing::{info, warn};
 
 // ============= ROUTES =============
@@ -211,6 +212,29 @@ pub async fn deploy_container(
             .await
         {
             Ok((container_name, _pod_name, container_ip, ports, deployed_ipv6)) => {
+                if deploy_req.wait {
+                    // `nerdctl run -d` has returned, but the runtime listing exec
+                    // resolves through can lag by a moment; make "deployed" mean
+                    // "exec works now" here as well.
+                    let limit =
+                        Duration::from_secs(deploy_req.wait_timeout_s.unwrap_or(120).clamp(1, 600));
+                    let deadline = tokio::time::Instant::now() + limit;
+                    loop {
+                        let seen = app_state
+                            .container_manager
+                            .list_user_containers(&user.0.wireguard_public_key)
+                            .await
+                            .map(|l| {
+                                l.iter()
+                                    .any(|c| c.name == container_name && c.status.starts_with("Up"))
+                            })
+                            .unwrap_or(false);
+                        if seen || tokio::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                }
                 let _ = track_container_deployment(
                     pool.inner(),
                     &container_name,
@@ -345,6 +369,36 @@ pub async fn deploy_container(
                         warn!("Failed to store container config: {}", e);
                     }
 
+                    if deploy_req.wait {
+                        // Sandbox contract: don't answer until the agent reported
+                        // the container running (or failed). The agent's
+                        // ContainerDeploymentResult lands in the DB as the
+                        // status; poll that rather than inventing a new channel.
+                        let limit = Duration::from_secs(
+                            deploy_req.wait_timeout_s.unwrap_or(120).clamp(1, 600),
+                        );
+                        return match wait_for_deploy(pool.inner(), &container_name, limit).await {
+                            DeployOutcome::Running(ip) => Json(serde_json::json!({
+                                "status": "deployed",
+                                "garage": target_garage,
+                                "node": target_node,
+                                "container_name": container_name,
+                                "container_ip": ip.or(allocated_ip).unwrap_or_default(),
+                            })),
+                            DeployOutcome::Failed(msg) => Json(serde_json::json!({
+                                "error": format!("deploy failed on {target_node}: {msg}"),
+                                "container_name": container_name,
+                            })),
+                            DeployOutcome::TimedOut(status) => Json(serde_json::json!({
+                                "error": format!(
+                                    "deploy still '{status}' after {}s — check `nordkraft list`",
+                                    limit.as_secs()
+                                ),
+                                "container_name": container_name,
+                            })),
+                        };
+                    }
+
                     let mut response = serde_json::json!({
                         "status": "scheduled",
                         "garage": target_garage,
@@ -384,6 +438,48 @@ pub async fn deploy_container(
 
 /// `?label=key=value` (repeatable) keeps only containers carrying every
 /// given user label — how an orchestrator finds "its" sandboxes.
+enum DeployOutcome {
+    Running(Option<String>),
+    Failed(String),
+    TimedOut(String),
+}
+
+/// Poll the containers row the agent's deployment result updates.
+async fn wait_for_deploy(pool: &sqlx::PgPool, name: &str, limit: Duration) -> DeployOutcome {
+    let deadline = tokio::time::Instant::now() + limit;
+    let mut last = String::from("deploying");
+    loop {
+        let row: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT status, internal_ip FROM containers WHERE container_name = $1")
+                .bind(name)
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+        if let Some((status, ip)) = row {
+            match status.as_str() {
+                "running" => return DeployOutcome::Running(ip),
+                "error" | "failed" => {
+                    let msg: Option<String> = sqlx::query_scalar(
+                        "SELECT status_message FROM containers WHERE container_name = $1",
+                    )
+                    .bind(name)
+                    .fetch_optional(pool)
+                    .await
+                    .ok()
+                    .flatten();
+                    return DeployOutcome::Failed(msg.unwrap_or(status));
+                }
+                other => last = other.to_string(),
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return DeployOutcome::TimedOut(last);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 #[get("/containers?<label>")]
 pub async fn list_containers_route(
     label: Vec<String>,

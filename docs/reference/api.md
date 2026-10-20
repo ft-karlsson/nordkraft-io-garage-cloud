@@ -47,6 +47,11 @@ Alle requests autentificeres via din WireGuard VPN-forbindelse. Ingen API keys n
 
 Varigheder: `90s`, `15m`, `2h`, `1d` eller sekunder; `0` = aldrig. Samme felter kan sendes til `PUT /containers/{id}/upgrade`. Se [Sandboxes](../guides/sandboxes.md).
 
+`"wait": true` gør kaldet synkront: svaret kommer først når containeren kører og `exec` virker
+(eller med `error` hvis den fejlede). Uden `wait` svarer et deploy til en anden node `"scheduled"`
+med det samme, mens noden stadig henter imaget. `wait_timeout_s` (default 120, max 600) sætter loftet.
+Orkestratorer bør bruge `wait: true` — så er "oprettet" det samme som "klar".
+
 ### Exec, shell og wait
 
 **`POST /containers/{id}/exec`** — ikke-interaktiv, bufferet.
