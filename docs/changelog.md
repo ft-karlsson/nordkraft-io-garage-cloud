@@ -4,6 +4,23 @@
 
 ---
 
+## Oktober 2026 — v0.3.45
+
+**`start` med `?wait=true`**
+
+Samme kontrakt som `deploy`: svaret kommer først når runtime melder containeren `Up`, så en `exec`
+lige efter virker. Uden flaget er start som før (fire-and-forget over NATS). Fundet da Mastra-
+provideren genstartede en sandbox som `auto_stop` havde stoppet, og den første kommando ramte
+Kata-shim'en før containeren var registreret. Provideren bruger nu `start?wait=true` og en
+readiness-probe (`exec true`) før den melder sandboxen klar.
+
+**Fejl fra runtime ser ud som fra en shell**
+
+En kommando der ikke findes gav containerd's fulde fejl med Go-backtrace i stderr og WARN i
+noden's journal. Nu: `sh: x: not found`, exit 127 (126 ved permission denied), og kun debug i loggen.
+
+---
+
 ## Oktober 2026 — v0.3.44
 
 **`exec` holder sin timeout — også på tværs af noder**

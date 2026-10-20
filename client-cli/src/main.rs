@@ -224,6 +224,9 @@ enum Commands {
     Start {
         /// Container name, alias, or omit for interactive selection
         container: Option<String>,
+        /// Return only when the container is running (exec works)
+        #[arg(long)]
+        wait: bool,
     },
     /// Remove a container (shortcut for 'container rm')
     #[command(alias = "rm")]
@@ -360,6 +363,9 @@ enum ContainerCommands {
     Start {
         /// Container name, alias, or omit for interactive selection
         container: Option<String>,
+        /// Return only when the container is running (exec works)
+        #[arg(long)]
+        wait: bool,
     },
     /// Stop a running container
     Stop {
@@ -2001,7 +2007,7 @@ async fn main() {
             handle_logs_interactive(container, lines, json_output).await
         }
         Commands::Stop { container } => handle_stop_interactive(container, json_output).await,
-        Commands::Start { container } => handle_start_interactive(container, json_output).await,
+        Commands::Start { container, wait } => handle_start_interactive(container, wait, json_output).await,
         Commands::Shell { container, cmd } => handle_shell(container, cmd, json_output).await,
         Commands::Exec {
             container,
@@ -2148,9 +2154,9 @@ async fn handle_container(
     match command {
         ContainerCommands::List { label } => handle_container_list(&label, json_output).await,
         ContainerCommands::Deploy(args) => handle_deploy(*args, json_output).await,
-        ContainerCommands::Start { container } => {
+        ContainerCommands::Start { container, wait } => {
             let container = get_container_or_select(container, json_output).await?;
-            handle_container_start(&container, json_output).await
+            handle_container_start(&container, wait, json_output).await
         }
         ContainerCommands::Stop { container } => {
             let container = get_container_or_select(container, json_output).await?;
@@ -2159,7 +2165,7 @@ async fn handle_container(
         ContainerCommands::Restart { container } => {
             let container = get_container_or_select(container, json_output).await?;
             handle_container_stop(&container, json_output).await?;
-            handle_container_start(&container, json_output).await
+            handle_container_start(&container, false, json_output).await
         }
         ContainerCommands::Remove { container, force } => {
             let container = get_container_or_select(container, json_output).await?;
@@ -2253,10 +2259,11 @@ async fn handle_stop_interactive(
 
 async fn handle_start_interactive(
     container: Option<String>,
+    wait: bool,
     json_output: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let container = get_container_or_select(container, json_output).await?;
-    handle_container_start(&container, json_output).await
+    handle_container_start(&container, wait, json_output).await
 }
 
 async fn handle_remove_interactive(
@@ -2892,6 +2899,7 @@ async fn handle_deploy(
 
 async fn handle_container_start(
     container: &str,
+    wait: bool,
     json_output: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = create_client()?;
@@ -2901,7 +2909,11 @@ async fn handle_container_start(
         println!("{}", format!("▶️  Starting {}...", container).cyan());
     }
 
-    let url = format!("{}/containers/{}/start", *API_BASE_URL, container);
+    let url = if wait {
+        format!("{}/containers/{}/start?wait=true", *API_BASE_URL, container)
+    } else {
+        format!("{}/containers/{}/start", *API_BASE_URL, container)
+    };
     let response = client.post(&url).send().await?;
 
     if !response.status().is_success() {
@@ -2914,7 +2926,11 @@ async fn handle_container_start(
     if json_output {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
-        println!("{} Container started", "✅".green().bold());
+        match result.status.as_deref() {
+            Some("running") => println!("{} Container running", "✅".green().bold()),
+            Some("timeout") => println!("{} Start sent, but the container did not report running in time", "⚠️".yellow().bold()),
+            _ => println!("{} Container started", "✅".green().bold()),
+        }
     }
 
     Ok(())

@@ -699,9 +699,14 @@ pub async fn delete_container(
     }
 }
 
-#[post("/containers/<container_id>/start")]
+/// `?wait=true` blocks until the runtime reports the container Up (so an
+/// exec issued right after works), `wait_timeout_s` bounds it (default 60,
+/// max 600). Without it, start is fire-and-forget — same contract as deploy.
+#[post("/containers/<container_id>/start?<wait>&<wait_timeout_s>")]
 pub async fn start_container(
     container_id: String,
+    wait: Option<String>,
+    wait_timeout_s: Option<u64>,
     user: AuthenticatedUser,
     app_state: &rocket::State<AppState>,
     orchestrator: &rocket::State<OrchestratorService>,
@@ -722,7 +727,13 @@ pub async fn start_container(
             .start_container(&container_id, &user.0.wireguard_public_key)
             .await
         {
-            Ok(_) => Json(serde_json::json!({"status": "started"})),
+            Ok(_) => {
+                if wait_flag(&wait) {
+                    let up = wait_until_up(app_state, orchestrator, &user, &container_id, wait_limit(wait_timeout_s)).await;
+                    return Json(serde_json::json!({"status": if up { "running" } else { "timeout" }}));
+                }
+                Json(serde_json::json!({"status": "started"}))
+            }
             Err(e) => Json(serde_json::json!({"error": e.to_string()})),
         }
     } else if let Some(nats) = &orchestrator.nats_service {
@@ -733,17 +744,75 @@ pub async fn start_container(
             owner_pubkey: user.0.wireguard_public_key.clone(),
         };
 
-        if let Some(node_id) = target_node {
+        let initiated = if let Some(node_id) = target_node {
             let _ = nats.send_to_node(&node_id, msg).await;
-            Json(serde_json::json!({"status": "start_initiated", "node": node_id}))
+            serde_json::json!({"status": "start_initiated", "node": node_id})
         } else {
             for node in orchestrator.get_nodes().await {
                 let _ = nats.send_to_node(&node.id, msg.clone()).await;
             }
-            Json(serde_json::json!({"status": "start_broadcast"}))
+            serde_json::json!({"status": "start_broadcast"})
+        };
+        if wait_flag(&wait) {
+            let up = wait_until_up(app_state, orchestrator, &user, &container_id, wait_limit(wait_timeout_s)).await;
+            let mut v = initiated;
+            v["status"] = serde_json::json!(if up { "running" } else { "timeout" });
+            return Json(v);
         }
+        Json(initiated)
     } else {
         Json(serde_json::json!({"error": "NATS required"}))
+    }
+}
+
+fn wait_flag(wait: &Option<String>) -> bool {
+    matches!(
+        wait.as_deref().map(|s| s.to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("")
+    )
+}
+
+fn wait_limit(secs: Option<u64>) -> Duration {
+    Duration::from_secs(secs.unwrap_or(60).clamp(1, 600))
+}
+
+/// Poll the runtime (local list, or every node over NATS on a controller)
+/// until `name` reports `Up …`. True if it did before `limit`.
+async fn wait_until_up(
+    app_state: &rocket::State<AppState>,
+    orchestrator: &rocket::State<OrchestratorService>,
+    user: &AuthenticatedUser,
+    name: &str,
+    limit: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    let is_controller = orchestrator
+        .nats_service
+        .as_ref()
+        .map(|n| n.is_controller())
+        .unwrap_or(false);
+    loop {
+        let list = if is_controller {
+            orchestrator
+                .query_all_nodes_for_containers(&user.0.wireguard_public_key)
+                .await
+        } else {
+            app_state
+                .container_manager
+                .list_user_containers(&user.0.wireguard_public_key)
+                .await
+                .unwrap_or_default()
+        };
+        if list
+            .iter()
+            .any(|c| (c.name == name || c.container_id == name) && c.status.starts_with("Up"))
+        {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 

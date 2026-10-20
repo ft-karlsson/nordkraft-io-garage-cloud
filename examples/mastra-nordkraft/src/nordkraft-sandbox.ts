@@ -83,16 +83,47 @@ export class NordkraftSandbox extends MastraSandbox<string> {
     if (!hit) return undefined;
     this.containerIp = hit.container_ip;
     if (!/^Up/.test(hit.status)) {
-      const r = await fetch(`${this.apiBase}/containers/${hit.name}/start`, { method: 'POST' });
-      if (!r.ok) throw new Error(`nordkraft start: HTTP ${r.status}`);
+      // A sandbox the reaper auto-stopped: start it and wait for the runtime
+      // to report it Up (needs node ≥ 0.3.45; older nodes ignore `wait` and
+      // the readiness probe in connect() covers the gap).
+      const r = await fetch(`${this.apiBase}/containers/${hit.name}/start?wait=true&wait_timeout_s=120`, { method: 'POST' });
+      const body = (await r.json().catch(() => ({}))) as { status?: string; error?: string };
+      if (!r.ok || body.error) throw new Error(`nordkraft start: ${body.error ?? r.status}`);
+      if (body.status === 'timeout') throw new Error(`nordkraft start: ${hit.name} did not come up in time`);
     }
     return hit.name;
   }
 
   protected async connect(handle: string): Promise<void> {
     this.container = handle;
+    await this.waitReady();
     this.status = 'running';
     await this.ensureWorkingDirectory();
+  }
+
+  /** Readiness, the kubelet way: a trivial exec that must succeed. With Kata
+   *  there is a short window after start where the sandbox VM is up but the
+   *  container is not registered in it yet; retry through it instead of
+   *  letting the model see a one-off runtime error. */
+  private async waitReady(timeoutMs = 20_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    let last = '';
+    while (Date.now() < deadline) {
+      try {
+        const res = await fetch(`${this.apiBase}/containers/${this.container}/exec`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ cmd: ['true'], timeout_s: 5 }),
+        });
+        const body = (await res.json()) as { exit_code?: number; stderr?: string; error?: string };
+        if (res.ok && body.exit_code === 0) return;
+        last = body.error ?? body.stderr ?? `HTTP ${res.status}`;
+      } catch (e) {
+        last = String(e);
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    throw new Error(`sandbox ${this.container} not ready: ${last.split('\n')[0]}`);
   }
 
   /** A cwd that does not exist makes every exec fail before it starts;
