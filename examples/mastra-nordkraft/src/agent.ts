@@ -20,7 +20,7 @@ const agent = new Agent({
   name: 'Nordkraft sandbox agent',
   model: process.env.MODEL ?? 'mistral/mistral-medium-latest',
   instructions: [
-    'You have a Linux sandbox (Alpine, python3) reachable through your tools.',
+    'You have a Linux sandbox (Alpine, python3) reachable through your tools. Your working directory is /work (create it with mkdir -p if a command says it is missing).',
     'Do the task by running commands in it. Keep commands short and check their output.',
     'When done, answer with the result only.',
   ].join(' '),
@@ -38,6 +38,10 @@ for (const step of res.steps ?? []) {
   for (const call of step.toolCalls ?? []) {
     const p = call.payload as { toolName?: string; args?: unknown };
     console.log('→ tool', p.toolName, JSON.stringify(p.args ?? {}).slice(0, 160));
+  }
+  for (const result of step.toolResults ?? []) {
+    const p = result.payload as { result?: unknown };
+    console.log('   ←', JSON.stringify(p.result ?? result).slice(0, 300));
   }
 }
 console.log('\nanswer:\n' + res.text);

@@ -92,6 +92,19 @@ export class NordkraftSandbox extends MastraSandbox<string> {
   protected async connect(handle: string): Promise<void> {
     this.container = handle;
     this.status = 'running';
+    await this.ensureWorkingDirectory();
+  }
+
+  /** A cwd that does not exist makes every exec fail before it starts;
+   *  images rarely ship the directory an agent wants, so create it. */
+  private async ensureWorkingDirectory(): Promise<void> {
+    const dir = this.workingDirectory;
+    if (!dir || !this.container) return;
+    await fetch(`${this.apiBase}/containers/${this.container}/exec`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cmd: ['mkdir', '-p', dir], timeout_s: 10 }),
+    });
   }
 
   protected async create(): Promise<void> {
@@ -115,6 +128,7 @@ export class NordkraftSandbox extends MastraSandbox<string> {
     this.container = body.container_name;
     this.containerIp = body.container_ip;
     this.status = 'running';
+    await this.ensureWorkingDirectory();
   }
 
   private get name_(): string {
@@ -140,11 +154,15 @@ export class NordkraftSandbox extends MastraSandbox<string> {
     const env = Object.fromEntries(
       Object.entries({ ...this.getEnv(), ...(options.env ?? {}) }).filter((kv): kv is [string, string] => typeof kv[1] === 'string'),
     );
+    // Mastra's execute_command tool hands the whole shell line as `command`
+    // with no args (its LocalSandbox runs it with shell: true), so pipes,
+    // heredocs and && must work. With explicit args it is argv.
+    const cmd = args.length === 0 ? ['sh', '-c', command] : [command, ...args];
     const res = await fetch(`${this.apiBase}/containers/${this.name_}/exec`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        cmd: [command, ...args],
+        cmd,
         cwd: options.cwd ?? this.workingDirectory,
         env,
         timeout_s: Math.max(1, Math.ceil(timeoutMs / 1000)),
