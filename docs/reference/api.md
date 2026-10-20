@@ -22,7 +22,7 @@ Alle requests autentificeres via din WireGuard VPN-forbindelse. Ingen API keys n
 | `/containers/deploy` | POST | Deploy ny container |
 | `/containers` | GET | List containere |
 | `/containers/{id}/stop` | POST | Stop container |
-| `/containers/{id}/start` | POST | Start container |
+| `/containers/{id}/start` | POST | Start container (`?wait=true` svarer først når den kører) |
 | `/containers/{id}` | DELETE | Slet container |
 | `/containers/{id}/logs` | GET | Hent logs |
 | `/containers/{id}/exec` | POST | Kør én kommando, få output og exit-kode |

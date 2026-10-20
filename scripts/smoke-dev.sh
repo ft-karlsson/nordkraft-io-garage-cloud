@@ -229,6 +229,12 @@ NW=$(jq -r .container_name <<<"$DW")
 [[ "$(jq -r .status <<<"$DW")" == "deployed" && -n "$NW" && "$NW" != "null" ]] && ok "deploy wait=true → deployed" || fail "deploy wait" "$DW"
 EX=$(curl -fsS -X POST "$API/containers/$NW/exec" -H 'Content-Type: application/json' -d '{"cmd":["sh","-c","echo ready"]}')
 [[ "$(jq -r .stdout <<<"$EX")" == "ready" ]] && ok "exec works immediately after deploy wait=true" || fail "exec right after deploy" "$EX"
+# the same contract for start: stop it, start with wait=true, exec at once.
+curl -fsS -X POST "$API/containers/$NW/stop" >/dev/null
+SW=$(curl -fsS -X POST "$API/containers/$NW/start?wait=true&wait_timeout_s=60")
+[[ "$(jq -r .status <<<"$SW")" == "running" ]] && ok "start wait=true → running" || fail "start wait" "$SW"
+EX=$(curl -fsS -X POST "$API/containers/$NW/exec" -H 'Content-Type: application/json' -d '{"cmd":["sh","-c","echo back"]}')
+[[ "$(jq -r .stdout <<<"$EX")" == "back" ]] && ok "exec works immediately after start wait=true" || fail "exec right after start" "$EX"
 "$NK" -y rm --force "$NW" >/dev/null 2>&1 || true
 
 # =============================================================================
