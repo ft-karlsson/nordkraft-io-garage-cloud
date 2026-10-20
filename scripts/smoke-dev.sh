@@ -158,6 +158,31 @@ EX=$("$NK" --json exec "$N1" -- sh -c 'echo out; echo err >&2; exit 3' 2>/dev/nu
 RC=0; "$NK" exec "$N1" -- sh -c 'exit 7' >/dev/null 2>&1 || RC=$?; [[ $RC -eq 7 ]] && ok "CLI exit code mirrors the process" || fail "CLI exec exit code" "rc=$RC"
 printf 'piped\n' | "$NK" exec "$N1" --stdin -- cat | grep -q '^piped$' && ok "exec --stdin" || fail "exec --stdin" ""
 RC=0; "$NK" exec "$N1" --timeout 1 -- sleep 5 >/dev/null 2>&1 || RC=$?; [[ $RC -eq 124 ]] && ok "exec timeout → 124" || fail "exec timeout" "rc=$RC"
+# The relay leg: the controller forwards exec to the agent's internal stream.
+# A hybrid dev node mounts that route too, so drive it directly (dev mode
+# trusts loopback) and make sure the agent — not just the controller —
+# enforces the timeout. Regression: timeout_s was not forwarded, so a
+# remote `sleep 10` with timeout 2 ran for the full 10 s.
+python3 - "$API" "$N1" <<'PY' && ok "relay stream enforces timeout_s on the agent" || fail "relay stream timeout" ""
+import asyncio, json, sys, time
+try:
+    import websockets
+except ImportError:
+    sys.exit(0)
+api, name = sys.argv[1], sys.argv[2]
+url = api.replace("http://", "ws://", 1) + f"/internal/containers/{name}/stream?tty=false&owner=dev_key_placeholder&timeout_s=2&cmd=sleep&cmd=10"
+async def main():
+    t0 = time.time()
+    async with websockets.connect(url) as ws:
+        await ws.send(bytes([0]))  # stdin EOF
+        status = None
+        async for msg in ws:
+            if msg[0] == 3: status = json.loads(msg[1:])
+    took = time.time() - t0
+    assert status and status.get("exit_code") is None and "timeout" in status.get("error", ""), status
+    assert took < 8, f"took {took:.1f}s"
+asyncio.run(main())
+PY
 EX=$(curl -fsS -X POST "$API/containers/$N1/exec" -H 'Content-Type: application/json' -d '{"cmd":["sh","-c","pwd; echo $X"],"cwd":"/tmp","env":{"X":"y"}}')
 [[ "$(jq -r .stdout <<<"$EX")" == "/tmp"$'\n'"y" ]] && ok "REST exec honours cwd + env" || fail "REST exec cwd/env" "$EX"
 curl -s -o /dev/null -w '%{http_code}' -X POST "$API/containers/does-not-exist/exec" -H 'Content-Type: application/json' -d '{"cmd":["true"]}' | grep -q 404 && ok "exec on unknown container → 404" || fail "exec 404" ""

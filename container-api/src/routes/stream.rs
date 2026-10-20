@@ -53,6 +53,10 @@ pub struct StreamQuery {
     pub rows: Option<u16>,
     /// Internal route only: owner pubkey the controller already verified.
     pub owner: Option<String>,
+    /// Session limit in seconds (idle and max). Non-interactive exec passes
+    /// its timeout here so the *agent* kills the process, not just the
+    /// controller giving up on the relay.
+    pub timeout_s: Option<u64>,
 }
 
 impl StreamQuery {
@@ -265,8 +269,14 @@ pub async fn internal_stream(
         _ => return Err((Status::BadRequest, "owner required".into())),
     };
     let exec = app_state.exec.clone();
+    let limits = match q.timeout_s {
+        Some(s) => {
+            let t = Duration::from_secs(s.clamp(1, EXEC_MAX_TIMEOUT));
+            session::Limits { idle: t, max: t }
+        }
+        None => session::Limits::default(),
+    };
     let spec = q.into_spec(container, Some(owner));
-    let limits = session::Limits::default();
     Ok(ws.channel(move |duplex| {
         Box::pin(async move {
             let (to_session_tx, to_session_rx) = mpsc::channel::<Vec<u8>>(64);
@@ -347,7 +357,11 @@ pub async fn container_exec(
             agent_ip,
             agent_port,
         } => {
-            let mut query = vec![("tty", "false".to_string()), ("owner", pubkey)];
+            let mut query = vec![
+                ("tty", "false".to_string()),
+                ("owner", pubkey),
+                ("timeout_s", timeout.as_secs().to_string()),
+            ];
             for c in &req.cmd {
                 query.push(("cmd", c.clone()));
             }
