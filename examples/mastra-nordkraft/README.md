@@ -6,10 +6,43 @@ what to run; every command executes in a container on Nordkraft hardware and
 only its output goes back to the model.
 
 ```
-Mac: Mastra agent ──► Mistral API (inference)
-        │
-        └── REST /exec ──► Nordkraft controller ──► node ──► container
+ your Mac                                   Mistral (cloud)
+┌──────────────────────────────┐            ┌──────────────────────┐
+│ Mastra agent (TypeScript)    │── HTTPS ──►│ inference only:      │
+│  tool: execute_command       │            │ prompt + tool output │
+│  NordkraftSandbox provider   │            │ never a shell        │
+└──────────────┬───────────────┘            └──────────────────────┘
+               │ REST  POST /containers/<id>/exec
+               │ WireGuard tunnel — your key is your identity,
+               │ no API key, no password, kernel-level crypto
+               ▼
+┌──────────────────────────────┐  Nordkraft controller (Raspberry Pi)
+│ container-api :8001          │  WG source IP → user → tenant
+│  owner check on every call   │  timeouts, lifecycle, placement
+└──────────────┬───────────────┘
+               │ WebSocket /api/internal/…  (private LAN/WG)
+               │ trusted only from the controller's IP
+               ▼
+┌──────────────────────────────┐  Nordkraft node (OptiPlex)
+│ container-api agent          │  containerd gRPC: Exec/Start/Wait
+│  nftables per-tenant rules   │  macvlan: container gets a LAN IP
+│  reaper: auto_stop/delete    │
+└──────────────┬───────────────┘
+               │ containerd + Kata shim
+               ▼
+┌──────────────────────────────┐  Kata Containers
+│ microVM, own kernel          │  python:3.12-alpine
+│   sh -c "<agent's command>"  │  stdout/stderr/exit → back up the chain
+└──────────────────────────────┘
 ```
+
+Every hop has its own boundary: TLS to the model (which only ever sees text),
+WireGuard between you and the cloud (the peer key is the credential), the
+controller mapping that key to a tenant and checking ownership, the node
+trusting only the controller for internal calls and fencing tenants with
+nftables, and finally a VM boundary around the container itself — the agent's
+command never shares a kernel with the host or with other tenants. Idle
+sandboxes stop and delete themselves via lifecycle labels.
 
 `src/nordkraft-sandbox.ts` is the whole provider (~170 lines): find-or-create,
 `executeCommand` → `POST /containers/<name>/exec`, `writeFiles` via
