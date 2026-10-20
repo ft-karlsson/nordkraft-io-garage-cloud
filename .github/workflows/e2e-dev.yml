@@ -67,6 +67,7 @@ jobs:
           workspaces: |
             container-api
             client-cli
+            sandboxd
 
       # The repo's .cargo/config.toml names cross-compiler binaries; point
       # them at the native toolchain (the installer does the same).
@@ -85,8 +86,13 @@ jobs:
           sudo apt-get install -y -qq protobuf-compiler >/dev/null
           cd container-api && cargo build --release
 
+      # The sandbox daemon is a static musl binary; the installer mounts it into
+      # `deploy --sandbox` containers (smoke step 4c exercises it on runc).
+      - name: Build sandboxd
+        run: cd sandboxd && cargo build --release --target x86_64-unknown-linux-musl
+
       - name: Install dev node
-        run: sudo bash scripts/install-node.sh --dev --binary "$PWD/container-api/target/release/container-api"
+        run: sudo bash scripts/install-node.sh --dev --binary "$PWD/container-api/target/release/container-api" --sandboxd "$PWD/sandboxd/target/x86_64-unknown-linux-musl/release/sandboxd"
 
       - name: Wait for API
         run: |

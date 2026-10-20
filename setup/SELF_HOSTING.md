@@ -176,7 +176,13 @@ and `config.env` unless `--force`.
 
 `nordkraft deploy --sandbox` (API `"sandbox": true`) needs the sandbox daemon on every
 node that runs containers. It is a single static binary the agent bind-mounts into each
-sandbox as its entrypoint; the installer does not ship it yet, so build and copy it:
+sandbox as its entrypoint. `install-node.sh` installs it next to the node binary:
+
+- from a release: the `sandboxd-linux-<arch>` asset (with checksum) of the same version;
+- `--build-from <repo>`: built from the checkout as well (static musl, needs no extra toolchain);
+- `--sandboxd <path>`: a binary you built yourself, for use with `--binary`.
+
+Manual install is just:
 
 ```bash
 cd sandboxd

@@ -11,9 +11,11 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
+            musl: x86_64-unknown-linux-musl
             os: ubuntu-latest
             platform: linux-x86_64
           - target: aarch64-unknown-linux-gnu
+            musl: aarch64-unknown-linux-musl
             os: ubuntu-latest
             platform: linux-aarch64
 
@@ -41,13 +43,20 @@ jobs:
         mkdir -p ../dist/${{ matrix.platform }}
         cp target/${{ matrix.target }}/release/container-api ../dist/${{ matrix.platform }}/nordkraft
 
-        # Checksum
+        # nordkraft-sandboxd: static musl, linked with rustup's rust-lld (sandboxd/.cargo/config.toml)
+        cd ../sandboxd
+        cargo build --release --target ${{ matrix.musl }}
+        file target/${{ matrix.musl }}/release/sandboxd | grep -q static
+        cp target/${{ matrix.musl }}/release/sandboxd ../dist/${{ matrix.platform }}/sandboxd
+
+        # Checksums
         cd ../dist/${{ matrix.platform }}
         sha256sum nordkraft > nordkraft.sha256
+        sha256sum sandboxd > sandboxd.sha256
 
         # Tarball
         cd ..
-        tar -czf nordkraft-${{ matrix.platform }}.tar.gz -C ${{ matrix.platform }} nordkraft nordkraft.sha256
+        tar -czf nordkraft-${{ matrix.platform }}.tar.gz -C ${{ matrix.platform }} nordkraft nordkraft.sha256 sandboxd sandboxd.sha256
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -87,6 +96,12 @@ jobs:
           [ -f "$binary" ]   && cp "$binary"   "dist/nordkraft-${platform}"
           [ -f "$checksum" ] && cp "$checksum" "dist/nordkraft-${platform}.sha256"
 
+          # The sandbox daemon travels in the same tarball; install-node.sh curls it by name
+          sbx=$(find "$tmpdir" -name "sandboxd" -not -name "*.sha256" | head -1)
+          sbxsum=$(find "$tmpdir" -name "sandboxd.sha256" | head -1)
+          [ -f "$sbx" ]    && cp "$sbx"    "dist/sandboxd-${platform}"
+          [ -f "$sbxsum" ] && cp "$sbxsum" "dist/sandboxd-${platform}.sha256"
+
           rm -rf "$tmpdir"
         done
 
@@ -118,6 +133,11 @@ jobs:
           |----------|--------|----------|
           | Linux x86_64 | nordkraft-linux-x86_64 | nordkraft-linux-x86_64.sha256 |
           | Linux aarch64 (Pi/ARM) | nordkraft-linux-aarch64 | nordkraft-linux-aarch64.sha256 |
+          | Sandbox daemon x86_64 | sandboxd-linux-x86_64 | sandboxd-linux-x86_64.sha256 |
+          | Sandbox daemon aarch64 | sandboxd-linux-aarch64 | sandboxd-linux-aarch64.sha256 |
+
+          `sandboxd` is PID 1 of `nordkraft deploy --sandbox` containers; the installer puts it at
+          `/opt/nordkraft/sandboxd/sandboxd`.
 
           ### Updating an existing server
 
@@ -132,6 +152,10 @@ jobs:
           dist/nordkraft-linux-x86_64.sha256
           dist/nordkraft-linux-aarch64
           dist/nordkraft-linux-aarch64.sha256
+          dist/sandboxd-linux-x86_64
+          dist/sandboxd-linux-x86_64.sha256
+          dist/sandboxd-linux-aarch64
+          dist/sandboxd-linux-aarch64.sha256
           dist/schema.sql
         draft: false
         prerelease: false

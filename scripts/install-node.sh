@@ -20,7 +20,8 @@ set -euo pipefail
 #   --controller <ip>       (agent only) controller's internal IP
 #   --kata                  install Kata Containers for VM isolation (not dev)
 #   --binary <path>         use a locally built binary instead of downloading a release
-#   --build-from <repo>     build container-api from a checkout on this machine (installs rustup + gcc)
+#   --sandboxd <path>       use a locally built nordkraft-sandboxd (static musl) instead of the release asset
+#   --build-from <repo>     build container-api and sandboxd from a checkout on this machine (installs rustup + gcc)
 #   --version <tag>         release tag to download (default: latest)
 #   --bind <addr>           API bind address for --dev (default 127.0.0.1; use 0.0.0.0 for LAN)
 #   --no-systemd            write configs but do not manage services (containers, CI)
@@ -35,6 +36,7 @@ KATA=false
 FORCE=false
 CONTROLLER_IP=""
 LOCAL_BINARY=""
+LOCAL_SANDBOXD=""
 BUILD_FROM=""
 NORDKRAFT_VERSION="${NORDKRAFT_VERSION:-latest}"
 DEV_BIND=""
@@ -50,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --force)       FORCE=true; shift ;;
     --controller)  CONTROLLER_IP="$2"; shift 2 ;;
     --binary)      LOCAL_BINARY="$2"; shift 2 ;;
+    --sandboxd)    LOCAL_SANDBOXD="$2"; shift 2 ;;
     --build-from)  BUILD_FROM="$2"; shift 2 ;;
     --version)     NORDKRAFT_VERSION="$2"; shift 2 ;;
     --bind)        DEV_BIND="$2"; shift 2 ;;
@@ -226,6 +229,14 @@ if [[ -n "$BUILD_FROM" ]]; then
   LOCAL_BINARY="$TARGET_DIR/release/container-api"
   [[ -x "$LOCAL_BINARY" ]] || error "build failed — see output above"
   file "$LOCAL_BINARY" | grep -q "ELF" || error "$LOCAL_BINARY is not a Linux binary"
+  # nordkraft-sandboxd: static musl, linked with rustup's rust-lld (sandboxd/.cargo/config.toml).
+  if [[ -z "$LOCAL_SANDBOXD" && -f "$BUILD_FROM/sandboxd/Cargo.toml" ]]; then
+    MUSL_TARGET="${ARCH}-unknown-linux-musl"
+    log "Building sandboxd from $BUILD_FROM ($MUSL_TARGET)"
+    sudo -u "$BUILD_USER" -H bash -c "'$BUILD_HOME/.cargo/bin/rustup' target add '$MUSL_TARGET' >/dev/null 2>&1; cd '$BUILD_FROM/sandboxd' && CARGO_TARGET_DIR='$TARGET_DIR/sandboxd' '$BUILD_HOME/.cargo/bin/cargo' build --release --target '$MUSL_TARGET' 2>&1 | tail -2"
+    LOCAL_SANDBOXD="$TARGET_DIR/sandboxd/$MUSL_TARGET/release/sandboxd"
+    [[ -x "$LOCAL_SANDBOXD" ]] || error "sandboxd build failed — see output above"
+  fi
 fi
 if [[ -n "$LOCAL_BINARY" ]] && ! file "$LOCAL_BINARY" | grep -q "ELF.*${ARCH/x86_64/x86-64}"; then
   error "--binary $LOCAL_BINARY is not a Linux $ARCH executable: $(file -b "$LOCAL_BINARY" | cut -c1-60)"
@@ -250,6 +261,37 @@ else
   install -m 755 /tmp/nordkraft-new /usr/local/bin/nordkraft-node
   rm -f /tmp/nordkraft-new /tmp/nordkraft-new.sha256
   log "Installed ${NORDKRAFT_VERSION} → /usr/local/bin/nordkraft-node"
+fi
+
+# --- nordkraft-sandboxd ------------------------------------------------------
+# PID 1 of `deploy --sandbox` containers: the agent bind-mounts it read-only
+# into each sandbox. One static binary, same for runc (dev) and Kata nodes.
+# Running sandboxes keep the copy they were started with.
+SANDBOXD_DEST="/opt/nordkraft/sandboxd/sandboxd"
+if [[ -n "$LOCAL_SANDBOXD" ]]; then
+  file "$LOCAL_SANDBOXD" | grep -q "ELF.*${ARCH/x86_64/x86-64}.*static" \
+    || error "--sandboxd $LOCAL_SANDBOXD is not a static Linux $ARCH executable: $(file -b "$LOCAL_SANDBOXD" | cut -c1-70)"
+  install -D -m 755 "$LOCAL_SANDBOXD" "$SANDBOXD_DEST"
+  log "Installed local sandboxd → $SANDBOXD_DEST"
+elif [[ -n "$LOCAL_BINARY" ]]; then
+  # A local node binary without a local daemon: nothing to pair it with.
+  [[ -x "$SANDBOXD_DEST" ]] && log "sandboxd already present at $SANDBOXD_DEST — keep" \
+    || warn "no --sandboxd given: 'deploy --sandbox' will refuse until $SANDBOXD_DEST exists (build it: see sandboxd/README.md)"
+elif [[ -x "$SANDBOXD_DEST" && "$NORDKRAFT_VERSION" == "latest" && ! $FORCE ]]; then
+  log "sandboxd already present — keep"
+else
+  SANDBOXD_URL="https://github.com/${GITHUB_REPO}/releases/download/${NORDKRAFT_VERSION}/sandboxd-linux-${BINARY_ARCH}"
+  if curl -fsSL "$SANDBOXD_URL" -o /tmp/sandboxd-new 2>/dev/null \
+     && curl -fsSL "${SANDBOXD_URL}.sha256" -o /tmp/sandboxd-new.sha256 2>/dev/null; then
+    EXPECTED=$(awk '{print $1}' /tmp/sandboxd-new.sha256)
+    ACTUAL=$(sha256sum /tmp/sandboxd-new | awk '{print $1}')
+    [[ "$EXPECTED" == "$ACTUAL" ]] || error "sandboxd checksum mismatch"
+    install -D -m 755 /tmp/sandboxd-new "$SANDBOXD_DEST"
+    log "Installed sandboxd ${NORDKRAFT_VERSION} → $SANDBOXD_DEST"
+  else
+    warn "release ${NORDKRAFT_VERSION} has no sandboxd asset; 'deploy --sandbox' needs $SANDBOXD_DEST (see sandboxd/README.md)"
+  fi
+  rm -f /tmp/sandboxd-new /tmp/sandboxd-new.sha256
 fi
 
 mkdir -p "$NORDKRAFT_DIR" "$NORDKRAFT_DATA" "$NORDKRAFT_LOG"
