@@ -186,6 +186,11 @@ PY
 EX=$(curl -fsS -X POST "$API/containers/$N1/exec" -H 'Content-Type: application/json' -d '{"cmd":["sh","-c","pwd; echo $X"],"cwd":"/tmp","env":{"X":"y"}}')
 [[ "$(jq -r .stdout <<<"$EX")" == "/tmp"$'\n'"y" ]] && ok "REST exec honours cwd + env" || fail "REST exec cwd/env" "$EX"
 curl -s -o /dev/null -w '%{http_code}' -X POST "$API/containers/does-not-exist/exec" -H 'Content-Type: application/json' -d '{"cmd":["true"]}' | grep -q 404 && ok "exec on unknown container → 404" || fail "exec 404" ""
+# A missing binary is the user's result, reported like a shell: exit 127 on
+# stderr, no runtime internals, nothing above debug in the node log.
+EX=$(curl -fsS -X POST "$API/containers/$N1/exec" -H 'Content-Type: application/json' -d '{"cmd":["no-such-binary-xyz","--flag"]}')
+[[ "$(jq -r .exit_code <<<"$EX")" == "127" && "$(jq -r .stderr <<<"$EX")" == "sh: no-such-binary-xyz: not found" ]] && ok "missing binary → exit 127, shell-style stderr" || fail "missing binary reporting" "$EX"
+jq -e '.stderr | test("backtrace|containerd|rpc error") | not' <<<"$EX" >/dev/null && ok "no runtime internals in exec output" || fail "runtime internals leaked" "$EX"
 # the shell stream: open a tty session over WebSocket, resize, run a command, read the status frame
 python3 - "$API" "$N1" <<'PY' && ok "PTY stream: resize seen, exit code delivered" || fail "PTY stream" ""
 import asyncio, json, sys
