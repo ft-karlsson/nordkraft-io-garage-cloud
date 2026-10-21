@@ -62,6 +62,59 @@ async fn write_pull_credentials(
     Ok(dir)
 }
 
+/// OCI architecture name for a Rust `target_arch`.
+fn oci_arch(rust_arch: &str) -> &str {
+    match rust_arch {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "powerpc64" => "ppc64le",
+        other => other,
+    }
+}
+
+fn host_oci_arch() -> &'static str {
+    oci_arch(std::env::consts::ARCH)
+}
+
+/// User-facing message when an image (`os/arch`, e.g. `linux/arm64`) can't run
+/// on this node; None when it matches or the platform is unknown.
+fn arch_mismatch_message(image_platform: &str, host_arch: &str) -> Option<String> {
+    let image_arch = image_platform
+        .rsplit('/')
+        .next()
+        .unwrap_or(image_platform)
+        .trim();
+    if image_arch.is_empty() || image_arch == "unknown" || image_arch == host_arch {
+        return None;
+    }
+    Some(format!(
+        "Wrong architecture: image is {image_platform}, this node is linux/{host_arch}. \
+         Rebuild with --platform linux/{host_arch} \
+         (e.g. nerdctl build --platform linux/{host_arch} ...)"
+    ))
+}
+
+/// One-line reason for a container that exited right after start.
+fn start_failure_message(exit_code: &str, logs: &str) -> String {
+    let tail: Vec<&str> = logs
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let tail = tail[tail.len().saturating_sub(3)..].join(" | ");
+    let code = if exit_code.is_empty() {
+        String::new()
+    } else {
+        format!(" (exit code {exit_code})")
+    };
+    if tail.is_empty() {
+        format!("Container exited right after start{code} with no output")
+    } else {
+        let tail: String = tail.chars().take(300).collect();
+        format!("Container exited right after start{code}: {tail}")
+    }
+}
+
 fn emit(
     tx: &Option<DeployEventTx>,
     container_name: &str,
@@ -603,24 +656,37 @@ impl ContainerManager {
             true,
         );
 
+        // ========== PLATFORM CHECK ==========
+        // A single-arch image for another CPU (e.g. built on an Apple Silicon Mac)
+        // pulls fine and `run -d` succeeds, but the process dies at exec with no
+        // output — which used to surface as "IPv4 assignment failed".
+        if let Some(platform) = self.image_platform(image).await {
+            if let Some(msg) = arch_mismatch_message(&platform, host_oci_arch()) {
+                error!("{} ({})", msg, image);
+                emit(&event_tx, &container_name, "failed", &msg, false);
+                let _ = tokio::process::Command::new(&self.runtime_binary)
+                    .args(["rm", "-f", &container_name])
+                    .output()
+                    .await;
+                return Err(msg.into());
+            }
+        }
+
         // ========== IPv4 VERIFICATION ==========
         // Get container IPv4 from the macvlan network
         let container_ip = match self.macvlan.get_container_ipv4(&container_name).await? {
             Some(ip) => ip,
             None => {
-                error!("Failed to get IPv4 from container. Removing...");
-                emit(
-                    &event_tx,
-                    &container_name,
-                    "failed",
-                    "IPv4 assignment failed",
-                    false,
-                );
+                // No IP almost always means the container already exited.
+                // Capture why before `rm -f` throws the evidence away.
+                let reason = self.describe_start_failure(&container_name).await;
+                error!("Failed to get IPv4 from container: {}. Removing...", reason);
+                emit(&event_tx, &container_name, "failed", &reason, false);
                 let _ = tokio::process::Command::new(&self.runtime_binary)
                     .args(["rm", "-f", &container_name])
                     .output()
                     .await;
-                return Err("Container IPv4 assignment failed".into());
+                return Err(reason.into());
             }
         };
 
@@ -722,6 +788,64 @@ impl ContainerManager {
         };
 
         vec!["-v".to_string(), mount_spec]
+    }
+
+    /// `os/arch` of a local image (e.g. `linux/arm64`), or None if it can't be read.
+    async fn image_platform(&self, image: &str) -> Option<String> {
+        let out = tokio::process::Command::new(&self.runtime_binary)
+            .args([
+                "image",
+                "inspect",
+                "--format",
+                "{{.Os}}/{{.Architecture}}",
+                image,
+            ])
+            .output()
+            .await
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let platform = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!platform.is_empty()).then_some(platform)
+    }
+
+    /// Best-effort explanation for a container that has no IP right after start:
+    /// exit code plus the tail of its output.
+    async fn describe_start_failure(&self, container_name: &str) -> String {
+        let state = tokio::process::Command::new(&self.runtime_binary)
+            .args([
+                "inspect",
+                "--format",
+                "{{.State.Status}} {{.State.ExitCode}}",
+                container_name,
+            ])
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let (status, exit_code) = state.split_once(' ').unwrap_or((state.as_str(), ""));
+
+        if status == "running" {
+            return "IPv4 assignment failed (container is running but has no address)".into();
+        }
+
+        let logs = tokio::process::Command::new(&self.runtime_binary)
+            .args(["logs", "--tail", "20", container_name])
+            .output()
+            .await
+            .map(|o| {
+                format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                )
+            })
+            .unwrap_or_default();
+
+        start_failure_message(exit_code, &logs)
     }
 
     /// List user's containers
@@ -1653,5 +1777,50 @@ mod sandbox_label_tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got["workspace"], "ws-1");
         assert_eq!(got["tier"], "a=b");
+    }
+}
+
+#[cfg(test)]
+mod start_failure_tests {
+    use super::*;
+
+    #[test]
+    fn arm64_image_on_amd64_node_is_rejected() {
+        let msg = arch_mismatch_message("linux/arm64", "amd64").unwrap();
+        assert!(msg.contains("image is linux/arm64"));
+        assert!(msg.contains("this node is linux/amd64"));
+        assert!(msg.contains("--platform linux/amd64"));
+    }
+
+    #[test]
+    fn matching_or_unknown_arch_passes() {
+        assert!(arch_mismatch_message("linux/amd64", "amd64").is_none());
+        assert!(arch_mismatch_message("linux/arm64", "arm64").is_none());
+        assert!(arch_mismatch_message("", "amd64").is_none());
+        assert!(arch_mismatch_message("linux/unknown", "amd64").is_none());
+    }
+
+    #[test]
+    fn rust_arch_maps_to_oci() {
+        assert_eq!(oci_arch("x86_64"), "amd64");
+        assert_eq!(oci_arch("aarch64"), "arm64");
+        assert_eq!(oci_arch("riscv64"), "riscv64");
+    }
+
+    #[test]
+    fn start_failure_keeps_last_three_lines() {
+        let logs = "boot\n\nline a\nline b\nfatal: config invalid\n";
+        assert_eq!(
+            start_failure_message("1", logs),
+            "Container exited right after start (exit code 1): line a | line b | fatal: config invalid"
+        );
+    }
+
+    #[test]
+    fn start_failure_without_output() {
+        assert_eq!(
+            start_failure_message("", "\n \n"),
+            "Container exited right after start with no output"
+        );
     }
 }
