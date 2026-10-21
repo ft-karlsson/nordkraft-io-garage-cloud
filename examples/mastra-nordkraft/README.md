@@ -51,8 +51,12 @@ exec+stdin, lifecycle labels so an idle sandbox stops and cleans itself up.
 Two ways to try it: against Nordkraft Cloud (A), or against a dev node running
 locally on your Mac (B). The example is the same; only `NORDKRAFT_API` changes.
 
-Prerequisites for both: Node 20+, and a Mistral API key from
-<https://console.mistral.ai> (a plain API key, not a workspace key).
+Prerequisites for both:
+
+- Node 20+ with npm — on a Mac: `brew install node` (a fresh Mac has neither)
+- the `nordkraft` CLI, 0.3.45 or newer: `curl -fsSL https://cloud.nordkraft.io/install.sh | sh`,
+  then `nordkraft --version` (an older copy already on the PATH shadows the new one)
+- a Mistral API key from <https://console.mistral.ai> (a plain API key, not a workspace key)
 
 ---
 
