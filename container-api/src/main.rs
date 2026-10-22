@@ -574,10 +574,11 @@ async fn nft_add_tenant_rule(
 async fn nft_remove_tenant_rule(
     user_slot: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Find the rule handle, then delete by handle
+    // Find the rule handle, then delete by handle. Match the quoted comment
+    // exactly: a bare 'tenant-1' also matches tenant-10 … tenant-19.
     let output = tokio::process::Command::new("bash")
         .args(["-c", &format!(
-            "nft -a list chain inet filter forward | grep 'tenant-{}' | grep -oP 'handle \\K[0-9]+'",
+            "nft -a list chain inet filter forward | grep -F 'comment \"tenant-{}\"' | grep -oP 'handle \\K[0-9]+'",
             user_slot
         )])
         .output()
@@ -830,6 +831,170 @@ async fn admin_deprovision_tenant(
             }))
         }
     }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+struct TenantPurgeAdminRequest {
+    user_id: String,
+    /// Must repeat the user's email for a real purge, so an id typo cannot
+    /// remove someone else.
+    #[serde(default)]
+    confirm_email: String,
+    /// Defaults to true: report everything that would be removed, change nothing.
+    #[serde(default = "default_true")]
+    dry_run: bool,
+}
+
+/// Remove a tenant completely: ingress, custom domains, IPv6 firewall rules,
+/// containers + volumes + volume backups on every node, WireGuard peer, nft
+/// rule, then all DB rows. Dry run by default. Safe to re-run after a partial
+/// failure; DB rows go only when every step succeeded. See services/tenant_purge.rs.
+#[post("/admin/tenant/purge", data = "<req>")]
+async fn admin_purge_tenant(
+    _admin: AdminAuth,
+    req: Json<TenantPurgeAdminRequest>,
+    app_state: &rocket::State<AppState>,
+    orchestrator: &rocket::State<OrchestratorService>,
+    pool: &rocket::State<PgPool>,
+    haproxy: &rocket::State<Arc<dyn HAProxyClientTrait>>,
+    pfsense: &rocket::State<Arc<dyn PfSenseClientTrait>>,
+) -> (rocket::http::Status, Json<serde_json::Value>) {
+    use rocket::http::Status;
+    use services::tenant_purge;
+
+    let Some(_lock) = tenant_purge::try_lock() else {
+        return (
+            Status::Conflict,
+            Json(serde_json::json!({ "error": "another purge is running" })),
+        );
+    };
+
+    let target = match tenant_purge::load_target(pool.inner(), &req.user_id).await {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                Status::BadRequest,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        }
+    };
+
+    let config = &app_state.config;
+    let local_node =
+        matches!(config.mode, config::OperationMode::Hybrid).then_some(config.node_id.as_str());
+
+    let inv = match tenant_purge::inventory(pool.inner(), target, local_node).await {
+        Ok(inv) => inv,
+        Err(e) => {
+            return (
+                Status::InternalServerError,
+                Json(serde_json::json!({ "error": format!("inventory failed: {}", e) })),
+            )
+        }
+    };
+
+    if req.dry_run {
+        return (
+            Status::Ok,
+            Json(serde_json::json!({
+                "status": "dry_run",
+                "inventory": inv,
+                "next": "repeat with \"dry_run\": false and \"confirm_email\" set to the user's email",
+            })),
+        );
+    }
+
+    if !req
+        .confirm_email
+        .trim()
+        .eq_ignore_ascii_case(&inv.user.email)
+    {
+        return (
+            Status::BadRequest,
+            Json(serde_json::json!({
+                "error": "confirm_email does not match the user's email; nothing changed",
+            })),
+        );
+    }
+
+    warn!(
+        "🧨 Admin purge started: user {} (slot {})",
+        inv.user.user_id, inv.user.user_slot
+    );
+
+    let mut report = tenant_purge::PurgeReport::default();
+    tenant_purge::suspend(pool.inner(), &inv.user, &mut report).await;
+    if report.errors.is_empty() {
+        let ctx = tenant_purge::PurgeContext {
+            pool: pool.inner(),
+            haproxy: haproxy.inner(),
+            pfsense: pfsense.inner(),
+            nats: orchestrator.nats_service.as_deref(),
+            local: local_node.map(|n| (app_state.container_manager.as_ref(), n)),
+        };
+        tenant_purge::purge_external(&ctx, &inv, &mut report).await;
+
+        match deprovision_tenant(
+            &config.wg_interface,
+            &inv.user.wireguard_public_key,
+            inv.user.user_slot,
+        )
+        .await
+        {
+            Ok(_) => report
+                .done
+                .push("WireGuard peer and nft rule removed".to_string()),
+            Err(e) => report.errors.push(format!("WireGuard/nft: {}", e)),
+        }
+    }
+
+    if !report.errors.is_empty() {
+        error!(
+            "❌ Admin purge incomplete for user {}: {:?}",
+            inv.user.user_id, report.errors
+        );
+        return (
+            Status::InternalServerError,
+            Json(serde_json::json!({
+                "status": "incomplete",
+                "message": "The account is suspended and its DB rows are kept. Fix the errors and run the purge again.",
+                "report": report,
+            })),
+        );
+    }
+
+    if let Err(e) = tenant_purge::delete_rows(pool.inner(), &inv.user).await {
+        report.errors.push(format!("DB delete: {}", e));
+        return (
+            Status::InternalServerError,
+            Json(serde_json::json!({
+                "status": "incomplete",
+                "message": "Everything outside the DB is gone, but the rows could not be deleted. Run the purge again.",
+                "report": report,
+            })),
+        );
+    }
+    report.done.push("DB rows deleted".to_string());
+
+    tenant_purge::remove_controller_routes(&app_state.route_manager, &inv).await;
+
+    warn!(
+        "🧨 Admin purge complete: user {} (slot {})",
+        inv.user.user_id, inv.user.user_slot
+    );
+    (
+        Status::Ok,
+        Json(serde_json::json!({
+            "status": "purged",
+            "user_id": inv.user.user_id,
+            "user_slot": inv.user.user_slot,
+            "report": report,
+        })),
+    )
 }
 
 /// Health check for admin API — shows active tenant count
@@ -1320,6 +1485,7 @@ async fn rocket() -> _ {
                     // Admin endpoints (signup-api → container-api provisioning)
                     admin_provision_tenant,
                     admin_deprovision_tenant,
+                    admin_purge_tenant,
                     admin_tenants_status,
                     // usage
                     routes::containers::get_usage,

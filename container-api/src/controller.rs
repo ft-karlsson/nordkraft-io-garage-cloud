@@ -10,7 +10,9 @@
 use crate::config::{AppConfig, OperationMode};
 use crate::models::{ContainerInfo, NodeInfo};
 use crate::services::container_manager::ContainerManager;
-use crate::services::nats_service::{NatsMessage, NatsService, NatsSubjects};
+use crate::services::nats_service::{
+    NatsMessage, NatsService, NatsSubjects, TenantPurgeReply, TenantPurgeRequest,
+};
 use crate::storage;
 use chrono::Utc;
 use futures::StreamExt;
@@ -446,6 +448,39 @@ impl OrchestratorService {
                     make_container_upgrade_handler(orchestrator.clone(), nats_clone.clone()),
                 )
                 .await;
+
+            // A hybrid node purges its own containers directly from the admin
+            // route; only pure agents answer purge requests over NATS.
+            if !nats_clone.is_controller() {
+                let cm = orchestrator.container_manager.clone();
+                let node_id = orchestrator.node_id.clone();
+                let _ = nats_clone
+                    .serve_tenant_purge(move |req: TenantPurgeRequest| {
+                        let cm = cm.clone();
+                        let node_id = node_id.clone();
+                        async move {
+                            match cm.purge_owner(&req.owner_pubkey, req.user_slot).await {
+                                Ok(removed) => TenantPurgeReply {
+                                    node_id,
+                                    removed,
+                                    error: None,
+                                },
+                                Err(e) => {
+                                    error!(
+                                        "❌ Tenant purge (slot {}) failed: {}",
+                                        req.user_slot, e
+                                    );
+                                    TenantPurgeReply {
+                                        node_id,
+                                        removed: Vec::new(),
+                                        error: Some(e.to_string()),
+                                    }
+                                }
+                            }
+                        }
+                    })
+                    .await;
+            }
         });
     }
 }

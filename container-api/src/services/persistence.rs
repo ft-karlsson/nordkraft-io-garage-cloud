@@ -188,4 +188,27 @@ impl PersistenceManager {
 
         Ok(())
     }
+
+    /// Remove everything a tenant has on this node: all volumes AND the volume
+    /// backups taken on container removal. Used only by the admin tenant purge.
+    /// Returns whether the directory existed.
+    pub async fn remove_tenant_data(
+        &self,
+        user_slot: u32,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        // Slot 0 or > 255 is never a tenant; refuse rather than build an odd path.
+        if !(1..=255).contains(&user_slot) {
+            return Err(format!("refusing to remove data for invalid slot {}", user_slot).into());
+        }
+
+        let tenant_path = self.base_path.join("users").join(user_slot.to_string());
+
+        if !tenant_path.exists() {
+            return Ok(false);
+        }
+
+        fs::remove_dir_all(&tenant_path).await?;
+        info!("🧹 Removed all tenant data at {}", tenant_path.display());
+        Ok(true)
+    }
 }

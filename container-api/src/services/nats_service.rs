@@ -358,6 +358,29 @@ impl NatsSubjects {
     pub fn deploy_events_for_user(user_id: &str) -> String {
         format!("nordkraft.events.deploy.{}", user_id)
     }
+
+    // Admin tenant purge (NATS request/reply, one node per request)
+    pub fn tenant_purge_for_node(node_id: &str) -> String {
+        format!("nordkraft.tenants.purge.{}", node_id)
+    }
+}
+
+// ============= TENANT PURGE (request/reply) =============
+
+/// Controller → agent: remove every container and all on-disk data for one tenant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantPurgeRequest {
+    pub owner_pubkey: String,
+    pub user_slot: u32,
+}
+
+/// Agent → controller. `error` is None only when the node has converged:
+/// no containers left for the owner and the tenant data directory is gone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantPurgeReply {
+    pub node_id: String,
+    pub removed: Vec<String>,
+    pub error: Option<String>,
 }
 
 // ============= NATS SERVICE =============
@@ -1201,6 +1224,71 @@ impl NatsService {
     }
 
     // ============= HELPER FUNCTIONS =============
+
+    /// Ask one node to purge a tenant and wait for its answer. A node that
+    /// does not answer (offline, or running a build without purge support)
+    /// is an error, never a silent success.
+    pub async fn request_tenant_purge(
+        &self,
+        node_id: &str,
+        request: &TenantPurgeRequest,
+    ) -> Result<TenantPurgeReply, Box<dyn std::error::Error + Send + Sync>> {
+        let payload = serde_json::to_vec(request)?;
+        let message = self
+            .client
+            .send_request(
+                NatsSubjects::tenant_purge_for_node(node_id),
+                async_nats::Request::new()
+                    .payload(payload.into())
+                    .timeout(Some(Duration::from_secs(120))),
+            )
+            .await
+            .map_err(|e| format!("node {} did not answer the purge request: {}", node_id, e))?;
+        Ok(serde_json::from_slice(&message.payload)?)
+    }
+
+    /// Agent side: answer tenant purge requests addressed to this node.
+    pub async fn serve_tenant_purge<F, Fut>(
+        &self,
+        handler: F,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        F: Fn(TenantPurgeRequest) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = TenantPurgeReply> + Send + 'static,
+    {
+        let subject = NatsSubjects::tenant_purge_for_node(&self.node_id);
+        let mut subscriber = self.client.subscribe(subject.clone()).await?;
+        let client = self.client.clone();
+        let node_id = self.node_id.clone();
+        info!("📥 Subscribed to: {}", subject);
+
+        tokio::spawn(async move {
+            while let Some(message) = subscriber.next().await {
+                let Some(reply_to) = message.reply.clone() else {
+                    warn!("Tenant purge request without reply subject ignored");
+                    continue;
+                };
+                let reply = match serde_json::from_slice::<TenantPurgeRequest>(&message.payload) {
+                    Ok(request) => handler(request).await,
+                    Err(e) => TenantPurgeReply {
+                        node_id: node_id.clone(),
+                        removed: Vec::new(),
+                        error: Some(format!("invalid purge request: {}", e)),
+                    },
+                };
+                match serde_json::to_vec(&reply) {
+                    Ok(payload) => {
+                        if let Err(e) = client.publish(reply_to, payload.into()).await {
+                            error!("Failed to answer tenant purge request: {}", e);
+                        }
+                    }
+                    Err(e) => error!("Failed to encode tenant purge reply: {}", e),
+                }
+            }
+        });
+
+        Ok(())
+    }
 
     pub fn get_client(&self) -> &Client {
         &self.client

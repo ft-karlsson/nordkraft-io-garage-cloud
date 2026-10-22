@@ -1244,6 +1244,65 @@ impl ContainerManager {
         Ok(())
     }
 
+    /// Admin tenant purge, node side: force-remove every container this node
+    /// runs for `owner_pubkey`, clear their CNI IPAM state, then delete the
+    /// tenant's whole data directory (volumes and volume backups).
+    ///
+    /// Unlike `remove_container` there is no graceful stop and no backup — the
+    /// point is that nothing is left. Errs (without touching the data
+    /// directory) if any container is still listed afterwards, so the
+    /// controller never deletes DB rows for a node that did not converge.
+    pub async fn purge_owner(
+        &self,
+        owner_pubkey: &str,
+        user_slot: u32,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        // An empty or malformed key would widen the label filter below.
+        if !crate::services::tenant_purge::is_wireguard_key(owner_pubkey) {
+            return Err("refusing to purge: owner key is not a WireGuard public key".into());
+        }
+
+        let containers = self.list_user_containers(owner_pubkey).await?;
+        let mut removed = Vec::new();
+
+        for c in &containers {
+            let output = tokio::process::Command::new(&self.runtime_binary)
+                .args(["rm", "-f", &c.name])
+                .output()
+                .await?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stderr.contains("No such container") {
+                    return Err(format!("rm -f {} failed: {}", c.name, stderr.trim()).into());
+                }
+            }
+
+            if let Some(ip) = &c.container_ip {
+                let network_name = self.macvlan.network_name_for_slot(user_slot as i32);
+                let cni_file = format!("/var/lib/cni/networks/{}/{}", network_name, ip);
+                match tokio::fs::remove_file(&cni_file).await {
+                    Ok(_) => debug!("🧹 Cleaned CNI IPAM state {}", cni_file),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => warn!("Failed to clean CNI state {}: {}", cni_file, e),
+                }
+            }
+
+            info!("🗑️ Purged container {} (slot {})", c.name, user_slot);
+            removed.push(c.name.clone());
+        }
+
+        let left = self.list_user_containers(owner_pubkey).await?;
+        if !left.is_empty() {
+            let names: Vec<&str> = left.iter().map(|c| c.name.as_str()).collect();
+            return Err(
+                format!("containers still present after purge: {}", names.join(", ")).into(),
+            );
+        }
+
+        self.persistence.remove_tenant_data(user_slot).await?;
+        Ok(removed)
+    }
+
     /// Get container logs
     pub async fn get_container_logs(
         &self,

@@ -532,6 +532,44 @@ pub async fn disable_ingress(
             }
         };
 
+    let cleanup_errors =
+        teardown_ingress(pool.inner(), haproxy.inner(), pfsense.inner(), &ingress).await;
+
+    // Delete from database
+    if let Err(e) = storage::delete_ingress_route(pool.inner(), ingress.id).await {
+        return Json(serde_json::json!({
+            "error": format!("Failed to delete ingress record: {}", e),
+            "cleanup_errors": cleanup_errors
+        }));
+    }
+
+    info!("✅ Ingress disabled for container: {}", container_id);
+
+    if cleanup_errors.is_empty() {
+        Json(serde_json::json!({
+            "status": "disabled",
+            "subdomain": ingress.subdomain,
+            "mode": ingress.mode
+        }))
+    } else {
+        Json(serde_json::json!({
+            "status": "disabled",
+            "subdomain": ingress.subdomain,
+            "mode": ingress.mode,
+            "warnings": cleanup_errors
+        }))
+    }
+}
+
+/// Remove every HAProxy / pfSense object behind one ingress route (and release
+/// its TCP port). Tolerant of already-missing pieces, so it is safe to repeat.
+/// Returns the steps that failed; the caller decides whether the DB row goes.
+pub async fn teardown_ingress(
+    pool: &sqlx::PgPool,
+    haproxy: &Arc<dyn HAProxyClientTrait>,
+    pfsense: &Arc<dyn PfSenseClientTrait>,
+    ingress: &storage::IngressRouteDb,
+) -> Vec<String> {
     let mut cleanup_errors = Vec::new();
 
     // Mode-specific cleanup
@@ -565,7 +603,7 @@ pub async fn disable_ingress(
             }
             // Release TCP port
             if let Some(port) = ingress.public_port {
-                let _ = storage::release_tcp_port(pool.inner(), port).await;
+                let _ = storage::release_tcp_port(pool, port).await;
             }
             // Remove firewall rule
             if let Some(rule_id) = &ingress.pfsense_rule_id {
@@ -588,30 +626,7 @@ pub async fn disable_ingress(
         }
     }
 
-    // Delete from database
-    if let Err(e) = storage::delete_ingress_route(pool.inner(), ingress.id).await {
-        return Json(serde_json::json!({
-            "error": format!("Failed to delete ingress record: {}", e),
-            "cleanup_errors": cleanup_errors
-        }));
-    }
-
-    info!("✅ Ingress disabled for container: {}", container_id);
-
-    if cleanup_errors.is_empty() {
-        Json(serde_json::json!({
-            "status": "disabled",
-            "subdomain": ingress.subdomain,
-            "mode": ingress.mode
-        }))
-    } else {
-        Json(serde_json::json!({
-            "status": "disabled",
-            "subdomain": ingress.subdomain,
-            "mode": ingress.mode,
-            "warnings": cleanup_errors
-        }))
-    }
+    cleanup_errors
 }
 
 /// Get ingress status for a container
