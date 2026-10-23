@@ -938,16 +938,23 @@ async fn admin_purge_tenant(
         };
         tenant_purge::purge_external(&ctx, &inv, &mut report).await;
 
-        match deprovision_tenant(
-            &config.wg_interface,
-            &inv.user.wireguard_public_key,
-            inv.user.user_slot,
-        )
-        .await
-        {
-            Ok(_) => report
+        // An unclaimed invite has no WireGuard peer (its "key" is the claim
+        // token, which wg rejects), but the nft rule is keyed by slot only.
+        let network = if inv.user.claimed {
+            deprovision_tenant(
+                &config.wg_interface,
+                &inv.user.wireguard_public_key,
+                inv.user.user_slot,
+            )
+            .await
+        } else {
+            nft_remove_tenant_rule(inv.user.user_slot).await
+        };
+        match network {
+            Ok(_) if inv.user.claimed => report
                 .done
                 .push("WireGuard peer and nft rule removed".to_string()),
+            Ok(_) => report.done.push("nft rule removed".to_string()),
             Err(e) => report.errors.push(format!("WireGuard/nft: {}", e)),
         }
     }

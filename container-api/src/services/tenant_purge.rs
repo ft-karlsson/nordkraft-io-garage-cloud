@@ -17,6 +17,9 @@
 //   that may hold the tenant's containers confirmed it converged. Until then
 //   the rows stay, because they are what the next run needs to find things.
 // - One purge at a time.
+// - An unclaimed invite (key still the NKINVITE- placeholder) never had a VPN
+//   peer, so it cannot have containers or data on a node: only the nft rule
+//   and the DB rows go. If rows say otherwise, the purge refuses.
 
 use crate::routes::ingress::teardown_ingress;
 use crate::services::container_manager::ContainerManager;
@@ -52,11 +55,17 @@ pub struct PurgeTarget {
     pub user_id: String,
     pub email: String,
     pub full_name: String,
+    /// Real WireGuard key, or the signup's `NKINVITE-` claim token until the
+    /// CLI claims the account. Never returned: the token is a credential.
     #[serde(skip)]
     pub wireguard_public_key: String,
     pub user_slot: u32,
     pub account_status: String,
+    /// False while the key is still the invite placeholder.
+    pub claimed: bool,
 }
+
+const INVITE_PREFIX: &str = "NKINVITE-";
 
 /// Everything the purge will touch. Returned as-is by a dry run.
 #[derive(Debug, Serialize)]
@@ -123,20 +132,23 @@ pub async fn load_target(pool: &PgPool, user_id: &str) -> Result<PurgeTarget, Bo
         other => return Err(format!("user has no valid slot ({:?})", other).into()),
     };
 
+    let key: String = row.get("wireguard_public_key");
+    let claimed = !key.starts_with(INVITE_PREFIX);
+    if claimed && !is_wireguard_key(&key) {
+        return Err("user's WireGuard key is malformed; purge by hand".into());
+    }
+
     let target = PurgeTarget {
         user_id: row.get("id"),
         email: row.get("email"),
         full_name: row.get("full_name"),
-        wireguard_public_key: row.get("wireguard_public_key"),
+        wireguard_public_key: key,
         user_slot: slot,
         account_status: row
             .get::<Option<String>, _>("account_status")
             .unwrap_or_default(),
+        claimed,
     };
-
-    if !is_wireguard_key(&target.wireguard_public_key) {
-        return Err("user's WireGuard key is malformed; purge by hand".into());
-    }
 
     // Slot and key identify the tenant on nodes and in nft/WireGuard. If either
     // is shared with another user, a purge would hit that user too.
@@ -165,7 +177,7 @@ pub async fn inventory(
     target: PurgeTarget,
     local_node: Option<&str>,
 ) -> Result<PurgeInventory, BoxError> {
-    let containers = sqlx::query(
+    let containers: Vec<(String, String, String, Option<String>)> = sqlx::query(
         "SELECT container_name, node_id, COALESCE(status, '') AS status, internal_ip
          FROM containers WHERE user_id = $1 ORDER BY created_at",
     )
@@ -183,19 +195,19 @@ pub async fn inventory(
     })
     .collect();
 
-    let ingress_routes =
+    let ingress_routes: Vec<String> =
         sqlx::query_scalar("SELECT full_domain FROM ingress_routes WHERE user_id = $1 ORDER BY id")
             .bind(&target.user_id)
             .fetch_all(pool)
             .await?;
 
-    let custom_domains =
+    let custom_domains: Vec<String> =
         sqlx::query_scalar("SELECT domain FROM custom_domains WHERE user_id = $1 ORDER BY id")
             .bind(&target.user_id)
             .fetch_all(pool)
             .await?;
 
-    let ipv6_firewall_rules = sqlx::query_scalar(
+    let ipv6_firewall_rules: Vec<String> = sqlx::query_scalar(
         "SELECT container_name FROM ipv6_firewall_rules WHERE user_id = $1 ORDER BY id",
     )
     .bind(&target.user_id)
@@ -214,6 +226,29 @@ pub async fn inventory(
     .bind(&target.user_id)
     .fetch_all(pool)
     .await?;
+
+    if !target.claimed {
+        // Deploying needs the VPN, so an unclaimed account owns nothing. Rows
+        // that say otherwise mean something is off: let a human look.
+        if !containers.is_empty()
+            || !ingress_routes.is_empty()
+            || !custom_domains.is_empty()
+            || !ipv6_firewall_rules.is_empty()
+        {
+            return Err(
+                "account was never claimed but has containers, ingress or domains; refusing".into(),
+            );
+        }
+        return Ok(PurgeInventory {
+            user: target,
+            containers,
+            ingress_routes,
+            custom_domains,
+            ipv6_firewall_rules,
+            nodes_to_confirm: Vec::new(),
+            local_node: None,
+        });
+    }
 
     Ok(PurgeInventory {
         user: target,
@@ -327,6 +362,11 @@ pub async fn purge_external(
     }
 
     // 4. Containers, volumes and volume backups on every node.
+    if !user.claimed {
+        report.ok("never claimed: no VPN peer, containers or node data to remove");
+        return;
+    }
+
     if let Some((cm, node_id)) = ctx.local {
         match cm
             .purge_owner(&user.wireguard_public_key, user.user_slot)
@@ -586,5 +626,50 @@ mod tests {
         .await
         .unwrap();
         assert!(load_target(&pool, "ub").await.is_err());
+
+        // Unclaimed invite: no nodes to ask, rows still deletable.
+        sqlx::query(
+            "INSERT INTO users (id, email, full_name, address, wireguard_public_key, client_ip,
+                plan_id, user_slot) VALUES ('ud', 'ud@x.dk', 'n', 'a',
+                'NKINVITE-7eaada49-18fa-416b-9043-b2ad9869e6df', '1.1.1.1', 'p', 7)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let invite = load_target(&pool, "ud").await.unwrap();
+        assert!(!invite.claimed);
+        let inv = inventory(&pool, invite.clone(), None).await.unwrap();
+        assert!(inv.nodes_to_confirm.is_empty());
+
+        // ...but one that somehow owns a container is refused.
+        sqlx::query(
+            "INSERT INTO containers (container_id, user_id, node_id, container_name, image)
+                VALUES ('ud-cid', 'ud', 'ry-optiplex-1', 'ud-web', 'img')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(inventory(&pool, invite.clone(), None).await.is_err());
+        sqlx::query("DELETE FROM containers WHERE user_id = 'ud'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        delete_rows(&pool, &invite).await.unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = 'ud'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+
+        // A claimed key that is not a WireGuard key is refused outright.
+        sqlx::query(
+            "INSERT INTO users (id, email, full_name, address, wireguard_public_key, client_ip,
+                plan_id, user_slot) VALUES ('ue', 'ue@x.dk', 'n', 'a', 'garbage', '1.1.1.1', 'p', 8)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(load_target(&pool, "ue").await.is_err());
     }
 }
