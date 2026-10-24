@@ -34,6 +34,7 @@ jobs:
           for t in gcc g++ ar; do sudo ln -sf /usr/bin/$t /usr/local/bin/x86_64-unknown-linux-gnu-$t; done
       - name: shellcheck
         run: |
+          sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck protobuf-compiler >/dev/null
           shellcheck -S warning scripts/*.sh
       - name: clippy (container-api)
@@ -73,6 +74,7 @@ jobs:
       # is minutes on a 2-core runner). Same binary, same install path.
       - name: Build container-api
         run: |
+          sudo apt-get update -qq
           sudo apt-get install -y -qq protobuf-compiler >/dev/null
           cd container-api && cargo build --release
 
