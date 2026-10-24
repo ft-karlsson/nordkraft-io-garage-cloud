@@ -8,3 +8,4 @@ database-backups-dev/
 *.dump
 *.sql.gz
 dist/
+build_push_to_ry-1.sh
