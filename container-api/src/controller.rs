@@ -657,6 +657,7 @@ async fn handle_container_deletion_cleanup(
     }
 
     storage::mark_container_deleted(&pool, container_name).await?;
+    crate::services::peer_reconciler::kick();
     info!("🏁 Cleanup completed for {}", container_name);
     Ok(())
 }

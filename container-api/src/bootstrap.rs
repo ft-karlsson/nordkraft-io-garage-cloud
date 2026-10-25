@@ -14,6 +14,7 @@ const SCHEMA_SQL: &str = include_str!("../../setup/schema.sql");
 const MIGRATION_CUSTOM_DOMAINS_SQL: &str = include_str!("../../setup/migration_custom_domains.sql");
 const MIGRATION_CONTAINER_STATUS_SQL: &str =
     include_str!("../../setup/migration_container_status.sql");
+const MIGRATION_CHILD_PEERS_SQL: &str = include_str!("../../setup/migration_child_peers.sql");
 
 /// Identity of the dev user — must match the shortcut in guards.rs.
 pub const DEV_USER_ID: &str = "dev-user-id";
@@ -68,6 +69,18 @@ pub async fn ensure_schema(
         .await?;
     info!("✅ Schema applied");
     Ok(true)
+}
+
+/// Idempotent migrations that an existing database may lack. Applied on every
+/// start, so a new binary never runs ahead of its tables. Each statement is
+/// IF NOT EXISTS; a database that already has them is left untouched.
+pub async fn ensure_migrations(
+    pool: &PgPool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    sqlx::raw_sql(MIGRATION_CHILD_PEERS_SQL)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Seed plan + garage + node + dev user + subnet allocation for `--dev`.

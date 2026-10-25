@@ -249,6 +249,8 @@ pub async fn deploy_container(
                     deploy_req.enable_persistence.unwrap_or(false),
                 )
                 .await;
+                // child-peer rules follow container IPs
+                crate::services::peer_reconciler::kick();
 
                 // Store full deploy config for future upgrades
                 let config = build_container_config(
@@ -348,6 +350,8 @@ pub async fn deploy_container(
                         deploy_req.enable_persistence.unwrap_or(false),
                     )
                     .await;
+                    // child-peer rules follow container IPs
+                    crate::services::peer_reconciler::kick();
 
                     // Store full deploy config for future upgrades
                     let config = build_container_config(
