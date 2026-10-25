@@ -73,24 +73,78 @@ impl DenyMode {
 
 // ============= DESIRED STATE =============
 
+/// An IPv4 network in CIDR form, as stored in
+/// `garage_container_allocations.container_subnet` ("172.21.5.0/24").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Subnet {
+    pub network: Ipv4Addr,
+    pub prefix: u8,
+}
+
+impl Subnet {
+    pub fn parse(s: &str) -> Option<Self> {
+        let (addr, len) = s.trim().split_once('/')?;
+        let addr: Ipv4Addr = addr.parse().ok()?;
+        let prefix: u8 = len.parse().ok()?;
+        if prefix > 32 {
+            return None;
+        }
+        let mask = Self::mask(prefix);
+        Some(Self {
+            network: Ipv4Addr::from(u32::from(addr) & mask),
+            prefix,
+        })
+    }
+
+    /// What every tenant has had so far: 172.21.<slot>.0/24.
+    pub fn legacy_for_slot(slot: u8) -> Self {
+        Self {
+            network: Ipv4Addr::new(172, 21, slot, 0),
+            prefix: 24,
+        }
+    }
+
+    fn mask(prefix: u8) -> u32 {
+        if prefix == 0 {
+            0
+        } else {
+            u32::MAX << (32 - prefix)
+        }
+    }
+
+    pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        (u32::from(ip) & Self::mask(self.prefix)) == u32::from(self.network)
+    }
+}
+
+impl std::fmt::Display for Subnet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.network, self.prefix)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Owner {
     pub slot: u8,
     pub public_key: String,
+    /// The tenant's container range, from its allocation row. Not derived from
+    /// the slot, so a garage that hands out /20s instead of /24s needs no
+    /// change here.
+    pub container_subnet: Subnet,
 }
 
 impl Owner {
     pub fn vpn_ip(&self) -> Ipv4Addr {
         Ipv4Addr::new(172, 20, 0, self.slot)
     }
-    pub fn container_subnet(&self) -> String {
-        format!("172.21.{}.0/24", self.slot)
-    }
-    /// Server-side allowed-ips. The container /24 is what every owner peer has
-    /// carried since day one; it is kept verbatim so phase 1 rewrites nothing
-    /// on existing peers.
+    /// Server-side allowed-ips. The container subnet is what every owner peer
+    /// has carried since day one; it is kept so nothing is rewritten on
+    /// existing peers.
     pub fn allowed_ips(&self) -> Vec<String> {
-        vec![format!("{}/32", self.vpn_ip()), self.container_subnet()]
+        vec![
+            format!("{}/32", self.vpn_ip()),
+            self.container_subnet.to_string(),
+        ]
     }
 }
 
@@ -117,6 +171,8 @@ pub struct ChildPeer {
     pub index: u8,
     pub name: String,
     pub public_key: String,
+    /// The owner's container range (see Owner::container_subnet).
+    pub container_subnet: Subnet,
     pub scope: Scope,
 }
 
@@ -153,15 +209,52 @@ impl DesiredState {
 /// slots outside 1..=255, odd indexes) are skipped with a warning rather than
 /// failing the whole run.
 pub async fn load_desired(pool: &PgPool) -> Result<DesiredState, BoxError> {
+    // user_id → container subnet, preferring the primary garage's allocation.
+    let mut subnets: BTreeMap<String, Subnet> = BTreeMap::new();
+    for row in sqlx::query(
+        "SELECT a.user_id, a.container_subnet
+         FROM garage_container_allocations a
+         JOIN users u ON u.id = a.user_id
+         ORDER BY a.user_id, (a.garage_id = u.primary_garage_id) DESC, a.created_at",
+    )
+    .fetch_all(pool)
+    .await?
+    {
+        let user_id: String = row.get("user_id");
+        let subnet: String = row.get("container_subnet");
+        if subnets.contains_key(&user_id) {
+            continue;
+        }
+        match Subnet::parse(&subnet) {
+            Some(s) => {
+                subnets.insert(user_id, s);
+            }
+            None => warn!(
+                "peer reconciler: allocation for {} has unparsable subnet {:?}, ignored",
+                user_id, subnet
+            ),
+        }
+    }
+    let subnet_for = |user_id: &str, slot: u8| -> Subnet {
+        subnets.get(user_id).copied().unwrap_or_else(|| {
+            warn!(
+                "peer reconciler: no allocation row for slot {}, assuming 172.21.{}.0/24",
+                slot, slot
+            );
+            Subnet::legacy_for_slot(slot)
+        })
+    };
+
     let mut owners = Vec::new();
     for row in sqlx::query(
-        "SELECT wireguard_public_key, user_slot FROM users
+        "SELECT id, wireguard_public_key, user_slot FROM users
          WHERE account_status = 'active' AND user_slot IS NOT NULL
          ORDER BY user_slot",
     )
     .fetch_all(pool)
     .await?
     {
+        let user_id: String = row.get("id");
         let key: String = row.get("wireguard_public_key");
         let slot: i32 = row.get("user_slot");
         if !is_wireguard_key(&key) {
@@ -179,13 +272,14 @@ pub async fn load_desired(pool: &PgPool) -> Result<DesiredState, BoxError> {
         owners.push(Owner {
             slot,
             public_key: key,
+            container_subnet: subnet_for(&user_id, slot),
         });
     }
 
     let mut children_by_id: BTreeMap<String, ChildPeer> = BTreeMap::new();
     let mut scoped: BTreeSet<String> = BTreeSet::new();
     for row in sqlx::query(
-        "SELECT p.id, p.name, p.peer_index, p.public_key, p.scope, u.user_slot
+        "SELECT p.id, p.user_id, p.name, p.peer_index, p.public_key, p.scope, u.user_slot
          FROM tenant_peers p
          JOIN users u ON u.id = p.user_id
          WHERE p.status = 'active' AND u.account_status = 'active' AND u.user_slot IS NOT NULL
@@ -195,6 +289,7 @@ pub async fn load_desired(pool: &PgPool) -> Result<DesiredState, BoxError> {
     .await?
     {
         let id: String = row.get("id");
+        let user_id: String = row.get("user_id");
         let name: String = row.get("name");
         let index: i16 = row.get("peer_index");
         let key: String = row.get("public_key");
@@ -242,6 +337,7 @@ pub async fn load_desired(pool: &PgPool) -> Result<DesiredState, BoxError> {
                 index,
                 name,
                 public_key: key,
+                container_subnet: subnet_for(&user_id, slot),
                 scope,
             },
         );
@@ -367,14 +463,14 @@ pub fn render_ruleset(state: &DesiredState, wg_interface: &str, mode: DenyMode) 
     out.push_str("\tchain forward {\n");
     out.push_str("\t\tct state established,related accept\n");
 
-    out.push_str("\t\t# owners: 172.20.0.<slot> -> 172.21.<slot>.0/24\n");
+    out.push_str("\t\t# owners: 172.20.0.<slot> -> the tenant's container subnet\n");
     for o in &owners {
         let _ = writeln!(
             out,
             "\t\tiifname {} ip saddr {} ip daddr {} accept comment {}",
             wg,
             o.vpn_ip(),
-            o.container_subnet(),
+            o.container_subnet,
             comment(&format!("tenant-{}", o.slot))
         );
     }
@@ -386,10 +482,10 @@ pub fn render_ruleset(state: &DesiredState, wg_interface: &str, mode: DenyMode) 
             Scope::AllContainers => {
                 let _ = writeln!(
                     out,
-                    "\t\tiifname {} ip saddr {} ip daddr 172.21.{}.0/24 accept comment {}",
+                    "\t\tiifname {} ip saddr {} ip daddr {} accept comment {}",
                     wg,
                     c.vpn_ip(),
-                    c.slot,
+                    c.container_subnet,
                     comment(&format!("{} all", label))
                 );
             }
@@ -405,14 +501,14 @@ pub fn render_ruleset(state: &DesiredState, wg_interface: &str, mode: DenyMode) 
                         );
                         continue;
                     };
-                    // A container of another slot can never be a target: the
+                    // A container of another tenant can never be a target: the
                     // DB query joins on the owner, and this check keeps a bad
                     // row from ever widening the rule.
-                    if ip.octets()[0] != 172 || ip.octets()[1] != 21 || ip.octets()[2] != c.slot {
+                    if !c.container_subnet.contains(ip) {
                         let _ = writeln!(
                             out,
-                            "\t\t# {} {}: {} is outside 172.21.{}.0/24, refused",
-                            label, t.container_name, ip, c.slot
+                            "\t\t# {} {}: {} is outside {}, refused",
+                            label, t.container_name, ip, c.container_subnet
                         );
                         continue;
                     }
@@ -821,10 +917,12 @@ mod tests {
                 Owner {
                     slot: 12,
                     public_key: "OOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOA=".into(),
+                    container_subnet: Subnet::legacy_for_slot(12),
                 },
                 Owner {
                     slot: 5,
                     public_key: "OOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOB=".into(),
+                    container_subnet: Subnet::legacy_for_slot(5),
                 },
             ],
             children: vec![
@@ -833,6 +931,7 @@ mod tests {
                     index: 3,
                     name: "ci-runner".into(),
                     public_key: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCA=".into(),
+                    container_subnet: Subnet::legacy_for_slot(5),
                     scope: Scope::Containers(vec![
                         Target {
                             container_name: "web".into(),
@@ -861,6 +960,7 @@ mod tests {
                     index: 2,
                     name: "anna's laptop".into(),
                     public_key: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCB=".into(),
+                    container_subnet: Subnet::legacy_for_slot(5),
                     scope: Scope::AllContainers,
                 },
             ],
@@ -967,11 +1067,85 @@ mod tests {
         let want: BTreeSet<String> = Owner {
             slot: 5,
             public_key: String::new(),
+            container_subnet: Subnet::legacy_for_slot(5),
         }
         .allowed_ips()
         .into_iter()
         .collect();
         assert_eq!(&want, a);
+    }
+
+    #[test]
+    fn subnet_parse_and_contains() {
+        let s = Subnet::parse("172.21.16.0/20").unwrap();
+        assert_eq!(s.to_string(), "172.21.16.0/20");
+        assert!(s.contains("172.21.16.1".parse().unwrap()));
+        assert!(s.contains("172.21.31.254".parse().unwrap()));
+        assert!(!s.contains("172.21.32.1".parse().unwrap()));
+        assert!(!s.contains("172.21.15.255".parse().unwrap()));
+        // host bits are masked off
+        assert_eq!(
+            Subnet::parse("172.21.20.5/20").unwrap().network,
+            "172.21.16.0".parse::<Ipv4Addr>().unwrap()
+        );
+        assert_eq!(Subnet::legacy_for_slot(7).to_string(), "172.21.7.0/24");
+        assert!(Subnet::parse("172.21.1.0/33").is_none());
+        assert!(Subnet::parse("172.21.1.0").is_none());
+        assert!(Subnet::parse("nope/24").is_none());
+    }
+
+    /// A garage that allocates /20s per tenant: the rules follow the
+    /// allocation row, not the slot number.
+    #[test]
+    fn ruleset_follows_a_wider_allocation() {
+        let big = Subnet::parse("172.21.16.0/20").unwrap();
+        let state = DesiredState {
+            owners: vec![Owner {
+                slot: 2,
+                public_key: "OOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOC=".into(),
+                container_subnet: big,
+            }],
+            children: vec![
+                ChildPeer {
+                    slot: 2,
+                    index: 2,
+                    name: "all".into(),
+                    public_key: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=".into(),
+                    container_subnet: big,
+                    scope: Scope::AllContainers,
+                },
+                ChildPeer {
+                    slot: 2,
+                    index: 3,
+                    name: "one".into(),
+                    public_key: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCD=".into(),
+                    container_subnet: big,
+                    scope: Scope::Containers(vec![
+                        Target {
+                            container_name: "inside".into(),
+                            ip: Some("172.21.29.7".parse().unwrap()),
+                            ports: None,
+                        },
+                        Target {
+                            container_name: "outside".into(),
+                            ip: Some("172.21.2.7".parse().unwrap()),
+                            ports: None,
+                        },
+                    ]),
+                },
+            ],
+        };
+        let r = render_ruleset(&state, "wg0", DenyMode::Drop);
+        assert!(
+            r.contains("ip saddr 172.20.0.2 ip daddr 172.21.16.0/20 accept comment \"tenant-2\"")
+        );
+        assert!(r.contains("ip saddr 172.20.2.2 ip daddr 172.21.16.0/20 accept"));
+        assert!(r.contains("ip saddr 172.20.2.3 ip daddr 172.21.29.7 accept"));
+        // 172.21.2.7 would have been "slot 2's" under the old slot-derived rule
+        assert!(!r.contains("ip daddr 172.21.2.7 accept"));
+        assert!(r.contains("172.21.2.7 is outside 172.21.16.0/20, refused"));
+        // children stay in the VPN range whatever the container subnet is
+        assert!(!r.contains("172.20.16."));
     }
 
     #[test]

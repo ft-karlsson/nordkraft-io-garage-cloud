@@ -206,8 +206,13 @@ Notes on the ruleset:
   peer later if someone needs a container to call home.
 - **Children cannot reach each other or the owner** over the hub: there is no
   accept with a `172.20.x.x` destination.
-- **A target outside the owner's /24 never becomes a rule**, even if a bad row
-  says so; the renderer refuses it with a comment in the ruleset.
+- **A target outside the owner's subnet never becomes a rule**, even if a bad
+  row says so; the renderer refuses it with a comment in the ruleset.
+- **The container subnet comes from `garage_container_allocations`**, not from
+  the slot number. Today every row is `172.21.<slot>.0/24`; a garage that
+  allocates `/20`s per tenant needs no change in this feature. Child addresses
+  stay `172.20.<slot>.<n>` whatever the container range is. A tenant without an
+  allocation row falls back to the `/24` with a warning.
 
 **Triggers:** boot, every 5 minutes, and a `tokio::sync::Notify` kick
 (`peer_reconciler::kick()`) from every write path that changes the desired
