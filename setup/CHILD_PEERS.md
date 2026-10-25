@@ -319,10 +319,16 @@ every rule from the DB on each pass. A self-hoster upgrading a node that ran
 with the old accept chain can start with `VPN_DENY_MODE=audit` and read the
 `nk-vpn-deny` journal lines before switching to `drop`.
 
-Related, one line: NATS listens on `0.0.0.0:4222` without auth on the
-controller. The input rule in §5 keeps *children* away from it; owners can
-still reach it over wg0 today. Worth an `iifname "wg0" tcp dport 4222 drop`
-in `nordkraft_input` once confirmed nothing legitimate uses it.
+Related: NATS listens on `0.0.0.0:4222` without auth on the controller, but
+rasp2's hand-written `inet filter input` chain (policy drop) only accepts
+4222 from `10.0.0.0/24`, and the API only from `172.20.0.0/24` to
+`172.20.0.254:8001`. So owners cannot reach NATS over wg0, and that input
+chain is a fourth layer in front of children. The reconciler leaves it alone.
+
+Deployed 2026-10-25 (v0.3.48): first pass on rasp2 rendered 8 owners, 0
+children, changed no WireGuard peer, applied the ruleset; the
+`vpn-default-deny` counter stayed at 0 and owner traffic to containers kept
+working.
 
 ---
 
