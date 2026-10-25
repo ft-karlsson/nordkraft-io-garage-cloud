@@ -1298,6 +1298,15 @@ async fn rocket() -> _ {
                     routes::domains::verify_domain_now,
                     routes::domains::list_domains,
                     routes::domains::remove_domain,
+                    // Child WireGuard peers (CHILD_PEERS.md)
+                    routes::peers::create_peer,
+                    routes::peers::list_peers,
+                    routes::peers::get_peer,
+                    routes::peers::patch_peer,
+                    routes::peers::enable_peer,
+                    routes::peers::disable_peer,
+                    routes::peers::rotate_peer,
+                    routes::peers::delete_peer,
                     // Admin endpoints (signup-api → container-api provisioning)
                     admin_provision_tenant,
                     admin_deprovision_tenant,

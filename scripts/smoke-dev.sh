@@ -238,6 +238,43 @@ EX=$(curl -fsS -X POST "$API/containers/$NW/exec" -H 'Content-Type: application/
 "$NK" -y rm --force "$NW" >/dev/null 2>&1 || true
 
 # =============================================================================
+step "4c · child peers (rows + CLI; dev mode has no WireGuard, so nothing is applied)"
+# Keys are 44-char base64 shapes; dev user is slot 99, so peers get 172.20.99.N.
+KA="$(head -c 43 </dev/zero | tr '\0' A)="; KB="${KA//A/B}"; KC="${KA//A/C}"
+P=$("$NK" --json peer add smoke-all --all --pubkey "$KA" --out /tmp/smoke-all.conf)
+jq -e '.vpn_ip == "172.20.99.2" and .scope == "all" and .status == "active"' <<<"$P" >/dev/null \
+  && ok "peer add --all → 172.20.99.2" || fail "peer add --all" "$P"
+grep -q '^Address = 172.20.99.2/32$' /tmp/smoke-all.conf && grep -q '^AllowedIPs = 172.21.99.0/24$' /tmp/smoke-all.conf \
+  && ! grep -q '172.20.0.254' /tmp/smoke-all.conf \
+  && ok "config routes only the container range" || fail "peer config" "$(cat /tmp/smoke-all.conf)"
+P=$("$NK" --json peer add smoke-one --container "$N1" --ports 443,80 --pubkey "$KB" --out /tmp/smoke-one.conf)
+jq -e '.vpn_ip == "172.20.99.3" and .scope == "containers" and (.targets|length) == 1 and .targets[0].ports == [80,443]' <<<"$P" >/dev/null \
+  && ok "peer add --container --ports → 172.20.99.3, one target, sorted ports" || fail "peer add --container" "$P"
+E=$("$NK" --json peer add 'Bad_Name' --all --pubkey "$KC" 2>&1 || true)
+grep -qi 'name must' <<<"$E" && ok "bad peer name rejected" || fail "peer name validation" "$E"
+E=$("$NK" --json peer add dup --all --pubkey "$KA" 2>&1 || true)
+grep -qi 'already in use' <<<"$E" && ok "duplicate key rejected" || fail "duplicate key" "$E"
+E=$("$NK" --json peer add nobody --container does-not-exist --pubkey "$KC" 2>&1 || true)
+grep -qi 'not found' <<<"$E" && ok "unknown container rejected" || fail "target validation" "$E"
+P=$("$NK" --json peer allow smoke-one --container "$N2")
+[[ "$(jq '.targets|length' <<<"$P")" == "2" ]] && ok "peer allow adds a target" || fail "peer allow" "$P"
+P=$("$NK" --json peer revoke smoke-one --container "$N2")
+[[ "$(jq '.targets|length' <<<"$P")" == "1" ]] && ok "peer revoke removes it" || fail "peer revoke" "$P"
+"$NK" --json peer show smoke-one | jq 'del(.live) | del(.targets[].ip) | del(.targets[].dangling)' | snapshot peer-show
+P=$("$NK" --json peer disable smoke-one)
+[[ "$(jq -r .status <<<"$P")" == "disabled" ]] && ok "peer disable" || fail "peer disable" "$P"
+P=$("$NK" --json peer enable smoke-one)
+[[ "$(jq -r .status <<<"$P")" == "active" ]] && ok "peer enable" || fail "peer enable" "$P"
+P=$("$NK" --json peer rotate smoke-one --pubkey "$KC" --out /tmp/smoke-one.conf)
+[[ "$(jq -r .public_key <<<"$P")" == "$KC" && "$(jq -r .vpn_ip <<<"$P")" == "172.20.99.3" ]] && ok "peer rotate keeps the address" || fail "peer rotate" "$P"
+P=$("$NK" --json peer set smoke-one --all)
+[[ "$(jq -r .scope <<<"$P")" == "all" && "$(jq '.targets|length' <<<"$P")" == "0" ]] && ok "peer set --all" || fail "peer set" "$P"
+[[ "$("$NK" --json peer ls | jq '.peers|length')" == "2" ]] && ok "peer ls shows 2" || fail "peer ls" "$("$NK" --json peer ls)"
+"$NK" -y peer rm smoke-all >/dev/null && "$NK" -y peer rm smoke-one >/dev/null \
+  && [[ "$("$NK" --json peer ls | jq '.peers|length')" == "0" ]] && ok "peer rm" || fail "peer rm" "$("$NK" --json peer ls)"
+rm -f /tmp/smoke-all.conf /tmp/smoke-one.conf
+
+# =============================================================================
 step "5 · rm --force is fast"
 S=$(date +%s)
 "$NK" -y rm --force "$N2" >/dev/null && ok "removed $N2" || fail "rm --force failed" ""

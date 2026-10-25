@@ -1,7 +1,8 @@
 # Child peers (sub-users with scoped WireGuard access)
 
-> Status: **phase 1 implemented** (reconciler + generated ruleset, no API or CLI
-> yet), 2026-10-25. Read [SETUP_WIREGUARD.md](SETUP_WIREGUARD.md) first.
+> Status: **phases 1 and 3 implemented** (reconciler + generated ruleset,
+> `/api/peers`, `nordkraft peer`), 2026-10-25. Read
+> [SETUP_WIREGUARD.md](SETUP_WIREGUARD.md) first.
 
 A customer (the **owner**) can hand out extra WireGuard peers to people and
 devices — a colleague's laptop, a phone, a CI runner, a Raspberry Pi in the
@@ -245,7 +246,7 @@ logs the ruleset it would apply and does nothing else. This keeps the
 | `POST /api/peers` | `{name, public_key, scope, targets:[{container, ports?}]}` → `{name, vpn_ip, server_public_key, server_endpoint, allowed_ips, scope, targets}` |
 | `GET /api/peers` | list with `vpn_ip`, `scope`, `status`, `last_handshake`, `transfer_rx/tx` (from the existing peer cache), `dangling` targets |
 | `GET /api/peers/<name>` | one peer, same shape |
-| `PATCH /api/peers/<name>` | change `scope` and/or replace `targets` |
+| `PATCH /api/peers/<name>` | `scope`, `targets` (replace), `add_targets`, `remove_targets` |
 | `POST /api/peers/<name>/enable` · `/disable` | `disabled` ⇒ removed from WireGuard and nft, row kept |
 | `POST /api/peers/<name>/rotate` | `{public_key}` → same `vpn_ip`, new key |
 | `DELETE /api/peers/<name>` | row gone, next reconcile removes peer + rules |
@@ -347,8 +348,12 @@ working.
 2. **Verify on rasp2:** `nft list table inet filter`, the `last_reconcile`
    field of `GET /api/admin/tenants/status`, owners still reach their
    containers, `journalctl -u container-api | grep "peer reconciler"`.
-3. **API + CLI** (§6, §7), `plans.max_peers` (column exists), peer status from
-   the peer cache.
+3. **Done — API + CLI** (§6, §7): `container-api/src/routes/peers.rs`,
+   `nordkraft peer add|ls|show|allow|revoke|set|disable|enable|rotate|rm`.
+   Every write runs one reconcile pass before answering. `plans.max_peers`
+   is enforced only where `QUOTA_ENFORCED=true`, like the other quotas.
+   `scripts/smoke-dev.sh` step 4c exercises the whole set on the dev node
+   (rows only: dev mode has no WireGuard).
 4. **Docs**: a Danish guide `docs/guides/peers.md` ("Giv andre adgang til dine
    containere"), rows in `docs/reference/api.md` and `docs/reference/cli.md`,
    fix the `/24` in `SETUP_WIREGUARD.md`.

@@ -29,8 +29,36 @@ Alle requests autentificeres via din WireGuard VPN-forbindelse. Ingen API keys n
 | `/containers/{id}/stream` | GET (WebSocket) | Interaktiv shell / streamet exec |
 | `/containers/{id}/wait` | POST | Vent på at hovedprocessen slutter |
 | `/auth/verify` | GET | Verificer auth |
+| `/peers` | POST | Opret en ekstra WireGuard-peer (se nedenfor) |
+| `/peers` | GET | List dine peers med adresse, scope og seneste handshake |
+| `/peers/{name}` | GET / PATCH / DELETE | Vis, ændr scope og mål, slet |
+| `/peers/{name}/enable` · `/disable` · `/rotate` | POST | Tænd/sluk, eller skift nøgle (samme adresse) |
 
 `GET /containers` tager `?label=KEY=VALUE` (kan gentages) og returnerer kun containere med alle de angivne labels.
+
+### Peers: ekstra WireGuard-adgang til dine containere
+
+En peer er en netværksidentitet, ikke en bruger: den får en adresse i dit eget
+peer-område `172.20.<slot>.2-254`, kan nå dine containere (alle, eller udvalgte
+på udvalgte porte) og kan aldrig nå API'et eller andre kunder. Den private nøgle
+laves hos dig (CLI'en gør det), kun den offentlige sendes.
+
+```json
+POST /peers
+{"name": "ci-runner", "public_key": "K7f…=",
+ "scope": "containers",
+ "targets": [{"container": "web", "ports": [80, 443]}, {"container": "db"}]}
+```
+
+`scope` er `all` eller `containers` (default `all` uden `targets`). Svaret
+indeholder `vpn_ip`, `client` (det, der skal i enhedens `[Peer]`-sektion:
+`address`, `allowed_ips`, `server_public_key`, `server_endpoint`), `targets`
+med containerens aktuelle IP (`ip: null` = ingen kørende container med det
+navn) og `live` med seneste handshake, når enheden har været på.
+
+`PATCH /peers/{name}` tager `scope`, `targets` (erstat listen), `add_targets`
+og `remove_targets` (containernavne). Mål gemmes som navne, så et redeploy
+beholder adgangen. `POST /peers/{name}/rotate` tager `{"public_key": …}`.
 
 ### Deploy: livscyklus og labels
 

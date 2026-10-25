@@ -117,6 +117,11 @@ enum Commands {
         #[command(subcommand)]
         command: Ipv6Commands,
     },
+    /// Extra WireGuard peers (a phone, a colleague, CI) with access to your containers only
+    Peer {
+        #[command(subcommand)]
+        command: PeerCommands,
+    },
     /// Network information
     Network {
         #[command(subcommand)]
@@ -559,6 +564,112 @@ enum DomainCommands {
     Remove {
         /// The domain to remove
         domain: String,
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+    },
+}
+
+// ============= PEER COMMANDS =============
+
+#[derive(Subcommand)]
+enum PeerCommands {
+    /// Create a peer: generates a keypair here, uploads only the public key,
+    /// writes a WireGuard config you hand to the device
+    ///
+    ///   nordkraft peer add anna-laptop --all
+    ///   nordkraft peer add ci --container web --ports 80,443 --container db
+    ///   nordkraft peer add phone --all --qr
+    ///   nordkraft peer add anna --all --pubkey 'K7f…='   (she made her own key)
+    Add {
+        /// Peer name: a-z, 0-9 and '-', e.g. anna-laptop
+        name: String,
+        /// Reach every container you own (now and later)
+        #[arg(long)]
+        all: bool,
+        /// Reach only these containers (repeatable; name, ID or alias)
+        #[arg(short, long = "container")]
+        containers: Vec<String>,
+        /// Restrict the given containers to these TCP ports, e.g. 80,443
+        #[arg(long)]
+        ports: Option<String>,
+        /// Use this public key instead of generating a keypair here
+        #[arg(long)]
+        pubkey: Option<String>,
+        /// Where to write the WireGuard config (default ~/.nordkraft/peers/<name>.conf)
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Also print the config as a QR code (needs qrencode)
+        #[arg(long)]
+        qr: bool,
+    },
+    /// List your peers with address, scope and last handshake
+    #[command(alias = "ls")]
+    List,
+    /// Show one peer: scope, targets with their current IPs, connection state
+    Show {
+        /// Peer name
+        name: String,
+    },
+    /// Grant access to more containers
+    Allow {
+        /// Peer name
+        name: String,
+        /// Container(s) to add (repeatable; name, ID or alias)
+        #[arg(short, long = "container", required = true)]
+        containers: Vec<String>,
+        /// Restrict the added containers to these TCP ports, e.g. 80,443
+        #[arg(long)]
+        ports: Option<String>,
+    },
+    /// Take access to containers away
+    Revoke {
+        /// Peer name
+        name: String,
+        /// Container(s) to remove (repeatable)
+        #[arg(short, long = "container", required = true)]
+        containers: Vec<String>,
+    },
+    /// Replace the scope: every container, or exactly these
+    Set {
+        /// Peer name
+        name: String,
+        /// Reach every container you own
+        #[arg(long, conflicts_with = "only")]
+        all: bool,
+        /// Reach only these containers, comma-separated
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+    },
+    /// Cut the peer off without deleting it
+    Disable {
+        /// Peer name
+        name: String,
+    },
+    /// Re-enable a disabled peer
+    Enable {
+        /// Peer name
+        name: String,
+    },
+    /// New keypair, same address (writes a new config)
+    Rotate {
+        /// Peer name
+        name: String,
+        /// Use this public key instead of generating a keypair here
+        #[arg(long)]
+        pubkey: Option<String>,
+        /// Where to write the WireGuard config (default ~/.nordkraft/peers/<name>.conf)
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Also print the config as a QR code (needs qrencode)
+        #[arg(long)]
+        qr: bool,
+    },
+    /// Delete a peer
+    #[command(alias = "rm")]
+    Remove {
+        /// Peer name
+        name: String,
         /// Skip confirmation prompt
         #[arg(short, long)]
         yes: bool,
@@ -1952,6 +2063,7 @@ async fn main() {
         Commands::Ingress { command } => handle_ingress(command, json_output).await,
         Commands::Domain { command } => handle_domain(command, json_output).await,
         Commands::Ipv6 { command } => handle_ipv6(command, json_output).await,
+        Commands::Peer { command } => handle_peer(command, json_output).await,
         Commands::Network { command } => handle_network(command, json_output).await,
         Commands::Nodes => handle_nodes(json_output).await,
         Commands::Status => handle_status(json_output).await,
@@ -2007,7 +2119,9 @@ async fn main() {
             handle_logs_interactive(container, lines, json_output).await
         }
         Commands::Stop { container } => handle_stop_interactive(container, json_output).await,
-        Commands::Start { container, wait } => handle_start_interactive(container, wait, json_output).await,
+        Commands::Start { container, wait } => {
+            handle_start_interactive(container, wait, json_output).await
+        }
         Commands::Shell { container, cmd } => handle_shell(container, cmd, json_output).await,
         Commands::Exec {
             container,
@@ -2928,7 +3042,10 @@ async fn handle_container_start(
     } else {
         match result.status.as_deref() {
             Some("running") => println!("{} Container running", "✅".green().bold()),
-            Some("timeout") => println!("{} Start sent, but the container did not report running in time", "⚠️".yellow().bold()),
+            Some("timeout") => println!(
+                "{} Start sent, but the container did not report running in time",
+                "⚠️".yellow().bold()
+            ),
             _ => println!("{} Container started", "✅".green().bold()),
         }
     }
@@ -4697,6 +4814,555 @@ async fn handle_ingress(
 }
 
 // ============= DOMAIN HANDLERS =============
+
+// ============= PEER HANDLERS =============
+
+const PEERS_DIR: &str = "peers";
+
+fn parse_port_list(ports: &Option<String>) -> Result<Option<Vec<u16>>, Box<dyn std::error::Error>> {
+    let Some(p) = ports else { return Ok(None) };
+    let mut out = Vec::new();
+    for part in p.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let n: u16 = part
+            .parse()
+            .map_err(|_| format!("invalid port {part:?} (expected e.g. --ports 80,443)"))?;
+        if n == 0 {
+            return Err("port 0 is not valid".into());
+        }
+        out.push(n);
+    }
+    Ok(if out.is_empty() { None } else { Some(out) })
+}
+
+fn peer_targets_json(containers: &[String], ports: &Option<Vec<u16>>) -> Vec<serde_json::Value> {
+    containers
+        .iter()
+        .map(|c| serde_json::json!({ "container": resolve_alias(c), "ports": ports }))
+        .collect()
+}
+
+/// Render the device's WireGuard config from the API's `client` block.
+fn render_peer_config(peer: &serde_json::Value, private_key: Option<&str>) -> String {
+    let client = &peer["client"];
+    let s = |k: &str| {
+        client
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let allowed: Vec<String> = client["allowed_ips"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let server_key = client
+        .get("server_public_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<SERVER PUBLIC KEY: ask the operator>");
+    let private_key =
+        private_key.unwrap_or("<the private key that belongs to the public key you supplied>");
+    let name = peer["name"].as_str().unwrap_or("peer");
+    let scope = peer["scope"].as_str().unwrap_or("all");
+    let mut reach = String::new();
+    if scope == "all" {
+        reach.push_str(&format!("#   every container in {}\n", allowed.join(", ")));
+    } else if let Some(t) = peer["targets"].as_array() {
+        for t in t {
+            let c = t["container"].as_str().unwrap_or("?");
+            let ip = t["ip"]
+                .as_str()
+                .unwrap_or("(no running container with that name)");
+            let ports = t["ports"]
+                .as_array()
+                .map(|a| {
+                    format!(
+                        "  tcp {}",
+                        a.iter()
+                            .filter_map(|v| v.as_u64())
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                })
+                .unwrap_or_default();
+            reach.push_str(&format!("#   {c}  {ip}{ports}\n"));
+        }
+    }
+    format!(
+        "[Interface]\nPrivateKey = {private_key}\nAddress = {}\n\n[Peer]\nPublicKey = {server_key}\nEndpoint = {}\nAllowedIPs = {}\nPersistentKeepalive = 25\n\n# Nordkraft peer \"{name}\". Reachable from this device (enforced by Nordkraft, not by this file):\n{reach}",
+        s("address"),
+        s("server_endpoint"),
+        allowed.join(", "),
+    )
+}
+
+fn write_peer_config(
+    name: &str,
+    out: &Option<PathBuf>,
+    config: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let path = match out {
+        Some(p) => p.clone(),
+        None => {
+            let dir = get_config_dir().join(PEERS_DIR);
+            std::fs::create_dir_all(&dir)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+            }
+            dir.join(format!("{name}.conf"))
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        f.write_all(config.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&path, config)?;
+    Ok(path)
+}
+
+fn print_qr(config: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let child = Command::new("qrencode")
+        .args(["-t", "ansiutf8"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .spawn();
+    match child {
+        Ok(mut c) => {
+            if let Some(mut stdin) = c.stdin.take() {
+                let _ = stdin.write_all(config.as_bytes());
+            }
+            let _ = c.wait();
+        }
+        Err(_) => {
+            println!(
+                "   {}",
+                "qrencode not found — install it (brew install qrencode / apt install qrencode) for a QR code."
+                    .yellow()
+            );
+        }
+    }
+}
+
+fn handshake_label(peer: &serde_json::Value) -> String {
+    match peer["live"]["latest_handshake"].as_str() {
+        Some(h) if !h.is_empty() => h.to_string(),
+        _ => "never".to_string(),
+    }
+}
+
+fn print_peer(peer: &serde_json::Value) {
+    let name = peer["name"].as_str().unwrap_or("?");
+    let status = peer["status"].as_str().unwrap_or("?");
+    println!("{}", format!("🔗 {name}").cyan().bold());
+    println!();
+    println!(
+        "   {} {}",
+        "Address:".cyan(),
+        peer["vpn_ip"].as_str().unwrap_or("?")
+    );
+    println!(
+        "   {} {}",
+        "Status:".cyan(),
+        if status == "active" {
+            status.green()
+        } else {
+            status.yellow()
+        }
+    );
+    println!("   {} {}", "Handshake:".cyan(), handshake_label(peer));
+    if let Some(ep) = peer["live"]["endpoint"].as_str() {
+        println!("   {} {}", "From:".cyan(), ep);
+    }
+    if let (Some(rx), Some(tx)) = (
+        peer["live"]["transfer_rx"].as_str(),
+        peer["live"]["transfer_tx"].as_str(),
+    ) {
+        println!("   {} {} received, {} sent", "Traffic:".cyan(), rx, tx);
+    }
+    println!(
+        "   {} {}",
+        "Key:".cyan(),
+        peer["public_key"].as_str().unwrap_or("?").dimmed()
+    );
+    println!();
+    if peer["scope"].as_str() == Some("all") {
+        let allowed = peer["client"]["allowed_ips"][0].as_str().unwrap_or("?");
+        println!("   {} every container ({})", "Reaches:".cyan(), allowed);
+    } else {
+        println!("   {}", "Reaches:".cyan());
+        if let Some(t) = peer["targets"].as_array() {
+            for t in t {
+                let c = t["container"].as_str().unwrap_or("?");
+                let ports = t["ports"]
+                    .as_array()
+                    .map(|a| {
+                        format!(
+                            " tcp {}",
+                            a.iter()
+                                .filter_map(|v| v.as_u64())
+                                .map(|v| v.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )
+                    })
+                    .unwrap_or_default();
+                match t["ip"].as_str() {
+                    Some(ip) => println!("     {c:<24} {ip}{ports}"),
+                    None => println!(
+                        "     {c:<24} {}",
+                        "no running container with that name (dangling)".yellow()
+                    ),
+                }
+            }
+        }
+    }
+    if let Some(errs) = peer["reconcile_errors"].as_array() {
+        println!();
+        for e in errs {
+            println!("   {} {}", "⚠️".yellow(), e.as_str().unwrap_or(""));
+        }
+    }
+}
+
+/// Create or rotate: keypair handling and config output shared by both.
+async fn peer_issue_config(
+    name: &str,
+    pubkey: Option<String>,
+    out: &Option<PathBuf>,
+    qr: bool,
+    json_output: bool,
+    send: impl FnOnce(String) -> reqwest::RequestBuilder,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (private_key, public_key) = match pubkey {
+        Some(k) => (None, k.trim().to_string()),
+        None => {
+            if !json_output {
+                println!("{}", "  Generating WireGuard keypair locally...".dimmed());
+            }
+            let (private, public) = generate_wireguard_keypair().map_err(|e| {
+                format!("{e}\n   Either install wireguard-tools here, or let the device create its own key and pass it with --pubkey.")
+            })?;
+            (Some(private), public)
+        }
+    };
+
+    let response = send(public_key).send().await?;
+    let result: serde_json::Value = response.json().await?;
+    if let Some(error) = result.get("error").and_then(|v| v.as_str()) {
+        return Err(error.to_string().into());
+    }
+
+    let config = render_peer_config(&result, private_key.as_deref());
+    let path = write_peer_config(name, out, &config)?;
+
+    if json_output {
+        let mut v = result.clone();
+        v["config_path"] = serde_json::json!(path.to_string_lossy());
+        v["config"] = serde_json::json!(config);
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+
+    println!("{}", "✅ Peer ready".green().bold());
+    println!();
+    print_peer(&result);
+    println!();
+    println!(
+        "   {} {}",
+        "Config written:".cyan(),
+        path.display().to_string().white().bold()
+    );
+    if private_key.is_none() {
+        println!(
+            "   {}",
+            "You supplied the public key, so the PrivateKey line is a placeholder: fill it in on the device.".yellow()
+        );
+    }
+    if result["client"]["server_public_key"].is_null() {
+        println!(
+            "   {}",
+            "This garage has no server public key on record; fill in PublicKey under [Peer] by hand.".yellow()
+        );
+    }
+    println!();
+    println!("{}", config.dimmed());
+    if qr {
+        println!();
+        print_qr(&config);
+    }
+    println!(
+        "   Import the file in the WireGuard app on the device, or: {}",
+        format!("sudo wg-quick up {}", path.display())
+            .white()
+            .bold()
+    );
+    Ok(())
+}
+
+async fn handle_peer(
+    command: PeerCommands,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = create_client()?;
+
+    match command {
+        PeerCommands::Add {
+            name,
+            all,
+            containers,
+            ports,
+            pubkey,
+            out,
+            qr,
+        } => {
+            if !all && containers.is_empty() {
+                return Err(
+                    "say what the peer may reach: --all, or one or more --container <name>".into(),
+                );
+            }
+            if all && !containers.is_empty() {
+                return Err("--all and --container exclude each other".into());
+            }
+            let ports = parse_port_list(&ports)?;
+            let targets = peer_targets_json(&containers, &ports);
+            let scope = if all { "all" } else { "containers" };
+            let url = format!("{}/peers", *API_BASE_URL);
+            let name_for_body = name.clone();
+            peer_issue_config(&name, pubkey, &out, qr, json_output, |public_key| {
+                client.post(&url).json(&serde_json::json!({
+                    "name": name_for_body,
+                    "public_key": public_key,
+                    "scope": scope,
+                    "targets": targets,
+                }))
+            })
+            .await
+        }
+
+        PeerCommands::List => {
+            let url = format!("{}/peers", *API_BASE_URL);
+            let result: serde_json::Value = client.get(&url).send().await?.json().await?;
+            if let Some(error) = result.get("error").and_then(|v| v.as_str()) {
+                return Err(error.to_string().into());
+            }
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                return Ok(());
+            }
+            let peers = result["peers"].as_array().cloned().unwrap_or_default();
+            if peers.is_empty() {
+                println!(
+                    "No peers yet. Create one with: {}",
+                    "nordkraft peer add <name> --all".white().bold()
+                );
+                return Ok(());
+            }
+            println!(
+                "{:<20} {:<16} {:<10} {:<9} {:<22} {}",
+                "NAME".bold(),
+                "ADDRESS".bold(),
+                "SCOPE".bold(),
+                "STATUS".bold(),
+                "HANDSHAKE".bold(),
+                "REACHES".bold()
+            );
+            for p in &peers {
+                let reaches = if p["scope"].as_str() == Some("all") {
+                    "every container".to_string()
+                } else {
+                    p["targets"]
+                        .as_array()
+                        .map(|t| {
+                            t.iter()
+                                .filter_map(|x| x["container"].as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default()
+                };
+                let status = p["status"].as_str().unwrap_or("?");
+                println!(
+                    "{:<20} {:<16} {:<10} {:<9} {:<22} {}",
+                    p["name"].as_str().unwrap_or("?"),
+                    p["vpn_ip"].as_str().unwrap_or("?"),
+                    p["scope"].as_str().unwrap_or("?"),
+                    if status == "active" {
+                        status.green()
+                    } else {
+                        status.yellow()
+                    },
+                    handshake_label(p),
+                    reaches
+                );
+            }
+            Ok(())
+        }
+
+        PeerCommands::Show { name } => {
+            let url = format!("{}/peers/{}", *API_BASE_URL, name);
+            let result: serde_json::Value = client.get(&url).send().await?.json().await?;
+            if let Some(error) = result.get("error").and_then(|v| v.as_str()) {
+                return Err(error.to_string().into());
+            }
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                print_peer(&result);
+            }
+            Ok(())
+        }
+
+        PeerCommands::Allow {
+            name,
+            containers,
+            ports,
+        } => {
+            let ports = parse_port_list(&ports)?;
+            let body = serde_json::json!({ "add_targets": peer_targets_json(&containers, &ports) });
+            peer_patch(&client, &name, body, json_output).await
+        }
+
+        PeerCommands::Revoke { name, containers } => {
+            let names: Vec<String> = containers.iter().map(|c| resolve_alias(c)).collect();
+            let body = serde_json::json!({ "remove_targets": names });
+            peer_patch(&client, &name, body, json_output).await
+        }
+
+        PeerCommands::Set { name, all, only } => {
+            if !all && only.is_empty() {
+                return Err("use --all, or --only web,db".into());
+            }
+            let body = if all {
+                serde_json::json!({ "scope": "all" })
+            } else {
+                serde_json::json!({ "targets": peer_targets_json(&only, &None) })
+            };
+            peer_patch(&client, &name, body, json_output).await
+        }
+
+        PeerCommands::Disable { name } => {
+            peer_set_status(&client, &name, "disable", json_output).await
+        }
+        PeerCommands::Enable { name } => {
+            peer_set_status(&client, &name, "enable", json_output).await
+        }
+
+        PeerCommands::Rotate {
+            name,
+            pubkey,
+            out,
+            qr,
+        } => {
+            let url = format!("{}/peers/{}/rotate", *API_BASE_URL, name);
+            peer_issue_config(&name, pubkey, &out, qr, json_output, |public_key| {
+                client
+                    .post(&url)
+                    .json(&serde_json::json!({ "public_key": public_key }))
+            })
+            .await
+        }
+
+        PeerCommands::Remove { name, yes } => {
+            if !yes && !json_output && !non_interactive() {
+                let confirmed = Confirm::with_theme(&ColorfulTheme::default())
+                    .with_prompt(format!(
+                        "Remove peer {name}? The device loses access immediately."
+                    ))
+                    .default(false)
+                    .interact()?;
+                if !confirmed {
+                    println!("Cancelled.");
+                    return Ok(());
+                }
+            }
+            let url = format!("{}/peers/{}", *API_BASE_URL, name);
+            let result: serde_json::Value = client.delete(&url).send().await?.json().await?;
+            if let Some(error) = result.get("error").and_then(|v| v.as_str()) {
+                return Err(error.to_string().into());
+            }
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("{}", format!("🗑️ Peer {name} removed").green());
+                let local = get_config_dir()
+                    .join(PEERS_DIR)
+                    .join(format!("{name}.conf"));
+                if local.exists() {
+                    let _ = std::fs::remove_file(&local);
+                    println!(
+                        "   {} {}",
+                        "Deleted local config".dimmed(),
+                        local.display().to_string().dimmed()
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn peer_patch(
+    client: &Client,
+    name: &str,
+    body: serde_json::Value,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("{}/peers/{}", *API_BASE_URL, name);
+    let result: serde_json::Value = client.patch(&url).json(&body).send().await?.json().await?;
+    if let Some(error) = result.get("error").and_then(|v| v.as_str()) {
+        return Err(error.to_string().into());
+    }
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("{}", "✅ Updated".green().bold());
+        println!();
+        print_peer(&result);
+    }
+    Ok(())
+}
+
+async fn peer_set_status(
+    client: &Client,
+    name: &str,
+    verb: &str,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("{}/peers/{}/{}", *API_BASE_URL, name, verb);
+    let result: serde_json::Value = client.post(&url).send().await?.json().await?;
+    if let Some(error) = result.get("error").and_then(|v| v.as_str()) {
+        return Err(error.to_string().into());
+    }
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("{}", format!("✅ Peer {name} {verb}d").green().bold());
+        println!();
+        print_peer(&result);
+    }
+    Ok(())
+}
 
 /// Pretty-print the DNS instructions block returned by the API.
 fn print_dns_instructions(instructions: &serde_json::Value) {

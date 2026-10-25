@@ -10,3 +10,4 @@ database-backups-dev/
 *.sql.gz
 dist/
 build_push_to_ry-1.sh
+.deploy.log
