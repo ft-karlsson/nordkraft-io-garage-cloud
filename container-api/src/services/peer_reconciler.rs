@@ -42,6 +42,9 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 // 172.20.<slot>.<index>    child peer of slot S, index 2..254
 // 172.21.<slot>.0/24       containers of slot S
 
+/// The whole VPN range. Owners use its first /24, children the rest.
+pub const VPN_NET: &str = "172.20.0.0/16";
+
 /// True for every address a child peer can have: inside 172.20.0.0/16 but
 /// outside the owners' 172.20.0.0/24. Used by the auth guard (children never
 /// get an API identity) and by the generated input rule.
@@ -648,6 +651,56 @@ pub async fn wg_remove_peer(wg_interface: &str, key: &str) -> Result<(), BoxErro
     Ok(())
 }
 
+/// `ip` needs root; the route manager reads ROUTE_USE_SUDO for the same reason.
+fn ip_cmd(args: &[&str]) -> Command {
+    let use_sudo = std::env::var("ROUTE_USE_SUDO")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    if use_sudo {
+        let mut c = Command::new("sudo");
+        c.arg("ip").args(args);
+        c
+    } else {
+        let mut c = Command::new("ip");
+        c.args(args);
+        c
+    }
+}
+
+/// Make sure the whole VPN range is routed to the WireGuard interface.
+///
+/// Owners sit inside the /24 that is the interface address, so they work
+/// with nothing else. Children live in 172.20.<slot>.0/24: on a controller
+/// whose wg0 carries only a /24 (rasp2's netplan did) their packets fail the
+/// reverse-path check before any nft rule sees them, and replies leave via
+/// the default gateway. One link route fixes both directions. Re-asserted on
+/// every pass, so a netplan apply or reboot cannot take it away for long.
+/// Returns true when the route had to be added.
+async fn ensure_vpn_route(wg_interface: &str) -> Result<bool, BoxError> {
+    let out = ip_cmd(&["route", "show", VPN_NET, "dev", wg_interface])
+        .output()
+        .await?;
+    let present = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|l| l.trim_start().starts_with(VPN_NET));
+    if present {
+        return Ok(false);
+    }
+    let out = ip_cmd(&["route", "replace", VPN_NET, "dev", wg_interface])
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Err(format!(
+            "ip route replace {} dev {} failed: {}",
+            VPN_NET,
+            wg_interface,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+        .into());
+    }
+    Ok(true)
+}
+
 /// Apply a rendered ruleset atomically and read it back.
 async fn apply_ruleset(ruleset: &str) -> Result<(), BoxError> {
     let path = std::env::temp_dir().join("nordkraft-ruleset.nft");
@@ -708,6 +761,8 @@ pub struct ReconcileReport {
     pub wg_added: Vec<String>,
     pub wg_updated: Vec<String>,
     pub wg_removed: Vec<String>,
+    /// The 172.20.0.0/16 link route on the interface had to be (re)added.
+    pub route_added: bool,
     pub nft_applied: bool,
     pub errors: Vec<String>,
 }
@@ -823,6 +878,19 @@ impl PeerReconciler {
             Err(e) => report.errors.push(e.to_string()),
         }
 
+        match ensure_vpn_route(&self.wg_interface).await {
+            Ok(added) => {
+                report.route_added = added;
+                if added {
+                    warn!(
+                        "peer reconciler: added route {} dev {} (child peers need it)",
+                        VPN_NET, self.wg_interface
+                    );
+                }
+            }
+            Err(e) => report.errors.push(e.to_string()),
+        }
+
         let ruleset = render_ruleset(&desired, &self.wg_interface, self.mode);
         match apply_ruleset(&ruleset).await {
             Ok(()) => report.nft_applied = true,
@@ -831,7 +899,8 @@ impl PeerReconciler {
 
         let changed = !(report.wg_added.is_empty()
             && report.wg_updated.is_empty()
-            && report.wg_removed.is_empty());
+            && report.wg_removed.is_empty())
+            || report.route_added;
         if !report.errors.is_empty() {
             error!(
                 "peer reconciler: {} owner(s), {} child peer(s); errors: {}",

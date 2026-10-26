@@ -54,10 +54,12 @@ Why this shape:
 - `172.20.1.0-172.20.255.255` means "every child of every tenant" — one rule
   keeps all of them off the controller host.
 - No new allocation table: `(user_slot, peer_index)` is the address.
-- The controller's `wg0` is `172.20.0.254/16` and agents route
-  `172.20.0.0/16` back to the controller, so return traffic already works.
-  `SETUP_WIREGUARD.md` shows `172.20.0.1/24` in its hand-written example —
-  that must become `/16` or children get no return path.
+- Agents route `172.20.0.0/16` back to the controller, so that side already
+  works. The controller itself must route the whole `/16` to `wg0`: rasp2's
+  netplan gives `wg0` only `172.20.0.254/24`, which made the first phone's
+  packets fail the reverse-path check (found 2026-10-26). The reconciler now
+  asserts `172.20.0.0/16 dev wg0` on every pass, so neither netplan nor the
+  installer's address choice matters any more.
 - Freed slots follow the existing 30-day cool-off (account deletion design), so
   a child range is never re-issued while a stale client config may still exist.
 
