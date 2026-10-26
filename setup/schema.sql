@@ -2,10 +2,10 @@
 -- PostgreSQL database dump
 --
 
-\restrict mhKaGPDCFbAimCF392RzHAYSdYrZgFbIT2ZPUYFdN4hFFlZ8mNCO6N5yqHk8vQF
+\restrict I9j9VKduhczvtYMXrGvnEjCCuhm1qHfSszJA9d87rO5bH7F5aCzQZiicXK2hHrV
 
--- Dumped from database version 16.13 (Ubuntu 16.13-0ubuntu0.24.04.1)
--- Dumped by pg_dump version 16.13 (Ubuntu 16.13-0ubuntu0.24.04.1)
+-- Dumped from database version 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)
+-- Dumped by pg_dump version 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -341,7 +341,8 @@ CREATE TABLE public.containers (
     cpu_limit double precision DEFAULT 0.5,
     memory_limit_mb bigint DEFAULT 512,
     volume_size_mb bigint DEFAULT 0,
-    CONSTRAINT containers_status_check CHECK (((status)::text = ANY (ARRAY[('created'::character varying)::text, ('running'::character varying)::text, ('stopped'::character varying)::text, ('deleted'::character varying)::text, ('error'::character varying)::text])))
+    status_message text,
+    CONSTRAINT containers_status_check CHECK (((status)::text = ANY ((ARRAY['created'::character varying, 'deploying'::character varying, 'running'::character varying, 'stopped'::character varying, 'deleted'::character varying, 'failed'::character varying, 'error'::character varying])::text[])))
 );
 
 
@@ -388,6 +389,63 @@ ALTER SEQUENCE public.containers_id_seq OWNER TO garage_user;
 --
 
 ALTER SEQUENCE public.containers_id_seq OWNED BY public.containers.id;
+
+
+--
+-- Name: custom_domains; Type: TABLE; Schema: public; Owner: garage_user
+--
+
+CREATE TABLE public.custom_domains (
+    id integer NOT NULL,
+    user_id character varying(36) NOT NULL,
+    container_id character varying(64) NOT NULL,
+    domain character varying(253) NOT NULL,
+    target_port integer DEFAULT 80 NOT NULL,
+    status character varying(20) DEFAULT 'pending_dns'::character varying NOT NULL,
+    verification_token character varying(64) NOT NULL,
+    dns_check_successes integer DEFAULT 0 NOT NULL,
+    verified_at timestamp with time zone,
+    degraded_since timestamp with time zone,
+    cert_refid character varying(100),
+    cert_expires_at timestamp with time zone,
+    haproxy_backend_name character varying(100),
+    haproxy_acl_name character varying(100),
+    haproxy_server_name character varying(100),
+    static_route_created boolean DEFAULT false NOT NULL,
+    target_ip character varying(45),
+    last_checked_at timestamp with time zone,
+    last_error text,
+    retry_count integer DEFAULT 0 NOT NULL,
+    next_retry_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT custom_domains_status_check CHECK (((status)::text = ANY ((ARRAY['pending_dns'::character varying, 'dns_verified'::character varying, 'issuing_cert'::character varying, 'cert_ready'::character varying, 'activating'::character varying, 'active'::character varying, 'degraded'::character varying, 'error'::character varying, 'disabled'::character varying])::text[]))),
+    CONSTRAINT custom_domains_target_port_check CHECK (((target_port > 0) AND (target_port <= 65535)))
+);
+
+
+ALTER TABLE public.custom_domains OWNER TO garage_user;
+
+--
+-- Name: custom_domains_id_seq; Type: SEQUENCE; Schema: public; Owner: garage_user
+--
+
+CREATE SEQUENCE public.custom_domains_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE public.custom_domains_id_seq OWNER TO garage_user;
+
+--
+-- Name: custom_domains_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: garage_user
+--
+
+ALTER SEQUENCE public.custom_domains_id_seq OWNED BY public.custom_domains.id;
 
 
 --
@@ -754,7 +812,8 @@ CREATE TABLE public.plans (
     price character varying(20) NOT NULL,
     description text,
     is_active boolean DEFAULT true,
-    created_at timestamp with time zone DEFAULT now()
+    created_at timestamp with time zone DEFAULT now(),
+    max_peers integer DEFAULT 5 NOT NULL
 );
 
 
@@ -772,6 +831,41 @@ CREATE TABLE public.reserved_subdomains (
 
 
 ALTER TABLE public.reserved_subdomains OWNER TO garage_user;
+
+--
+-- Name: tenant_peer_targets; Type: TABLE; Schema: public; Owner: garage_user
+--
+
+CREATE TABLE public.tenant_peer_targets (
+    peer_id character varying(36) NOT NULL,
+    container_name character varying(100) NOT NULL,
+    ports integer[]
+);
+
+
+ALTER TABLE public.tenant_peer_targets OWNER TO garage_user;
+
+--
+-- Name: tenant_peers; Type: TABLE; Schema: public; Owner: garage_user
+--
+
+CREATE TABLE public.tenant_peers (
+    id character varying(36) NOT NULL,
+    user_id character varying(36) NOT NULL,
+    name character varying(63) NOT NULL,
+    peer_index smallint NOT NULL,
+    public_key text NOT NULL,
+    scope character varying(20) NOT NULL,
+    status character varying(20) DEFAULT 'active'::character varying NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT tenant_peers_peer_index_check CHECK (((peer_index >= 2) AND (peer_index <= 254))),
+    CONSTRAINT tenant_peers_scope_check CHECK (((scope)::text = ANY ((ARRAY['all'::character varying, 'containers'::character varying])::text[]))),
+    CONSTRAINT tenant_peers_status_check CHECK (((status)::text = ANY ((ARRAY['active'::character varying, 'disabled'::character varying])::text[])))
+);
+
+
+ALTER TABLE public.tenant_peers OWNER TO garage_user;
 
 --
 -- Name: user_network_info; Type: VIEW; Schema: public; Owner: garage_user
@@ -809,6 +903,13 @@ ALTER TABLE ONLY public.container_volumes ALTER COLUMN id SET DEFAULT nextval('p
 --
 
 ALTER TABLE ONLY public.containers ALTER COLUMN id SET DEFAULT nextval('public.containers_id_seq'::regclass);
+
+
+--
+-- Name: custom_domains id; Type: DEFAULT; Schema: public; Owner: garage_user
+--
+
+ALTER TABLE ONLY public.custom_domains ALTER COLUMN id SET DEFAULT nextval('public.custom_domains_id_seq'::regclass);
 
 
 --
@@ -885,6 +986,22 @@ ALTER TABLE ONLY public.containers
 
 ALTER TABLE ONLY public.containers
     ADD CONSTRAINT containers_public_url_key UNIQUE (public_url);
+
+
+--
+-- Name: custom_domains custom_domains_domain_unique; Type: CONSTRAINT; Schema: public; Owner: garage_user
+--
+
+ALTER TABLE ONLY public.custom_domains
+    ADD CONSTRAINT custom_domains_domain_unique UNIQUE (domain);
+
+
+--
+-- Name: custom_domains custom_domains_pkey; Type: CONSTRAINT; Schema: public; Owner: garage_user
+--
+
+ALTER TABLE ONLY public.custom_domains
+    ADD CONSTRAINT custom_domains_pkey PRIMARY KEY (id);
 
 
 --
@@ -1016,6 +1133,46 @@ ALTER TABLE ONLY public.reserved_subdomains
 
 
 --
+-- Name: tenant_peer_targets tenant_peer_targets_pkey; Type: CONSTRAINT; Schema: public; Owner: garage_user
+--
+
+ALTER TABLE ONLY public.tenant_peer_targets
+    ADD CONSTRAINT tenant_peer_targets_pkey PRIMARY KEY (peer_id, container_name);
+
+
+--
+-- Name: tenant_peers tenant_peers_pkey; Type: CONSTRAINT; Schema: public; Owner: garage_user
+--
+
+ALTER TABLE ONLY public.tenant_peers
+    ADD CONSTRAINT tenant_peers_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tenant_peers tenant_peers_public_key_key; Type: CONSTRAINT; Schema: public; Owner: garage_user
+--
+
+ALTER TABLE ONLY public.tenant_peers
+    ADD CONSTRAINT tenant_peers_public_key_key UNIQUE (public_key);
+
+
+--
+-- Name: tenant_peers tenant_peers_user_id_name_key; Type: CONSTRAINT; Schema: public; Owner: garage_user
+--
+
+ALTER TABLE ONLY public.tenant_peers
+    ADD CONSTRAINT tenant_peers_user_id_name_key UNIQUE (user_id, name);
+
+
+--
+-- Name: tenant_peers tenant_peers_user_id_peer_index_key; Type: CONSTRAINT; Schema: public; Owner: garage_user
+--
+
+ALTER TABLE ONLY public.tenant_peers
+    ADD CONSTRAINT tenant_peers_user_id_peer_index_key UNIQUE (user_id, peer_index);
+
+
+--
 -- Name: users users_email_key; Type: CONSTRAINT; Schema: public; Owner: garage_user
 --
 
@@ -1071,6 +1228,27 @@ CREATE INDEX idx_containers_user ON public.containers USING btree (user_id);
 --
 
 CREATE INDEX idx_containers_user_active ON public.containers USING btree (user_id, status) WHERE ((status)::text <> 'deleted'::text);
+
+
+--
+-- Name: idx_custom_domains_container; Type: INDEX; Schema: public; Owner: garage_user
+--
+
+CREATE INDEX idx_custom_domains_container ON public.custom_domains USING btree (container_id);
+
+
+--
+-- Name: idx_custom_domains_pending; Type: INDEX; Schema: public; Owner: garage_user
+--
+
+CREATE INDEX idx_custom_domains_pending ON public.custom_domains USING btree (status, next_retry_at) WHERE ((status)::text <> 'disabled'::text);
+
+
+--
+-- Name: idx_custom_domains_user; Type: INDEX; Schema: public; Owner: garage_user
+--
+
+CREATE INDEX idx_custom_domains_user ON public.custom_domains USING btree (user_id);
 
 
 --
@@ -1151,6 +1329,13 @@ CREATE INDEX idx_ingress_user ON public.ingress_routes USING btree (user_id);
 
 
 --
+-- Name: idx_tenant_peers_user; Type: INDEX; Schema: public; Owner: garage_user
+--
+
+CREATE INDEX idx_tenant_peers_user ON public.tenant_peers USING btree (user_id);
+
+
+--
 -- Name: idx_unique_container_ingress; Type: INDEX; Schema: public; Owner: garage_user
 --
 
@@ -1186,6 +1371,13 @@ CREATE INDEX idx_users_email ON public.users USING btree (email);
 
 
 --
+-- Name: custom_domains trigger_custom_domains_updated_at; Type: TRIGGER; Schema: public; Owner: garage_user
+--
+
+CREATE TRIGGER trigger_custom_domains_updated_at BEFORE UPDATE ON public.custom_domains FOR EACH ROW EXECUTE FUNCTION public.update_ingress_timestamp();
+
+
+--
 -- Name: ingress_routes trigger_ingress_updated_at; Type: TRIGGER; Schema: public; Owner: garage_user
 --
 
@@ -1214,6 +1406,14 @@ ALTER TABLE ONLY public.containers
 
 ALTER TABLE ONLY public.containers
     ADD CONSTRAINT containers_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: custom_domains custom_domains_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: garage_user
+--
+
+ALTER TABLE ONLY public.custom_domains
+    ADD CONSTRAINT custom_domains_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 
 --
@@ -1254,6 +1454,22 @@ ALTER TABLE ONLY public.ingress_routes
 
 ALTER TABLE ONLY public.nodes
     ADD CONSTRAINT nodes_garage_id_fkey FOREIGN KEY (garage_id) REFERENCES public.garages(garage_id);
+
+
+--
+-- Name: tenant_peer_targets tenant_peer_targets_peer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: garage_user
+--
+
+ALTER TABLE ONLY public.tenant_peer_targets
+    ADD CONSTRAINT tenant_peer_targets_peer_id_fkey FOREIGN KEY (peer_id) REFERENCES public.tenant_peers(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tenant_peers tenant_peers_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: garage_user
+--
+
+ALTER TABLE ONLY public.tenant_peers
+    ADD CONSTRAINT tenant_peers_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 
 --
@@ -1333,5 +1549,5 @@ ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT ALL ON TABLES 
 -- PostgreSQL database dump complete
 --
 
-\unrestrict mhKaGPDCFbAimCF392RzHAYSdYrZgFbIT2ZPUYFdN4hFFlZ8mNCO6N5yqHk8vQF
+\unrestrict I9j9VKduhczvtYMXrGvnEjCCuhm1qHfSszJA9d87rO5bH7F5aCzQZiicXK2hHrV
 
