@@ -1,0 +1,27 @@
+{
+  "client": {
+    "address": "172.20.99.3/32",
+    "allowed_ips": [
+      "172.21.99.0/24"
+    ],
+    "persistent_keepalive": 25,
+    "server_endpoint": "127.0.0.1:51820",
+    "server_public_key": null
+  },
+  "created_at": "<var>",
+  "name": "<var>",
+  "public_key": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+  "scope": "containers",
+  "status": "active",
+  "targets": [
+    {
+      "container": "<var>",
+      "ports": [
+        80,
+        443
+      ]
+    }
+  ],
+  "updated_at": "<var>",
+  "vpn_ip": "172.20.99.3"
+}

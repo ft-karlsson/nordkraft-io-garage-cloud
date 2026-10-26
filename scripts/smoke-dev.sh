@@ -260,7 +260,7 @@ P=$("$NK" --json peer allow smoke-one --container "$N2")
 [[ "$(jq '.targets|length' <<<"$P")" == "2" ]] && ok "peer allow adds a target" || fail "peer allow" "$P"
 P=$("$NK" --json peer revoke smoke-one --container "$N2")
 [[ "$(jq '.targets|length' <<<"$P")" == "1" ]] && ok "peer revoke removes it" || fail "peer revoke" "$P"
-"$NK" --json peer show smoke-one | jq 'del(.live) | del(.targets[].ip) | del(.targets[].dangling)' | snapshot peer-show
+"$NK" --json peer show smoke-one | jq 'del(.live, .dangling) | .targets[] |= (del(.ip, .dangling) | .container = "<var>")' | snapshot peer-show
 P=$("$NK" --json peer disable smoke-one)
 [[ "$(jq -r .status <<<"$P")" == "disabled" ]] && ok "peer disable" || fail "peer disable" "$P"
 P=$("$NK" --json peer enable smoke-one)
