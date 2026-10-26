@@ -166,6 +166,7 @@ impl Reaper {
                         Ok(()) => {
                             if let Some(pool) = &self.pool {
                                 let _ = crate::storage::mark_container_deleted(pool, &c.name).await;
+                                crate::services::peer_reconciler::kick();
                             }
                             self.event(&c, "lifecycle", &format!("auto-removed: {reason}"))
                                 .await;

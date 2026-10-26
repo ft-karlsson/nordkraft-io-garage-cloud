@@ -31,13 +31,15 @@ cat /etc/wireguard/server_public.key  # You'll need this for client configs
 ```bash
 sudo tee /etc/wireguard/wg0.conf > /dev/null <<EOF
 [Interface]
-Address = 172.20.0.1/24
+# /16, not /24: child peers live at 172.20.<slot>.<n> and need a route back
+Address = 172.20.0.254/16
 ListenPort = 51820
 PrivateKey = $(sudo cat /etc/wireguard/server_private.key)
 
 # IP forwarding — required for container routing
 PostUp = sysctl -w net.ipv4.ip_forward=1
-PostUp = nft add table inet filter 2>/dev/null || true
+# The chain container-api fills from the database. Deny by default from the start.
+PostUp = nft add table inet filter; nft add chain inet filter forward { type filter hook forward priority 0 \; policy drop \; }
 
 # Peers are added dynamically by container-api via `wg set`
 # Do NOT add peers manually here — they will be managed by the reconciler
@@ -106,7 +108,7 @@ This means:
 
 **Keep `server_private.key` private.** If it leaks, an attacker can impersonate your server and intercept client traffic. Store it with `chmod 600` and do not commit it to version control.
 
-**`AllowedIPs` is a routing table, not a firewall.** WireGuard enforces that packets from peer X can only arrive from peer X's assigned IP, but it does not prevent tenants from reaching each other's containers. That isolation is handled by nftables. Do not remove the nftables rules that `container-api` installs.
+**`AllowedIPs` is a routing table, not a firewall.** WireGuard enforces that packets from peer X can only arrive from peer X's assigned IP, but it does not prevent tenants from reaching each other's containers. That isolation is handled by nftables: `container-api` owns the `inet filter forward` and `inet filter nordkraft_input` chains and rewrites them from the database on every reconcile (see [CHILD_PEERS.md](CHILD_PEERS.md)). Do not add rules to those two chains by hand; they would be gone within five minutes. `VPN_DENY_MODE=drop` (default) drops VPN traffic no rule accepts; `audit` only logs it, for a node migrating from an older accept-by-default chain.
 
 **Do not expose the API port (8001) to the internet.** It should only be reachable over the WireGuard interface (`172.20.0.0/24`). Bind it to the WireGuard address:
 
@@ -115,7 +117,7 @@ export BIND_ADDRESS=172.20.0.1
 export BIND_PORT=8001
 ```
 
-**WgReconciler runs every 5 minutes.** It compares active WireGuard peers against the database and re-adds any that are missing. This handles the known failure mode where `unattended-upgrades` triggers a `systemd-networkd` restart and drops dynamically added peers. If you disable the reconciler, peers will disappear after network restarts.
+**The peer reconciler runs at boot, every 5 minutes and on every change.** It converges the WireGuard peers and the nftables chains to what the database says, both ways: a peer missing after `unattended-upgrades` restarted `systemd-networkd` comes back, and a peer the database does not know (a suspended account, a test peer added by hand) is removed. Set `WG_KEEP_STRAY_PEERS=true` to keep unknown peers instead.
 
 **Do not add a `DNS =` line to client configs on Ubuntu 24.04+** with `systemd-resolved`. It breaks general internet routing. The CLI removes this line automatically — if you write configs manually, leave DNS out.
 
@@ -134,7 +136,7 @@ curl http://172.20.0.1:8001/api/status  # Is the API reachable over WireGuard?
 
 ### Peers disappear after reboot
 
-Make sure you're **not** defining peers in `/etc/wireguard/wg0.conf`. If `wg-quick up wg0` runs on boot with a static config, it overwrites the dynamically-added peers. The WgReconciler will re-add them within 5 minutes, but you can also run `nordkraft auth login` to force re-registration.
+Make sure you're **not** defining peers in `/etc/wireguard/wg0.conf`. If `wg-quick up wg0` runs on boot with a static config, it overwrites the dynamically-added peers. The peer reconciler re-adds them on the next pass (at most 5 minutes); `GET /api/admin/tenants/status` shows the last pass.
 
 ### `wg-quick up wg0` fails
 

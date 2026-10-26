@@ -308,7 +308,7 @@ if ! $DEV; then
 PrivateKey = ${WG_PRIVATE_KEY}
 Address = ${VPN_SERVER_IP}/16
 ListenPort = ${WG_PORT}
-PostUp   = nft add table inet filter; nft add chain inet filter forward { type filter hook forward priority 0 \; }
+PostUp   = nft add table inet filter; nft add chain inet filter forward { type filter hook forward priority 0 \; policy drop \; }
 EOF
       chmod 600 "/etc/wireguard/${WG_INTERFACE}.conf"
     fi
@@ -378,6 +378,8 @@ DATABASE_URL=${DATABASE_URL}
 NATS_ENABLED=true
 NATS_URL=nats://127.0.0.1:4222
 WG_INTERFACE=${WG_INTERFACE}
+# VPN traffic no generated nft rule accepts: drop (default) or audit (log only). See setup/CHILD_PEERS.md
+VPN_DENY_MODE=drop
 VPN_NETWORK=172.20.0.0/16
 CONTAINER_NETWORK=172.21.0.0/16
 NETWORK_MODE=macvlan

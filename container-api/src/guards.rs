@@ -60,6 +60,22 @@ impl<'r> FromRequest<'r> for AuthenticatedUser {
             }
         };
 
+        // A child peer (172.20.<slot>.<n>, see CHILD_PEERS.md) is a network
+        // identity only. Its key is never in `users`, and nft drops its packets
+        // to this host before they get here; this is the third layer, and the
+        // one that leaves a clear log line.
+        if client_ip
+            .parse::<std::net::Ipv4Addr>()
+            .map(crate::services::peer_reconciler::is_child_peer_ip)
+            .unwrap_or(false)
+        {
+            error!("❌ Child peer {} tried the API: refused", client_ip);
+            return Outcome::Error((
+                Status::Unauthorized,
+                "child peers have no API access".to_string(),
+            ));
+        }
+
         // Get app state
         let app_state = match request.guard::<&rocket::State<AppState>>().await {
             Outcome::Success(state) => state,

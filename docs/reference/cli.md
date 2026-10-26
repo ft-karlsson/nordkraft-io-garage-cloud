@@ -519,6 +519,80 @@ nordkraft domain remove DOMÆNE [--yes]
 
 ---
 
+## Peer kommandoer (ekstra WireGuard-adgang)
+
+Giv en telefon, en kollega eller en CI-runner adgang til dine containere,
+uden at give dem din egen nøgle og uden adgang til API'et. Peeren får en
+adresse i dit eget område (`172.20.<slot>.2-254`) og kan kun nå det, du
+tillader. Den private nøgle laves lokalt; kun den offentlige sendes.
+
+### peer add
+
+```bash
+nordkraft peer add NAVN (--all | --container CONTAINER ...) [--ports 80,443] [--pubkey NØGLE] [--out FIL] [--qr]
+```
+
+| Flag | Beskrivelse |
+|------|-------------|
+| `--all` | Må nå alle dine containere, også dem du laver senere |
+| `--container`, `-c` | Må kun nå denne container (gentag flaget for flere) |
+| `--ports` | Begræns de angivne containere til disse TCP-porte |
+| `--pubkey` | Brug enhedens egen offentlige nøgle i stedet for at lave et nøglepar her |
+| `--out`, `-o` | Skriv WireGuard-konfigurationen hertil (default `~/.nordkraft/peers/NAVN.conf`) |
+| `--qr` | Vis også konfigurationen som QR-kode til WireGuard-appen (ingen ekstra værktøj) |
+
+**Eksempler:**
+
+```bash
+nordkraft peer add anna-laptop --all
+nordkraft peer add ci --container web --ports 80,443 --container db
+nordkraft peer add telefon --all --qr
+```
+
+Konfigurationen importeres i WireGuard-appen på enheden, eller med
+`sudo wg-quick up ~/.nordkraft/peers/NAVN.conf`. `AllowedIPs` er altid hele dit
+containerområde, så en ændring af scope kræver ingen ny konfiguration; det er
+noden, der håndhæver, hvad peeren må.
+
+---
+
+### peer list / show
+
+```bash
+nordkraft peer ls
+nordkraft peer show NAVN
+```
+
+Viser adresse, scope, status, seneste handshake og de containere peeren kan
+nå med deres aktuelle IP. En container, der ikke kører lige nu, vises som
+*dangling*; adgangen kommer igen, når en container med det navn kører.
+
+---
+
+### peer allow / revoke / set
+
+```bash
+nordkraft peer allow NAVN --container CONTAINER [--ports 80]
+nordkraft peer revoke NAVN --container CONTAINER
+nordkraft peer set NAVN --all
+nordkraft peer set NAVN --only web,db
+```
+
+Ændringer slår igennem på få sekunder; enheden skal ikke gøre noget.
+
+---
+
+### peer disable / enable / rotate / rm
+
+```bash
+nordkraft peer disable NAVN     # lukker adgangen, beholder peeren
+nordkraft peer enable NAVN
+nordkraft peer rotate NAVN      # nyt nøglepar, samme adresse, ny konfiguration
+nordkraft peer rm NAVN
+```
+
+---
+
 ## IPv6 kommandoer
 
 ### ipv6 open

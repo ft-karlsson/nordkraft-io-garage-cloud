@@ -48,6 +48,14 @@ pub struct AppConfig {
     pub admin_api_key: String, // Shared secret for /api/admin/* endpoints
     pub admin_allowed_ips: Vec<String>, // Source IPs allowed to call admin endpoints
     pub wg_interface: String,  // WireGuard interface name (for wg set commands)
+    /// What the generated nftables ruleset does with VPN traffic no rule
+    /// accepts: "drop" (default, what production runs) or "audit" (policy
+    /// accept, log + count only — for a node migrating from the installer's
+    /// accept-by-default chain). See setup/CHILD_PEERS.md.
+    pub vpn_deny_mode: String,
+    /// Keep WireGuard peers the database does not know instead of removing
+    /// them (default false: the DB is the single source of truth).
+    pub wg_keep_stray_peers: bool,
 
     // Quota enforcement (cloud.nordkraft.io = true, self-hosted = false)
     pub quota_enforced: bool,
@@ -262,6 +270,11 @@ pub fn init_config() -> AppConfig {
             .map(|s| s.trim().to_string())
             .collect(),
         wg_interface: env::var("WG_INTERFACE").unwrap_or_else(|_| "wg0".to_string()),
+        vpn_deny_mode: env::var("VPN_DENY_MODE").unwrap_or_else(|_| "drop".to_string()),
+        wg_keep_stray_peers: env::var("WG_KEEP_STRAY_PEERS")
+            .unwrap_or_else(|_| "false".to_string())
+            .parse()
+            .unwrap_or(false),
 
         // Quota enforcement — default OFF for self-hosted, ON for cloud.nordkraft.io
         quota_enforced: env::var("QUOTA_ENFORCED")

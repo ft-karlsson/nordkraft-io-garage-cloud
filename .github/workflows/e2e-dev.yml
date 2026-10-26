@@ -45,6 +45,12 @@ jobs:
         run: cd container-api && cargo fmt --check
       - name: unit tests
         run: cd container-api && cargo test
+      # The golden rulesets the PeerReconciler renders must be valid nft syntax
+      # (dry run against the real parser; nothing is applied).
+      - name: nft syntax check of generated rulesets
+        run: |
+          sudo apt-get install -y -qq nftables >/dev/null
+          for f in tests/snapshots/nft-ruleset-*.nft; do sudo nft -c -f "$f"; done
 
   e2e:
     name: Install dev node + smoke test

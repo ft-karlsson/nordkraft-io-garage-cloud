@@ -21,7 +21,8 @@ use models::*;
 use services::container_manager::ContainerManager;
 use services::haproxy_client::{DummyHAProxyClient, HAProxyClient, HAProxyClientTrait};
 use services::nats_service::NatsService;
-use services::peer_resolver::{PeerCache, WgReconciler};
+use services::peer_reconciler::{self, DenyMode, PeerReconciler};
+use services::peer_resolver::PeerCache;
 use services::pfsense_client::{DummyPfSenseClient, PfSenseClient, PfSenseClientTrait};
 use services::route_manager::StaticRouteManager;
 
@@ -472,245 +473,11 @@ async fn ensure_agent_macvlan_setup(
 
 // ============= MAIN =============
 
-// ============= TENANT PROVISIONING (wg set + nft insert) =============
-
-/// Add a WireGuard peer for a tenant slot. Instant, no restart needed.
-async fn wg_add_peer(
-    wg_interface: &str,
-    public_key: &str,
-    user_slot: u32,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let allowed_ips = format!("172.20.0.{}/32,172.21.{}.0/24", user_slot, user_slot);
-
-    let output = tokio::process::Command::new("wg")
-        .args([
-            "set",
-            wg_interface,
-            "peer",
-            public_key,
-            "allowed-ips",
-            &allowed_ips,
-        ])
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("wg set failed for slot {}: {}", user_slot, stderr).into());
-    }
-
-    info!(
-        "🔑 WireGuard peer added: slot {} → {}",
-        user_slot,
-        &public_key[..8]
-    );
-    Ok(())
-}
-
-/// Remove a WireGuard peer.
-async fn wg_remove_peer(
-    wg_interface: &str,
-    public_key: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let output = tokio::process::Command::new("wg")
-        .args(["set", wg_interface, "peer", public_key, "remove"])
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("wg peer remove failed: {}", stderr).into());
-    }
-
-    info!("🔑 WireGuard peer removed: {}", &public_key[..8]);
-    Ok(())
-}
-
-/// Add an nftables forwarding rule for a tenant. Instant, no reload needed.
-/// Uses `nft insert` so it goes at the top of the chain (before any drop rules).
-async fn nft_add_tenant_rule(
-    user_slot: u32,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // First check if rule already exists (idempotent)
-    let check = tokio::process::Command::new("nft")
-        .args(["list", "chain", "inet", "filter", "forward"])
-        .output()
-        .await?;
-
-    if check.status.success() {
-        let output_str = String::from_utf8_lossy(&check.stdout);
-        // Match the rule's quoted comment exactly. A bare "172.20.0.1" prefix also
-        // matches 172.20.0.11, .12, .13 ..., which left slots 1 and 2 without a rule.
-        let pattern = format!("comment \"tenant-{}\"", user_slot);
-        if output_str.contains(&pattern) {
-            info!("🔥 nftables rule already exists for slot {}", user_slot);
-            return Ok(());
-        }
-    }
-
-    // Insert rule at top of forward chain
-    let output = tokio::process::Command::new("bash")
-        .args(["-c", &format!(
-            "nft insert rule inet filter forward iifname \\\"wg0\\\" ip saddr 172.20.0.{slot} ip daddr 172.21.{slot}.0/24 accept comment \\\"tenant-{slot}\\\"",
-            slot = user_slot
-        )])
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("nft insert failed for slot {}: {}", user_slot, stderr).into());
-    }
-
-    info!(
-        "🔥 nftables rule added: slot {} (172.20.0.{} → 172.21.{}.0/24)",
-        user_slot, user_slot, user_slot
-    );
-    Ok(())
-}
-
-/// Remove nftables rule for a tenant slot.
-/// Remove nftables rule for a tenant slot.
-async fn nft_remove_tenant_rule(
-    user_slot: u32,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Find the rule handle, then delete by handle. Match the quoted comment
-    // exactly: a bare 'tenant-1' also matches tenant-10 … tenant-19.
-    let output = tokio::process::Command::new("bash")
-        .args(["-c", &format!(
-            "nft -a list chain inet filter forward | grep -F 'comment \"tenant-{}\"' | grep -oP 'handle \\K[0-9]+'",
-            user_slot
-        )])
-        .output()
-        .await?;
-
-    if output.status.success() {
-        let handles = String::from_utf8_lossy(&output.stdout);
-        for handle in handles.trim().lines() {
-            let del = tokio::process::Command::new("nft")
-                .args([
-                    "delete",
-                    "rule",
-                    "inet",
-                    "filter",
-                    "forward",
-                    "handle",
-                    handle.trim(),
-                ])
-                .output()
-                .await?;
-
-            if del.status.success() {
-                info!(
-                    "🔥 nftables rule removed: slot {} (handle {})",
-                    user_slot,
-                    handle.trim()
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Provision a tenant: add WireGuard peer + nftables rule.
-/// Called from admin endpoint on signup AND from boot recovery.
-async fn provision_tenant(
-    wg_interface: &str,
-    public_key: &str,
-    user_slot: u32,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    info!(
-        "🔧 Provisioning tenant slot {} (key: {}...)",
-        user_slot,
-        &public_key[..8.min(public_key.len())]
-    );
-
-    // Step 1: WireGuard peer
-    wg_add_peer(wg_interface, public_key, user_slot).await?;
-
-    // Step 2: nftables forwarding rule
-    nft_add_tenant_rule(user_slot).await?;
-
-    info!("✅ Tenant slot {} fully provisioned", user_slot);
-    Ok(())
-}
-
-/// Deprovision a tenant: remove WireGuard peer + nftables rule.
-async fn deprovision_tenant(
-    wg_interface: &str,
-    public_key: &str,
-    user_slot: u32,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    info!("🔧 Deprovisioning tenant slot {}", user_slot);
-
-    wg_remove_peer(wg_interface, public_key).await?;
-    nft_remove_tenant_rule(user_slot).await?;
-
-    info!("✅ Tenant slot {} deprovisioned", user_slot);
-    Ok(())
-}
-
-// ============= BOOT RECOVERY =============
-
-/// On startup, restore all WireGuard peers and nftables rules from database.
-/// This is the single source of truth pattern — DB drives runtime state.
-async fn boot_recovery_from_db(
-    pool: &PgPool,
-    wg_interface: &str,
-) -> Result<BootRecoveryReport, Box<dyn std::error::Error + Send + Sync>> {
-    info!("🔄 Boot recovery: restoring WireGuard peers + nftables rules from database...");
-
-    let rows = sqlx::query(
-        "SELECT wireguard_public_key, user_slot FROM users WHERE account_status = 'active' AND user_slot IS NOT NULL"
-    )
-    .fetch_all(pool)
-    .await?;
-
-    let mut report = BootRecoveryReport::default();
-
-    for row in &rows {
-        let public_key: String = row.get("wireguard_public_key");
-        let user_slot: i32 = row.get("user_slot");
-        let slot = user_slot as u32;
-
-        // Restore WireGuard peer
-        match wg_add_peer(wg_interface, &public_key, slot).await {
-            Ok(_) => report.wg_peers_restored += 1,
-            Err(e) => {
-                error!("Failed to restore WG peer for slot {}: {}", slot, e);
-                report.wg_peers_failed += 1;
-            }
-        }
-
-        // Restore nftables rule
-        match nft_add_tenant_rule(slot).await {
-            Ok(_) => report.nft_rules_restored += 1,
-            Err(e) => {
-                error!("Failed to restore nft rule for slot {}: {}", slot, e);
-                report.nft_rules_failed += 1;
-            }
-        }
-    }
-
-    info!(
-        "🔄 Boot recovery complete: {} WG peers ({} failed), {} nft rules ({} failed)",
-        report.wg_peers_restored,
-        report.wg_peers_failed,
-        report.nft_rules_restored,
-        report.nft_rules_failed
-    );
-
-    Ok(report)
-}
-
-#[derive(Debug, Default)]
-struct BootRecoveryReport {
-    wg_peers_restored: u32,
-    wg_peers_failed: u32,
-    nft_rules_restored: u32,
-    nft_rules_failed: u32,
-}
+// ============= TENANT PROVISIONING =============
+// WireGuard peers and the nftables ruleset are owned by the PeerReconciler
+// (services/peer_reconciler.rs): the database is the desired state, `wg` and
+// `nft` are converged to it at boot, every 5 minutes and on every kick. The
+// admin endpoints below only change the DB's view and ask for a pass.
 
 // ============= ADMIN API GUARD =============
 
@@ -779,58 +546,74 @@ struct TenantDeprovisionRequest {
     user_slot: u32,
 }
 
-/// Called by signup-api after DB insert. Adds WireGuard peer + nftables rule instantly.
+/// Called by signup-api after the users row is updated with the real key.
+/// Runs one reconcile pass so the peer and its rules exist when this returns.
 #[post("/admin/tenant/provision", data = "<req>")]
 async fn admin_provision_tenant(
     _admin: AdminAuth,
     req: Json<TenantProvisionRequest>,
-    app_state: &rocket::State<AppState>,
 ) -> Json<serde_json::Value> {
-    let wg_interface = &app_state.config.wg_interface;
-
-    match provision_tenant(wg_interface, &req.public_key, req.user_slot).await {
-        Ok(_) => Json(serde_json::json!({
-            "status": "provisioned",
+    let Some(rec) = peer_reconciler::global() else {
+        return Json(serde_json::json!({
+            "error": "no peer reconciler in this mode (dev or agent)",
+        }));
+    };
+    let report = rec.reconcile_now().await;
+    let key = &req.public_key;
+    let present = report
+        .wg_added
+        .iter()
+        .chain(report.wg_updated.iter())
+        .any(|k| key.starts_with(k.trim_end_matches('…')));
+    if report.errors.is_empty() {
+        Json(serde_json::json!({
+            "status": if present { "provisioned" } else { "converged" },
             "user_slot": req.user_slot,
             "vpn_ip": format!("172.20.0.{}", req.user_slot),
             "container_subnet": format!("172.21.{}.0/24", req.user_slot),
-        })),
-        Err(e) => {
-            error!(
-                "❌ Tenant provisioning failed for slot {}: {}",
-                req.user_slot, e
-            );
-            Json(serde_json::json!({
-                "error": format!("Provisioning failed: {}", e),
-            }))
-        }
+            "reconcile": report,
+        }))
+    } else {
+        error!(
+            "❌ Tenant provisioning (slot {}) reconcile errors: {:?}",
+            req.user_slot, report.errors
+        );
+        Json(serde_json::json!({
+            "error": format!("reconcile: {}", report.errors.join("; ")),
+            "reconcile": report,
+        }))
     }
 }
 
-/// Called to remove a tenant's networking. Removes WireGuard peer + nftables rule.
+/// Remove a tenant's peer now. The DB is the source of truth: if the users row
+/// is still active, the next pass puts the peer back — suspend or delete the
+/// row first (the purge endpoint does both).
 #[post("/admin/tenant/deprovision", data = "<req>")]
 async fn admin_deprovision_tenant(
     _admin: AdminAuth,
     req: Json<TenantDeprovisionRequest>,
     app_state: &rocket::State<AppState>,
 ) -> Json<serde_json::Value> {
-    let wg_interface = &app_state.config.wg_interface;
-
-    match deprovision_tenant(wg_interface, &req.public_key, req.user_slot).await {
-        Ok(_) => Json(serde_json::json!({
-            "status": "deprovisioned",
-            "user_slot": req.user_slot,
-        })),
-        Err(e) => {
-            error!(
-                "❌ Tenant deprovisioning failed for slot {}: {}",
-                req.user_slot, e
-            );
-            Json(serde_json::json!({
-                "error": format!("Deprovisioning failed: {}", e),
-            }))
-        }
+    if let Err(e) =
+        peer_reconciler::wg_remove_peer(&app_state.config.wg_interface, &req.public_key).await
+    {
+        warn!(
+            "deprovision slot {}: wg remove: {} (continuing with reconcile)",
+            req.user_slot, e
+        );
     }
+    let Some(rec) = peer_reconciler::global() else {
+        return Json(serde_json::json!({
+            "error": "no peer reconciler in this mode (dev or agent)",
+        }));
+    };
+    let report = rec.reconcile_now().await;
+    Json(serde_json::json!({
+        "status": if report.errors.is_empty() { "deprovisioned" } else { "error" },
+        "user_slot": req.user_slot,
+        "reconcile": report,
+        "note": "peers and rules follow the users row: a still-active row brings the peer back",
+    }))
 }
 
 fn default_true() -> bool {
@@ -938,24 +721,25 @@ async fn admin_purge_tenant(
         };
         tenant_purge::purge_external(&ctx, &inv, &mut report).await;
 
-        // An unclaimed invite has no WireGuard peer (its "key" is the claim
-        // token, which wg rejects), but the nft rule is keyed by slot only.
-        let network = if inv.user.claimed {
-            deprovision_tenant(
-                &config.wg_interface,
-                &inv.user.wireguard_public_key,
-                inv.user.user_slot,
-            )
-            .await
-        } else {
-            nft_remove_tenant_rule(inv.user.user_slot).await
-        };
-        match network {
-            Ok(_) if inv.user.claimed => report
-                .done
-                .push("WireGuard peer and nft rule removed".to_string()),
-            Ok(_) => report.done.push("nft rule removed".to_string()),
-            Err(e) => report.errors.push(format!("WireGuard/nft: {}", e)),
+        // The account is suspended, so the reconciler no longer wants its
+        // peer, its children or any of their rules: one pass removes them.
+        match peer_reconciler::global() {
+            Some(rec) => {
+                let r = rec.reconcile_now().await;
+                if r.errors.is_empty() {
+                    report.done.push(format!(
+                        "WireGuard peers and nft rules converged ({} peer(s) removed)",
+                        r.wg_removed.len()
+                    ));
+                } else {
+                    report
+                        .errors
+                        .push(format!("WireGuard/nft: {}", r.errors.join("; ")));
+                }
+            }
+            None => report
+                .errors
+                .push("no peer reconciler in this mode".to_string()),
         }
     }
 
@@ -986,6 +770,7 @@ async fn admin_purge_tenant(
         );
     }
     report.done.push("DB rows deleted".to_string());
+    peer_reconciler::kick();
 
     tenant_purge::remove_controller_routes(&app_state.route_manager, &inv).await;
 
@@ -1038,11 +823,38 @@ async fn admin_tenants_status(
         })
         .unwrap_or(0);
 
+    let last_reconcile = match peer_reconciler::global() {
+        Some(rec) => rec.last_report().await,
+        None => None,
+    };
+
     Json(serde_json::json!({
         "wireguard_peers": peer_count,
         "nftables_tenant_rules": nft_count,
         "wg_interface": app_state.config.wg_interface,
+        "vpn_deny_mode": app_state.config.vpn_deny_mode,
+        "last_reconcile": last_reconcile,
     }))
+}
+
+/// The nftables ruleset the database calls for right now, as `nft -f` text.
+/// Rendered fresh, nothing applied: diff it against `nft list table inet filter`.
+#[get("/admin/tenants/ruleset")]
+async fn admin_tenants_ruleset(_admin: AdminAuth) -> (rocket::http::Status, String) {
+    use rocket::http::Status;
+    let Some(rec) = peer_reconciler::global() else {
+        return (
+            Status::NotFound,
+            "no peer reconciler in this mode (dev or agent)\n".to_string(),
+        );
+    };
+    match rec.render_current().await {
+        Ok(text) => (Status::Ok, text),
+        Err(e) => (
+            Status::InternalServerError,
+            format!("could not render ruleset: {}\n", e),
+        ),
+    }
 }
 
 #[launch]
@@ -1118,6 +930,12 @@ async fn rocket() -> _ {
                 }
             }
         }
+        if let Err(e) = bootstrap::ensure_migrations(&db_pool).await {
+            error!("❌ Migrations failed: {}", e);
+            if dev {
+                std::process::exit(1);
+            }
+        }
         if dev {
             if let Err(e) = bootstrap::seed_dev(&db_pool, &config).await {
                 error!("❌ Dev seed failed: {}", e);
@@ -1138,9 +956,10 @@ async fn rocket() -> _ {
     }
 
     // =========================================================
-    // WG RECONCILER - re-provisions missing peers from DB
-    // Catches peers lost to systemd-networkd restarts, netplan
-    // apply, unattended-upgrades, etc. Runs every 5 minutes.
+    // PEER RECONCILER — WireGuard peers + nftables from the DB
+    // Boot recovery, 5-minute convergence and on-demand kicks in
+    // one place. Two-way: adds what the DB wants, removes what it
+    // does not. See services/peer_reconciler.rs and CHILD_PEERS.md.
     // =========================================================
     if !dev
         && matches!(
@@ -1148,8 +967,21 @@ async fn rocket() -> _ {
             config::OperationMode::Controller | config::OperationMode::Hybrid
         )
     {
-        let reconciler = WgReconciler::new(&wg_interface, db_pool.clone());
-        reconciler.start().await;
+        let mode = DenyMode::parse(&config.vpn_deny_mode).unwrap_or_else(|| {
+            warn!(
+                "VPN_DENY_MODE={:?} is not drop|audit, using drop",
+                config.vpn_deny_mode
+            );
+            DenyMode::Drop
+        });
+        let reconciler = PeerReconciler::new(
+            db_pool.clone(),
+            &wg_interface,
+            mode,
+            config.wg_keep_stray_peers,
+        );
+        peer_reconciler::install_global(Arc::clone(&reconciler));
+        reconciler.start(300);
     }
 
     let app_state = AppState::new(config.clone(), peer_cache);
@@ -1234,29 +1066,6 @@ async fn rocket() -> _ {
                             )
                     }
                     Err(e) => error!("Failed to sync routes: {}", e),
-                }
-
-                // =========================================================
-                // BOOT RECOVERY: Restore WireGuard peers + nftables rules
-                // Database is single source of truth. On every boot:
-                //   1. `wg set` for each active tenant
-                //   2. `nft insert rule` for each active tenant
-                // No netplan peers, no static nftables tenant rules needed.
-                // =========================================================
-                match boot_recovery_from_db(&db_pool, &config.wg_interface).await {
-                    Ok(report) => {
-                        info!(
-                            "✅ Boot recovery: {} WG peers, {} nft rules restored",
-                            report.wg_peers_restored, report.nft_rules_restored
-                        );
-                        if report.wg_peers_failed > 0 || report.nft_rules_failed > 0 {
-                            warn!(
-                                "⚠️ Boot recovery failures: {} WG, {} nft",
-                                report.wg_peers_failed, report.nft_rules_failed
-                            );
-                        }
-                    }
-                    Err(e) => error!("❌ Boot recovery failed: {}", e),
                 }
             }
         }
@@ -1489,11 +1298,21 @@ async fn rocket() -> _ {
                     routes::domains::verify_domain_now,
                     routes::domains::list_domains,
                     routes::domains::remove_domain,
+                    // Child WireGuard peers (CHILD_PEERS.md)
+                    routes::peers::create_peer,
+                    routes::peers::list_peers,
+                    routes::peers::get_peer,
+                    routes::peers::patch_peer,
+                    routes::peers::enable_peer,
+                    routes::peers::disable_peer,
+                    routes::peers::rotate_peer,
+                    routes::peers::delete_peer,
                     // Admin endpoints (signup-api → container-api provisioning)
                     admin_provision_tenant,
                     admin_deprovision_tenant,
                     admin_purge_tenant,
                     admin_tenants_status,
+                    admin_tenants_ruleset,
                     // usage
                     routes::containers::get_usage,
                     // Deploy lifecycle events
@@ -1553,5 +1372,8 @@ fn log_startup_info(config: &AppConfig, nats_connected: bool) {
     }
 
     info!("🔐 Admin API: allowed IPs = {:?}", config.admin_allowed_ips);
-    info!("🔄 Boot recovery: DB → wg set + nft insert (no static tenant rules needed)");
+    info!(
+        "🔄 Peer reconciler: DB → wg set + generated nft ruleset (deny mode {})",
+        config.vpn_deny_mode
+    );
 }

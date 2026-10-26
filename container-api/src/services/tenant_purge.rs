@@ -2,8 +2,9 @@
 //
 // Called from POST /api/admin/tenant/purge. The order mirrors the account
 // deletion design: suspend → ingress + custom domains → IPv6 firewall rules →
-// containers + data on every node → WireGuard peer + nft rule (done by the
-// caller, which owns those helpers) → DB rows → controller routes.
+// containers + data on every node → WireGuard peers + nft rules (one pass of
+// the PeerReconciler, run by the caller once the account is suspended) → DB
+// rows → controller routes.
 //
 // Safety rules:
 // - Dry run unless the caller explicitly asks otherwise; the dry run returns
@@ -76,6 +77,9 @@ pub struct PurgeInventory {
     pub ingress_routes: Vec<String>,
     pub custom_domains: Vec<String>,
     pub ipv6_firewall_rules: Vec<String>,
+    /// Child WireGuard peers owned by the account: "name (172.20.<slot>.<n>)".
+    /// Their rows cascade from users; the reconciler removes the peers.
+    pub child_peers: Vec<String>,
     /// Nodes that must confirm over NATS (the local hybrid node is purged directly).
     pub nodes_to_confirm: Vec<String>,
     pub local_node: Option<String>,
@@ -214,6 +218,27 @@ pub async fn inventory(
     .fetch_all(pool)
     .await?;
 
+    let child_peers: Vec<String> = sqlx::query(
+        "SELECT name, peer_index, status FROM tenant_peers WHERE user_id = $1 ORDER BY peer_index",
+    )
+    .bind(&target.user_id)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|r| {
+        let name: String = r.get("name");
+        let index: i16 = r.get("peer_index");
+        let status: String = r.get("status");
+        format!(
+            "{} (172.20.{}.{}{})",
+            name,
+            target.user_slot,
+            index,
+            if status == "active" { "" } else { ", disabled" }
+        )
+    })
+    .collect();
+
     // Every registered node, plus any node a live container row points at.
     // Containers can be gone while their volumes and backups remain, so all
     // nodes are asked, not only the ones that run something now.
@@ -245,6 +270,7 @@ pub async fn inventory(
             ingress_routes,
             custom_domains,
             ipv6_firewall_rules,
+            child_peers,
             nodes_to_confirm: Vec::new(),
             local_node: None,
         });
@@ -256,6 +282,7 @@ pub async fn inventory(
         ingress_routes,
         custom_domains,
         ipv6_firewall_rules,
+        child_peers,
         nodes_to_confirm: nodes
             .into_iter()
             .filter(|n| Some(n.as_str()) != local_node)
@@ -439,6 +466,8 @@ pub async fn delete_rows(pool: &PgPool, target: &PurgeTarget) -> Result<(), BoxE
     .await?;
 
     for sql in [
+        // targets cascade from tenant_peers
+        "DELETE FROM tenant_peers WHERE user_id = $1",
         "DELETE FROM container_volumes WHERE container_id IN
             (SELECT container_id FROM containers WHERE user_id = $1)",
         "DELETE FROM ipv6_firewall_rules WHERE user_id = $1",
@@ -494,8 +523,9 @@ mod tests {
         ));
     }
 
-    // Live DB test: needs a scratch Postgres loaded with setup/schema.sql and
-    // setup/migration_custom_domains.sql. Never point it at a real database.
+    // Live DB test: needs a scratch Postgres loaded with setup/schema.sql,
+    // setup/migration_custom_domains.sql and setup/migration_child_peers.sql.
+    // Never point it at a real database.
     //   PURGE_TEST_DATABASE_URL=postgres://... cargo test live_purge -- --ignored
     #[tokio::test]
     #[ignore]
@@ -509,7 +539,7 @@ mod tests {
 
         for sql in [
             "TRUNCATE users, containers, container_volumes, container_config, deploy_events,
-                      ingress_routes, custom_domains, ipv6_firewall_rules,
+                      ingress_routes, custom_domains, ipv6_firewall_rules, tenant_peers,
                       garage_container_allocations, ingress_port_pool, nodes, garages, plans CASCADE",
             "INSERT INTO plans (id, name, display_name, cpu, memory, storage, price)
                 VALUES ('p', 'p', 'p', '1', '1', '1', '0')",
