@@ -358,9 +358,10 @@ working.
    is enforced only where `QUOTA_ENFORCED=true`, like the other quotas.
    `scripts/smoke-dev.sh` step 4c exercises the whole set on the dev node
    (rows only: dev mode has no WireGuard).
-4. **Docs**: a Danish guide `docs/guides/peers.md` ("Giv andre adgang til dine
-   containere"), rows in `docs/reference/api.md` and `docs/reference/cli.md`,
-   fix the `/24` in `SETUP_WIREGUARD.md`.
+4. **Done — docs**: `docs/guides/peers.md` ("Giv andre adgang til dine
+   containere") in the mkdocs nav, rows in `docs/reference/api.md` and
+   `docs/reference/cli.md`, `/16` in `SETUP_WIREGUARD.md`. `setup/schema.sql`
+   re-dumped from production after the merge, so it carries the peer tables.
 5. Later, if asked: per-peer "container may call home", IPv6 inside the
    tunnel, delegated API identities for sub-users who should deploy.
 

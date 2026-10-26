@@ -54,6 +54,7 @@ nav:
     - Persistent storage: guides/storage.md
     - Custom domæner: guides/domains.md
     - Sandboxes (shell, exec, livscyklus): guides/sandboxes.md
+    - Giv andre adgang (peers): guides/peers.md
   - Reference:
     - CLI kommandoer: reference/cli.md
     - API: reference/api.md
