@@ -25,6 +25,8 @@ Alle requests autentificeres via din WireGuard VPN-forbindelse. Ingen API keys n
 | `/containers/{id}/start` | POST | Start container (`?wait=true` svarer først når den kører) |
 | `/containers/{id}` | DELETE | Slet container |
 | `/containers/{id}/logs` | GET | Hent logs |
+| `/containers/{id}/volume` | GET | Download containerens volume som `tar.zst` (streamet) |
+| `/containers/{id}/volume` | PUT | Erstat containerens volume med en `tar.zst`-fil (body) |
 | `/containers/{id}/exec` | POST | Kør én kommando, få output og exit-kode |
 | `/containers/{id}/stream` | GET (WebSocket) | Interaktiv shell / streamet exec |
 | `/containers/{id}/wait` | POST | Vent på at hovedprocessen slutter |
@@ -117,3 +119,31 @@ Kald igen mens `timed_out` er `true`. Max 3600 sekunder pr. kald.
 
 Alle tre virker ens uanset hvilken node containeren kører på: controlleren videresender
 strømmen uændret til noden over WireGuard.
+
+### Volume backup og gendannelse
+
+**`GET /containers/{id}/volume`** — svarer med `Content-Type: application/zstd` og streamer
+hele volumen som `tar | zstd`. Headeren `X-Nordkraft-Manifest` indeholder det samme
+manifest (JSON) som ligger i arkivet under `.nordkraft/manifest.json`: `container_id`,
+`volume_path`, `created_at`, `consistency` (`snapshot` eller `live`), `node`, `volume_bytes`.
+Afbrydes strømmen på noden, lukkes forbindelsen uden korrekt afslutning — gem aldrig en
+ufuldstændig download som backup.
+
+**`PUT /containers/{id}/volume`** — body er arkivet. Send gerne `X-Nordkraft-Sha256`
+(hex) med filens sha256; noden afviser med `400` hvis det ikke stemmer. Containeren stoppes
+under udpakningen og startes igen bagefter, hvis den kørte. Svar:
+
+```json
+{"container_id": "app-…", "volume_path": "/data", "received_bytes": 9600000,
+ "sha256": "…", "manifest": {…}, "restarted": true, "warnings": []}
+```
+
+`warnings` nævner fx at arkivet kom fra en anden mount-sti. Fejl (`400`) efterlader den
+nuværende volume urørt. Øvre grænse for ét upload er 20 GiB.
+
+```bash
+curl -o campfire.tar.zst http://172.20.0.254:8001/api/containers/campfire/volume
+curl -X PUT --data-binary @campfire.tar.zst \
+  -H "X-Nordkraft-Sha256: $(sha256sum campfire.tar.zst | cut -d' ' -f1)" \
+  http://172.20.0.254:8001/api/containers/campfire-new/volume
+```

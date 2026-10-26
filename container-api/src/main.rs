@@ -1191,6 +1191,9 @@ async fn rocket() -> _ {
             agent_reconciler.start().await;
         }
 
+        // Backup snapshots left behind by a crash mid-export
+        services::volume_backup::sweep_stale_snapshots().await;
+
         // Setup macvlan shim + routes (so containers are reachable)
         // This is idempotent - safe to run every boot
         if let Err(e) = ensure_agent_macvlan_setup(&macvlan_manager, &config).await {
@@ -1250,6 +1253,9 @@ async fn rocket() -> _ {
                     // exec/shell/wait: the controller relays user requests here
                     routes::stream::internal_stream,
                     routes::stream::internal_wait,
+                    // volume backup/restore: relayed the same way
+                    routes::volumes::internal_export,
+                    routes::volumes::internal_import,
                 ],
             )
         }
@@ -1274,6 +1280,11 @@ async fn rocket() -> _ {
                     routes::stream::container_wait,
                     routes::stream::internal_stream,
                     routes::stream::internal_wait,
+                    // volume backup / restore (hybrid serves local, else relays)
+                    routes::volumes::backup_volume,
+                    routes::volumes::restore_volume,
+                    routes::volumes::internal_export,
+                    routes::volumes::internal_import,
                     // Node operations
                     routes::nodes::list_nodes,
                     routes::nodes::register_node,

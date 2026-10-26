@@ -14,6 +14,7 @@ mod spec_ops;
 mod spinner;
 mod stream;
 mod tui;
+mod volume;
 use spinner::Spinner;
 
 // ============= ALIAS MANAGEMENT =============
@@ -44,7 +45,7 @@ fn save_aliases(aliases: &HashMap<String, String>) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-fn resolve_alias(name: &str) -> String {
+pub(crate) fn resolve_alias(name: &str) -> String {
     let aliases = load_aliases();
     aliases
         .get(name)
@@ -219,6 +220,29 @@ enum Commands {
         /// Number of lines
         #[arg(short = 'n', long, default_value = "100")]
         lines: usize,
+    },
+    /// Download a full backup of a container's volume (tar.zst) to this machine
+    ///
+    ///   nordkraft backup campfire
+    ///   nordkraft backup campfire -o campfire.tar.zst
+    Backup {
+        /// Container name, alias, or omit for interactive selection
+        container: Option<String>,
+        /// Output file (default: <name>-<timestamp>.tar.zst; "-" for stdout)
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<String>,
+    },
+    /// Replace a container's volume with a backup file made by `nordkraft backup`
+    ///
+    ///   nordkraft restore campfire campfire-20261026T1840.tar.zst
+    Restore {
+        /// Container name or alias
+        container: Option<String>,
+        /// Backup file (tar.zst)
+        file: String,
+        /// Do not ask for confirmation
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Stop a container (shortcut for 'container stop')
     Stop {
@@ -497,6 +521,10 @@ struct DeployArgs {
     /// Label KEY=VALUE (repeatable); filter with `nordkraft list --label`
     #[arg(long = "label", short = 'l', value_name = "KEY=VALUE")]
     label: Vec<String>,
+
+    /// Restore this backup file (from `nordkraft backup`) into the new container's volume
+    #[arg(long, value_name = "FILE")]
+    volume_from: Option<String>,
 }
 
 // ============= INGRESS COMMANDS =============
@@ -1469,7 +1497,7 @@ enum ConfigCommands {
 /// True when prompts must be skipped: --yes, --json, or no terminal on stdin.
 static NON_INTERACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn non_interactive() -> bool {
+pub(crate) fn non_interactive() -> bool {
     NON_INTERACTIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -2035,8 +2063,8 @@ struct ApiResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct ApiError {
-    error: String,
+pub(crate) struct ApiError {
+    pub(crate) error: String,
     #[serde(default)]
     plan: Option<String>,
     // #[serde(default)]
@@ -2114,6 +2142,14 @@ async fn main() {
         Commands::Deploy(args) => handle_deploy(*args, json_output).await,
         Commands::Push { image } => handle_registry_push(&image, json_output).await,
         Commands::List { label } => handle_container_list(&label, json_output).await,
+        Commands::Backup { container, output } => {
+            volume::handle_backup(container, output, json_output).await
+        }
+        Commands::Restore {
+            container,
+            file,
+            yes,
+        } => volume::handle_restore(container, file, yes, json_output).await,
         Commands::Wait { container, timeout } => handle_wait(container, timeout, json_output).await,
         Commands::Logs { container, lines } => {
             handle_logs_interactive(container, lines, json_output).await
@@ -2556,6 +2592,7 @@ async fn handle_deploy(
             persistence: spec.storage.persistence,
             volume_path: spec.storage.volume_path.clone(),
             volume_size: spec.storage.volume_size.clone(),
+            volume_from: args.volume_from.clone(),
             ipv6: spec.network.ipv6,
             garage: spec.placement.garage.clone(),
             hardware: spec.placement.hardware.clone(),
@@ -2736,6 +2773,16 @@ async fn handle_deploy(
         }
     };
 
+    // Validate: --volume-from needs a persistent volume to land in, and a real file
+    if let Some(file) = &args.volume_from {
+        if !args.persistence {
+            return Err("--volume-from requires --persistence and --volume-path".into());
+        }
+        if !std::path::Path::new(file).is_file() {
+            return Err(format!("--volume-from: {} is not a file", file).into());
+        }
+    }
+
     // Validate: --persistence requires --volume-path
     if args.persistence && args.volume_path.is_none() {
         if json_output {
@@ -2885,8 +2932,34 @@ async fn handle_deploy(
 
     let result: DeployResponse = serde_json::from_value(body)?;
 
+    // --volume-from: push the backup into the new volume. A failed restore
+    // removes the container again so nothing half-made is left behind.
+    let mut restore_report: Option<serde_json::Value> = None;
+    if let (Some(file), Some(name)) = (&args.volume_from, &result.container_name) {
+        match volume::restore_file(name, std::path::Path::new(file), json_output).await {
+            Ok(report) => {
+                if !json_output {
+                    volume::print_restore_summary(&report);
+                }
+                restore_report = Some(report);
+            }
+            Err(e) => {
+                if !json_output {
+                    eprintln!("{} restore failed: {}", "❌".red(), e);
+                    eprintln!("   removing {} again", name);
+                }
+                let _ = handle_container_remove_opts(name, true, true).await;
+                return Err(format!("deploy rolled back: restore failed: {e}").into());
+            }
+        }
+    }
+
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        let mut out = serde_json::to_value(&result)?;
+        if let Some(r) = restore_report {
+            out["restore"] = r;
+        }
+        println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
 
@@ -6255,7 +6328,7 @@ async fn handle_alias(
 // ============= INTERACTIVE HELPERS =============
 
 /// If container is provided, resolve alias and return. Otherwise show interactive selection.
-async fn get_container_or_select(
+pub(crate) async fn get_container_or_select(
     container: Option<String>,
     json_output: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -6436,6 +6509,7 @@ fn prompt_deploy_interactive() -> Result<DeployArgs, Box<dyn std::error::Error>>
         auto_delete: None,
         max_lifetime: None,
         label: vec![],
+        volume_from: None,
     })
 }
 

@@ -15,3 +15,4 @@ pub mod pfsense_client;
 pub mod reaper;
 pub mod route_manager;
 pub mod tenant_purge;
+pub mod volume_backup;
