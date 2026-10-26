@@ -539,7 +539,7 @@ nordkraft peer add NAVN (--all | --container CONTAINER ...) [--ports 80,443] [--
 | `--ports` | Begræns de angivne containere til disse TCP-porte |
 | `--pubkey` | Brug enhedens egen offentlige nøgle i stedet for at lave et nøglepar her |
 | `--out`, `-o` | Skriv WireGuard-konfigurationen hertil (default `~/.nordkraft/peers/NAVN.conf`) |
-| `--qr` | Vis også konfigurationen som QR-kode (kræver `qrencode`) |
+| `--qr` | Vis også konfigurationen som QR-kode til WireGuard-appen (ingen ekstra værktøj) |
 
 **Eksempler:**
 

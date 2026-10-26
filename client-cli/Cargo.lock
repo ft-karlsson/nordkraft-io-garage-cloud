@@ -1399,6 +1399,7 @@ dependencies = [
  "dialoguer",
  "dirs",
  "futures",
+ "qrcode",
  "ratatui",
  "reqwest",
  "serde",
@@ -1714,6 +1715,12 @@ checksum = "89ae43fd86e4158d6db51ad8e2b80f313af9cc74f5c0e03ccb87de09998732de"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quote"

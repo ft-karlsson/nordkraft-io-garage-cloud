@@ -271,7 +271,7 @@ owns WireGuard and nft and already authenticates the owner.
 ```
 nordkraft peer add anna-laptop --all                        # keypair generated locally, config written
 nordkraft peer add ci-runner --container web --ports 80,443 --container db
-nordkraft peer add phone --all --qr                         # QR for the WireGuard app (qrencode if present)
+nordkraft peer add phone --all --qr                         # QR for the WireGuard app, drawn by the CLI itself
 nordkraft peer add anna-laptop --pubkey 'K7f…='             # sub-user made their own key; no private key anywhere
 nordkraft peer ls
 nordkraft peer show ci-runner                               # scope, targets (+ current IPs), last handshake, dangling
@@ -283,8 +283,10 @@ nordkraft peer rotate ci-runner [--pubkey …]
 nordkraft peer rm ci-runner
 ```
 
-`peer add` writes `~/.config/nordkraft/peers/<name>.conf` (mode 0600) and
-prints it once. The generated config:
+`peer add` writes `~/.nordkraft/peers/<name>.conf` (mode 0600) and prints it
+once; `--qr` draws the same text as a QR code in the terminal (pure-Rust
+`qrcode` crate, black on white so any terminal theme scans). The generated
+config:
 
 ```
 [Interface]

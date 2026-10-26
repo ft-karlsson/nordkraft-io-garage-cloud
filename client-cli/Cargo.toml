@@ -28,6 +28,8 @@ ratatui = "0.30.0"
 toml_edit = "0.25.11"
 # shell/exec: WebSocket stream to the node (plain ws over WireGuard)
 tokio-tungstenite = "0.21"
+# `nordkraft peer add --qr`: QR code drawn in the terminal, no external tool
+qrcode = { version = "0.14", default-features = false }
 futures = "0.3"
 
 [profile.release]

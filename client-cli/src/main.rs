@@ -599,7 +599,7 @@ enum PeerCommands {
         /// Where to write the WireGuard config (default ~/.nordkraft/peers/<name>.conf)
         #[arg(short, long)]
         out: Option<PathBuf>,
-        /// Also print the config as a QR code (needs qrencode)
+        /// Also print the config as a QR code to scan with the WireGuard app
         #[arg(long)]
         qr: bool,
     },
@@ -661,7 +661,7 @@ enum PeerCommands {
         /// Where to write the WireGuard config (default ~/.nordkraft/peers/<name>.conf)
         #[arg(short, long)]
         out: Option<PathBuf>,
-        /// Also print the config as a QR code (needs qrencode)
+        /// Also print the config as a QR code to scan with the WireGuard app
         #[arg(long)]
         qr: bool,
     },
@@ -4939,29 +4939,48 @@ fn write_peer_config(
     Ok(path)
 }
 
+/// Draw the config as a QR code for the WireGuard app. Two modules per
+/// character row (half blocks), and explicit black-on-white colours so the
+/// code has the right polarity whatever the terminal theme is.
 fn print_qr(config: &str) {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let child = Command::new("qrencode")
-        .args(["-t", "ansiutf8"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .spawn();
-    match child {
-        Ok(mut c) => {
-            if let Some(mut stdin) = c.stdin.take() {
-                let _ = stdin.write_all(config.as_bytes());
-            }
-            let _ = c.wait();
-        }
-        Err(_) => {
+    let code = match qrcode::QrCode::new(config.as_bytes()) {
+        Ok(c) => c,
+        Err(e) => {
             println!(
                 "   {}",
-                "qrencode not found — install it (brew install qrencode / apt install qrencode) for a QR code."
-                    .yellow()
+                format!("QR code not possible ({e}); import the file instead.").yellow()
             );
+            return;
         }
+    };
+    let width = code.width();
+    let modules = code.to_colors();
+    let dark = |x: isize, y: isize| -> bool {
+        if x < 0 || y < 0 || x >= width as isize || y >= width as isize {
+            return false; // quiet zone
+        }
+        modules[y as usize * width + x as usize] == qrcode::Color::Dark
+    };
+    let quiet: isize = 2;
+    let mut y = -quiet;
+    while y < width as isize + quiet {
+        let mut line = String::new();
+        for x in -quiet..width as isize + quiet {
+            line.push(match (dark(x, y), dark(x, y + 1)) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            });
+        }
+        println!("{}", line.black().on_white());
+        y += 2;
     }
+    println!();
+    println!(
+        "   {}",
+        "Scan with the WireGuard app: Add a tunnel → Create from QR code".dimmed()
+    );
 }
 
 fn handshake_label(peer: &serde_json::Value) -> String {
