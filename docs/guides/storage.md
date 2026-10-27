@@ -35,6 +35,12 @@ nordkraft deploy ghcr.io/basecamp/once-campfire:latest --port 3000 \
 Filen er almindelig `tar` komprimeret med `zstd` og kan åbnes uden mine værktøjer:
 `zstd -dc campfire-20261026T1840.tar.zst | tar -t`.
 
+**Kun dataene følger med.** Arkivet indeholder volumen — ikke containerens miljøvariabler,
+porte eller ressourcer. Starter du en ny container med `--volume-from`, skal du give de
+samme `-e`/`--env-file` som den gamle havde (fx `SECRET_KEY_BASE` for en Rails-app), ellers
+starter appen typisk ikke. Hent dem med `nordkraft init <container> --from-server` eller fra
+din egen `.env`-fil, før du fjerner den gamle container.
+
 **Konsistens.** Kører noden på LVM, tager jeg kopien fra et øjebliksbillede, så der ingen
 nedetid er, og databaser kommer op som efter en strømafbrydelse (SQLite og PostgreSQL klarer
 det). Ellers kopieres den kørende volume, og kommandoen siger `live` — stop containeren

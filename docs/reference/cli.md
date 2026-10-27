@@ -312,9 +312,11 @@ eksisterende volume. Kørte containeren før, startes den igen bagefter.
 # Rul tilbage til en backup
 nordkraft restore campfire campfire-20261026T1840.tar.zst
 
-# Flyt data til en ny container (fx ved migrering)
+# Flyt data til en ny container (fx ved migrering) — husk miljøvariablerne,
+# arkivet indeholder kun volumen
 nordkraft deploy ghcr.io/basecamp/once-campfire:latest --port 3000 \
   --persistence --volume-path /rails/storage \
+  --env-file campfire.env \
   --volume-from campfire-20261026T1840.tar.zst
 ```
 

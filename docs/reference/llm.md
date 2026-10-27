@@ -115,6 +115,7 @@ nordkraft backup CONTAINER [-o FIL]            # tar.zst, default NAVN-ÅÅÅÅM
 nordkraft restore CONTAINER FIL [--yes]        # erstatter hele volumen; containeren stoppes og startes igen
 nordkraft deploy IMAGE --persistence --volume-path STI --volume-from FIL   # ny container med dataene
 ```
+Arkivet indeholder kun volumen: giv den nye container samme `-e`/`--env-file` (fx `SECRET_KEY_BASE`) og port som den gamle.
 
 ---
 
