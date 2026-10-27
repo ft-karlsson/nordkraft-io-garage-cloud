@@ -5,8 +5,7 @@ Din egen WireGuard-nøgle er din identitet: den giver adgang til API'et, til
 
 En **peer** er en ekstra WireGuard-nøgle, du udsteder til en telefon, en
 kollegas laptop eller en CI-runner. Den får sin egen adresse i dit private
-netværk og kan nå dine containere, alle eller udvalgte, og intet andet. Ikke
-API'et, ikke andre kunders containere, ikke noden selv.
+netværk og kan nå dine containere, alle eller udvalgte, og intet andet.
 
 !!! info "Hvad en peer kan"
     - Nå dine containere direkte på deres `172.21.x.y`-adresser, som du selv gør
@@ -15,8 +14,6 @@ API'et, ikke andre kunders containere, ikke noden selv.
 
 !!! warning "Hvad en peer ikke kan"
     - Bruge `nordkraft` eller API'et: en peer er en netværksadgang, ikke en bruger
-    - Se eller nå andre kunders containere
-    - Nå andre peers eller din egen maskine gennem noden
 
 ## Opret en peer
 
