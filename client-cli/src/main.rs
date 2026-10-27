@@ -1794,7 +1794,17 @@ struct DeployRequest {
     lifecycle: LifecycleSpec,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     labels: HashMap<String, String>,
+    /// Ask the controller to answer only once the node reports the container
+    /// running (or failed). Needed before anything that acts on the container.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    wait: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wait_timeout_s: Option<u64>,
 }
+
+/// How long `deploy --volume-from` lets the controller wait for the node
+/// (image pull included) before giving up. The controller caps it at 600.
+const DEPLOY_WAIT_SECS: u64 = 300;
 
 #[derive(Debug, Serialize)]
 struct PortSpec {
@@ -2873,6 +2883,10 @@ async fn handle_deploy(
             &args.max_lifetime,
         ),
         labels: labels_from_flags(&args.label),
+        // A restore right after deploy must not race the node: wait until the
+        // container is really there before pushing the volume into it.
+        wait: args.volume_from.is_some(),
+        wait_timeout_s: args.volume_from.as_ref().map(|_| DEPLOY_WAIT_SECS),
     };
 
     if !json_output {
@@ -2890,7 +2904,21 @@ async fn handle_deploy(
     }
 
     let url = format!("{}/containers/deploy", *API_BASE_URL);
-    let response = client.post(&url).json(&request).send().await?;
+    let response = if request.wait {
+        if !json_output {
+            println!(
+                "   {} waiting for the container to start before restoring",
+                "→".dimmed()
+            );
+        }
+        volume::transfer_client()?
+    } else {
+        client
+    }
+    .post(&url)
+    .json(&request)
+    .send()
+    .await?;
 
     if !response.status().is_success() {
         let error: ApiError = response.json().await?;
@@ -6581,6 +6609,8 @@ async fn handle_registry_init(json_output: bool) -> Result<(), Box<dyn std::erro
         hardware_preference: None,
         lifecycle: LifecycleSpec::default(),
         labels: HashMap::new(),
+        wait: false,
+        wait_timeout_s: None,
     };
 
     let url = format!("{}/containers/deploy", *API_BASE_URL);

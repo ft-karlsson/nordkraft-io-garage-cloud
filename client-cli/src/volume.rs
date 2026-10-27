@@ -23,7 +23,7 @@ const PROGRESS_STEP: u64 = 1024 * 1024;
 type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 /// No overall timeout: a transfer takes as long as it takes.
-fn transfer_client() -> CliResult<Client> {
+pub(crate) fn transfer_client() -> CliResult<Client> {
     Ok(Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .build()?)
