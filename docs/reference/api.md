@@ -40,8 +40,8 @@ Alle requests autentificeres via din WireGuard VPN-forbindelse. Ingen API keys n
 
 En peer er en netværksidentitet, ikke en bruger: den får en adresse i dit eget
 peer-område `172.20.<slot>.2-254`, kan nå dine containere (alle, eller udvalgte
-på udvalgte porte) og kan aldrig nå API'et eller andre kunder. Den private nøgle
-laves hos dig (CLI'en gør det), kun den offentlige sendes.
+på udvalgte porte), og intet andet. Den private nøgle laves hos dig (CLI'en gør
+det), kun den offentlige sendes.
 
 ```json
 POST /peers
