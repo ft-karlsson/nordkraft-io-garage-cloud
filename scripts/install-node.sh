@@ -144,7 +144,7 @@ section "Phase 1: Packages"
 # =============================================================================
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-PKGS=(curl jq uuid-runtime ca-certificates containerd iptables file)
+PKGS=(curl jq uuid-runtime ca-certificates containerd iptables file zstd)
 if $IS_SERVER; then PKGS+=(postgresql postgresql-client); fi
 if ! $DEV; then PKGS+=(wireguard wireguard-tools nftables); fi
 apt-get install -y -qq "${PKGS[@]}"

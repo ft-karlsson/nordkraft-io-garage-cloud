@@ -8,3 +8,4 @@ pub mod nodes;
 pub mod peers;
 pub mod status;
 pub mod stream;
+pub mod volumes;

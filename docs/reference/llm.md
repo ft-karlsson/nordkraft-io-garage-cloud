@@ -58,6 +58,7 @@ FLAG:
       --memory STRING       RAM grænse (default: 512m)
       --persistence         Aktiver persistent storage
       --volume-path PATH    Sti i containeren til persistent data (kræves med --persistence)
+      --volume-from FIL     Fyld den nye volume med en backup-fil fra `nordkraft backup`
       --ipv6                Allokér global IPv6 adresse
       --name STRING         Brugerdefineret navn (kan bruges i alle efterfølgende kommandoer)
       --garage STRING       Target garage (fx ry)
@@ -107,6 +108,14 @@ nordkraft stop CONTAINER
 nordkraft start CONTAINER
 nordkraft rm CONTAINER
 ```
+
+#### backup / restore (volume som én fil på din egen maskine)
+```
+nordkraft backup CONTAINER [-o FIL]            # tar.zst, default NAVN-ÅÅÅÅMMDDTHHMM.tar.zst; -o - = stdout
+nordkraft restore CONTAINER FIL [--yes]        # erstatter hele volumen; containeren stoppes og startes igen
+nordkraft deploy IMAGE --persistence --volume-path STI --volume-from FIL   # ny container med dataene
+```
+Arkivet indeholder kun volumen: giv den nye container samme `-e`/`--env-file` (fx `SECRET_KEY_BASE`) og port som den gamle.
 
 ---
 
@@ -277,6 +286,7 @@ IPV6=$(nordkraft container inspect NAVN --json | jq -r '.ipv6_address')
 - `--name` sætter et menneskevenligt navn der bruges i ALLE efterfølgende kommandoer
 - `ingress enable` tager `.name` (fx `mattermost`), IKKE `.container_id`
 - `--persistence` kræver altid `--volume-path PATH` — de to flag hører sammen
+- `nordkraft backup` gemmer intet på platformen; filen ligger kun hos brugeren. `restore` erstatter alt i volumen, så foreslå en `backup` først
 - Interne container IPs er på `172.21.x.x` subnets (én per bruger)
 - API server er på `172.20.0.254:8001` (kun via VPN)
 - Containere kører i Kata VM isolation (ikke bare namespaces)

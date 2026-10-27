@@ -1398,6 +1398,43 @@ impl ContainerManager {
 
     /// Inspect a single container — calls `nerdctl inspect` and extracts rich data.
     /// Only succeeds if the container is owned by owner_pubkey (label check).
+    /// Bind mounts (host source, container destination) and whether the
+    /// container is running, straight from the runtime. No owner check: the
+    /// caller resolves ownership first.
+    pub async fn inspect_mounts_and_state(
+        &self,
+        container_id: &str,
+    ) -> Result<(Vec<(String, String)>, bool), Box<dyn std::error::Error + Send + Sync>> {
+        let output = tokio::process::Command::new(&self.runtime_binary)
+            .args(["inspect", container_id])
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
+        }
+        let raw: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let c = raw
+            .as_array()
+            .and_then(|arr| arr.first())
+            .ok_or("Empty inspect output")?;
+        let mounts = c["Mounts"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter(|m| m["Type"].as_str().unwrap_or("bind") == "bind")
+                    .filter_map(|m| {
+                        Some((
+                            m["Source"].as_str()?.to_string(),
+                            m["Destination"].as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let running = c["State"]["Running"].as_bool().unwrap_or(false);
+        Ok((mounts, running))
+    }
+
     pub async fn inspect_container(
         &self,
         container_id: &str,

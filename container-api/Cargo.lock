@@ -445,15 +445,17 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "container-api"
-version = "0.3.48"
+version = "0.3.49"
 dependencies = [
  "async-nats",
  "async-trait",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "containerd-client",
  "dotenv",
  "futures",
+ "hex",
  "hickory-resolver",
  "idna",
  "instant-acme",
@@ -470,9 +472,11 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tokio",
  "tokio-tungstenite",
+ "tokio-util",
  "toml",
  "tonic",
  "tracing",
@@ -2561,10 +2565,12 @@ dependencies = [
  "system-configuration",
  "tokio",
  "tokio-native-tls",
+ "tokio-util",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "winreg",
 ]
@@ -4206,6 +4212,19 @@ dependencies = [
  "indexmap",
  "wasm-encoder",
  "wasmparser",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

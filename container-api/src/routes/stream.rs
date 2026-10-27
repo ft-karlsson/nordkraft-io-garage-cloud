@@ -97,7 +97,7 @@ impl StreamQuery {
 // Where does this container live?
 // ---------------------------------------------------------------------------
 
-enum Placement {
+pub(crate) enum Placement {
     Local,
     Remote { agent_ip: String, agent_port: u16 },
 }
@@ -105,7 +105,7 @@ enum Placement {
 /// Ownership + placement in one step. Local containers are checked against
 /// the runtime's owner label (no DB involved, so dev mode works); remote
 /// ones against the containers table, then the owning node's WG address.
-async fn place(
+pub(crate) async fn place(
     container: &str,
     user: &AuthenticatedUser,
     app_state: &AppState,
@@ -530,7 +530,7 @@ fn wait_result(
 }
 
 /// Minimal percent-encoding for query values (WireGuard keys contain '+' and '/').
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {

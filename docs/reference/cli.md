@@ -54,6 +54,7 @@ nordkraft deploy IMAGE [FLAG]
 | `--auto-delete` | | - | Slet denne tid efter containeren stoppede (`1h`) |
 | `--max-lifetime` | | - | Stop senest denne tid efter oprettelse (`24h`) |
 | `--label` | `-l` | - | Label `KEY=VALUE` (kan gentages); se `list --label` |
+| `--volume-from` | | - | Fyld den nye volume med en backup-fil fra `nordkraft backup` (kræver `--persistence`) |
 
 !!! warning "Kendte problemer"
     **CPU/Memory limits:** Disse flag er implementeret men bliver ikke anvendt endnu (bug #1). Dette bliver rettet i næste opdatering.
@@ -243,7 +244,81 @@ nordkraft rm CONTAINER [FLAG]
 | `--force` | Slet uden bekræftelse |
 
 !!! warning "Advarsel"
-    Dette sletter containeren og frigiver IP-adressen. Persistent data backuppes automatisk.
+    Dette sletter containeren og frigiver IP-adressen. Tag en `nordkraft backup` først, hvis du vil beholde dataene.
+
+---
+
+### backup
+
+Hent en komplet kopi af containerens volume som én fil (`tar.zst`) på din egen maskine.
+
+```bash
+nordkraft backup CONTAINER [FLAG]
+```
+
+**Flag:**
+
+| Flag | Kort | Default | Beskrivelse |
+|------|------|---------|-------------|
+| `--output` | `-o` | `NAVN-ÅÅÅÅMMDDTHHMM.tar.zst` | Filnavn. `-` skriver til stdout |
+
+Filen er almindelig `tar` komprimeret med `zstd`, så du kan åbne den hvor som helst
+(`zstd -dc fil.tar.zst | tar -t`). Øverst i arkivet ligger `.nordkraft/manifest.json`
+med container-id, mount-sti og tidspunkt.
+
+Kører noden på LVM, tages kopien fra et øjebliksbillede uden nedetid (`snapshot`).
+Ellers kopieres den kørende volume (`live`) — stop containeren først, hvis det er en database
+og du vil være sikker på en konsistent kopi.
+
+**Eksempler:**
+
+```bash
+# Backup til en fil i den aktuelle mappe
+nordkraft backup campfire
+
+# Vælg selv filnavn
+nordkraft backup campfire -o campfire-før-opgradering.tar.zst
+
+# Direkte videre i en pipe
+nordkraft backup campfire -o - | ssh nas 'cat > /backups/campfire.tar.zst'
+```
+
+---
+
+### restore
+
+Erstat containerens volume med indholdet af en backup-fil.
+
+```bash
+nordkraft restore CONTAINER FIL [FLAG]
+```
+
+**Flag:**
+
+| Flag | Kort | Beskrivelse |
+|------|------|-------------|
+| `--yes` | `-y` | Spring bekræftelsen over |
+
+Containeren stoppes, arkivet pakkes ud ved siden af den nuværende volume og verificeres
+(sha256), og først derefter byttes mapperne. Fejler noget undervejs, rører jeg ikke den
+eksisterende volume. Kørte containeren før, startes den igen bagefter.
+
+!!! warning "Advarsel"
+    Alt i volumen erstattes — også filer der ikke findes i arkivet.
+
+**Eksempler:**
+
+```bash
+# Rul tilbage til en backup
+nordkraft restore campfire campfire-20261026T1840.tar.zst
+
+# Flyt data til en ny container (fx ved migrering) — husk miljøvariablerne,
+# arkivet indeholder kun volumen
+nordkraft deploy ghcr.io/basecamp/once-campfire:latest --port 3000 \
+  --persistence --volume-path /rails/storage \
+  --env-file campfire.env \
+  --volume-from campfire-20261026T1840.tar.zst
+```
 
 ---
 
