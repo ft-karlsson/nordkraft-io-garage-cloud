@@ -161,6 +161,19 @@ pub fn snapshot_mount_opts(fstype: &str) -> &'static str {
     }
 }
 
+/// `findmnt` prints a bind mount's source as `/dev/x[/sub/dir]`. Split that
+/// into the device and the subtree (relative, empty when not a bind mount).
+pub fn split_bind_source(source: &str) -> (String, PathBuf) {
+    match (source.find('['), source.ends_with(']')) {
+        (Some(i), true) => {
+            let dev = source[..i].to_string();
+            let sub = source[i + 1..source.len() - 1].trim_start_matches('/');
+            (dev, PathBuf::from(sub))
+        }
+        _ => (source.to_string(), PathBuf::new()),
+    }
+}
+
 /// Where `path` lives relative to its mount point, so the same directory can
 /// be found under the snapshot mount.
 pub fn path_under_mount(path: &Path, mount_target: &Path) -> Option<PathBuf> {
@@ -169,47 +182,87 @@ pub fn path_under_mount(path: &Path, mount_target: &Path) -> Option<PathBuf> {
         .map(|p| p.to_path_buf())
 }
 
+/// Try to take an LVM snapshot of the filesystem holding `host_path`. Any
+/// failure means "no snapshot" and the caller copies live; the reason is
+/// logged so a surprising `live` manifest can be explained from the journal.
 async fn try_snapshot(host_path: &Path, volume_bytes: u64, tag: &str) -> Option<Snapshot> {
-    // Which block device and mount point hold the volume?
-    let out = Command::new("findmnt")
-        .args(["-n", "-T"])
-        .arg(host_path)
-        .args(["-o", "SOURCE,TARGET,FSTYPE"])
+    match snapshot_inner(host_path, volume_bytes, tag).await {
+        Ok(s) => Some(s),
+        Err(reason) => {
+            warn!("snapshot not possible, falling back to live copy: {reason}");
+            None
+        }
+    }
+}
+
+/// Run a discovery command and return its trimmed stdout, or why it failed.
+async fn probe(cmd: &str, args: &[&str]) -> Result<String, String> {
+    let out = Command::new(cmd)
+        .args(args)
         .output()
         .await
-        .ok()?;
+        .map_err(|e| format!("{cmd}: cannot run: {e}"))?;
     if !out.status.success() {
-        return None;
+        return Err(format!(
+            "{cmd} {}: exit {}: {}",
+            args.join(" "),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
-    let line = String::from_utf8_lossy(&out.stdout);
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+async fn snapshot_inner(
+    host_path: &Path,
+    volume_bytes: u64,
+    tag: &str,
+) -> Result<Snapshot, String> {
+    // Which block device and mount point hold the volume?
+    let path = host_path.to_string_lossy().to_string();
+    let line = probe(
+        "findmnt",
+        &["-n", "-T", &path, "-o", "SOURCE,TARGET,FSTYPE"],
+    )
+    .await?;
     let mut parts = line.split_whitespace();
-    let (source, target, fstype) = (parts.next()?, parts.next()?, parts.next()?);
+    let (source, target, fstype) = match (parts.next(), parts.next(), parts.next()) {
+        (Some(s), Some(t), Some(f)) => (s.to_string(), t.to_string(), f.to_string()),
+        _ => return Err(format!("findmnt gave an unexpected line: {line:?}")),
+    };
     if !source.starts_with("/dev/") {
-        return None;
+        return Err(format!("{path} is on {source}, not a block device"));
     }
+    // A bind mount reports its device as `/dev/x[/sub/dir]`: the filesystem is
+    // `/dev/x` and the mount shows the subtree `/sub/dir` of it at `target`.
+    let (source, bind_root) = split_bind_source(&source);
 
     // Is it an LVM logical volume, and does the group have room?
-    let lvs = Command::new("lvs")
-        .args([
+    let lvs = probe(
+        "lvs",
+        &[
             "--noheadings",
             "--units",
             "b",
             "--nosuffix",
             "-o",
             "vg_name,lv_name",
-            source,
-        ])
-        .output()
-        .await
-        .ok()?;
-    if !lvs.status.success() {
-        return None;
-    }
-    let lvs = String::from_utf8_lossy(&lvs.stdout);
+            &source,
+        ],
+    )
+    .await?;
     let mut f = lvs.split_whitespace();
-    let (vg, lv) = (f.next()?.to_string(), f.next()?.to_string());
-    let vgs = Command::new("vgs")
-        .args([
+    let (vg, lv) = match (f.next(), f.next()) {
+        (Some(v), Some(l)) => (v.to_string(), l.to_string()),
+        _ => {
+            return Err(format!(
+                "{source} is not an LVM logical volume (lvs: {lvs:?})"
+            ))
+        }
+    };
+    let vgs = probe(
+        "vgs",
+        &[
             "--noheadings",
             "--units",
             "b",
@@ -217,82 +270,62 @@ async fn try_snapshot(host_path: &Path, volume_bytes: u64, tag: &str) -> Option<
             "-o",
             "vg_free",
             &vg,
-        ])
-        .output()
-        .await
-        .ok()?;
-    let vg_free: u64 = String::from_utf8_lossy(&vgs.stdout).trim().parse().ok()?;
-    let size = match snapshot_size(volume_bytes, vg_free) {
-        Some(s) => s,
-        None => {
-            info!("snapshot skipped: {} has {} B free in {}", lv, vg_free, vg);
-            return None;
-        }
-    };
+        ],
+    )
+    .await?;
+    let vg_free: u64 = vgs
+        .parse()
+        .map_err(|_| format!("vgs gave an unexpected free size: {vgs:?}"))?;
+    let size = snapshot_size(volume_bytes, vg_free)
+        .ok_or_else(|| format!("{vg} has only {vg_free} B free for a snapshot of {lv}"))?;
 
     let name = format!("{SNAP_LV_PREFIX}{tag}");
     let lv_ref = format!("{vg}/{lv}");
-    let created = Command::new("lvcreate")
-        .args(["-s", "-n", &name, "-L", &format!("{size}b"), &lv_ref])
-        .output()
-        .await
-        .ok()?;
-    if !created.status.success() {
-        warn!(
-            "lvcreate failed, falling back to live copy: {}",
-            String::from_utf8_lossy(&created.stderr).trim()
-        );
-        return None;
-    }
+    probe(
+        "lvcreate",
+        &["-s", "-n", &name, "-L", &format!("{size}b"), &lv_ref],
+    )
+    .await?;
     let snap = Snapshot {
         lv: format!("{vg}/{name}"),
         mount: Path::new(SNAP_MOUNT_ROOT).join(format!("snap-{tag}")),
         source: PathBuf::new(),
     };
-    if tokio::fs::create_dir_all(&snap.mount).await.is_err() {
+    if let Err(e) = tokio::fs::create_dir_all(&snap.mount).await {
+        let msg = format!("cannot create {}: {e}", snap.mount.display());
         snap.cleanup().await;
-        return None;
+        return Err(msg);
     }
     let dev = format!("/dev/{vg}/{name}");
-    let mounted = Command::new("mount")
-        .args(["-o", snapshot_mount_opts(fstype), &dev])
-        .arg(&snap.mount)
-        .output()
-        .await;
-    match mounted {
-        Ok(o) if o.status.success() => {}
-        Ok(o) => {
-            warn!(
-                "snapshot mount failed, falling back to live copy: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            snap.cleanup().await;
-            return None;
-        }
-        Err(e) => {
-            warn!("snapshot mount failed, falling back to live copy: {e}");
-            snap.cleanup().await;
-            return None;
-        }
+    let mount_dir = snap.mount.to_string_lossy().to_string();
+    if let Err(e) = probe(
+        "mount",
+        &["-o", snapshot_mount_opts(&fstype), &dev, &mount_dir],
+    )
+    .await
+    {
+        snap.cleanup().await;
+        return Err(e);
     }
-    let rel = match path_under_mount(host_path, Path::new(target)) {
+    let rel = match path_under_mount(host_path, Path::new(&target)) {
         Some(r) => r,
         None => {
             snap.cleanup().await;
-            return None;
+            return Err(format!("{path} is not under mount point {target}"));
         }
     };
-    let source = snap.mount.join(rel);
+    let source = snap.mount.join(&bind_root).join(rel);
     if !source.is_dir() {
+        let msg = format!("{} is not a directory in the snapshot", source.display());
         snap.cleanup().await;
-        return None;
+        return Err(msg);
     }
     info!(
         "📸 Snapshot {} mounted at {}",
         snap.lv,
         snap.mount.display()
     );
-    Some(Snapshot { source, ..snap })
+    Ok(Snapshot { source, ..snap })
 }
 
 /// Remove snapshots and mounts left behind by a crash. Called once at agent
@@ -708,6 +741,20 @@ mod tests {
     fn snapshot_size_refuses_without_headroom() {
         assert_eq!(snapshot_size(1 << 30, 2 << 30), None); // 2 GiB wanted + 1 GiB reserve > 2 GiB free
         assert_eq!(snapshot_size(1 << 30, 3 << 30), Some(SNAP_MIN_BYTES));
+    }
+
+    #[test]
+    fn bind_mount_source_is_split() {
+        let (dev, sub) = split_bind_source("/dev/mapper/ubuntu--vg-ubuntu--lv[/var/lib/nordkraft]");
+        assert_eq!(dev, "/dev/mapper/ubuntu--vg-ubuntu--lv");
+        assert_eq!(sub, PathBuf::from("var/lib/nordkraft"));
+        let (dev, sub) = split_bind_source("/dev/mapper/ubuntu--vg-ubuntu--lv");
+        assert_eq!(dev, "/dev/mapper/ubuntu--vg-ubuntu--lv");
+        assert_eq!(sub, PathBuf::new());
+        assert_eq!(
+            Path::new("/run/snap").join(&sub).join("users/1"),
+            PathBuf::from("/run/snap/users/1")
+        );
     }
 
     #[test]
