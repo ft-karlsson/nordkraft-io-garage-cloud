@@ -64,12 +64,19 @@ pub fn check(stored: &Stored, code: &str, now: DateTime<Utc>) -> Check {
         return Check::Dead;
     }
     if normalize(code).len() != CODE_LEN {
-        return Check::Wrong { attempts_left: MAX_ATTEMPTS - stored.attempts - 1 };
+        return Check::Wrong {
+            attempts_left: MAX_ATTEMPTS - stored.attempts - 1,
+        };
     }
-    if constant_time_eq(hash_code(&stored.id, code).as_bytes(), stored.code_hash.trim().as_bytes()) {
+    if constant_time_eq(
+        hash_code(&stored.id, code).as_bytes(),
+        stored.code_hash.trim().as_bytes(),
+    ) {
         Check::Ok
     } else {
-        Check::Wrong { attempts_left: MAX_ATTEMPTS - stored.attempts - 1 }
+        Check::Wrong {
+            attempts_left: MAX_ATTEMPTS - stored.attempts - 1,
+        }
     }
 }
 
@@ -113,13 +120,22 @@ mod tests {
     #[test]
     fn rejects_wrong_code_and_counts_down() {
         let s = stored("123456", 3, 10);
-        assert_eq!(check(&s, "000000", Utc::now()), Check::Wrong { attempts_left: 1 });
+        assert_eq!(
+            check(&s, "000000", Utc::now()),
+            Check::Wrong { attempts_left: 1 }
+        );
     }
 
     #[test]
     fn dead_after_expiry_or_attempts() {
-        assert_eq!(check(&stored("123456", 0, -1), "123456", Utc::now()), Check::Dead);
-        assert_eq!(check(&stored("123456", 5, 10), "123456", Utc::now()), Check::Dead);
+        assert_eq!(
+            check(&stored("123456", 0, -1), "123456", Utc::now()),
+            Check::Dead
+        );
+        assert_eq!(
+            check(&stored("123456", 5, 10), "123456", Utc::now()),
+            Check::Dead
+        );
     }
 
     #[test]

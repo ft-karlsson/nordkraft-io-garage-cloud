@@ -22,20 +22,20 @@ pub struct MailClient {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum Mail<'a> {
-    DeletionCode { code: &'a str },
-    DeletionScheduled { scheduled_for: DateTime<Utc> },
-    DeletionCancelled,
-    DeletionCompleted,
+pub enum DeletionMail<'a> {
+    Code { code: &'a str },
+    Scheduled { scheduled_for: DateTime<Utc> },
+    Cancelled,
+    Completed,
 }
 
-impl Mail<'_> {
+impl DeletionMail<'_> {
     fn kind(&self) -> &'static str {
         match self {
-            Mail::DeletionCode { .. } => "deletion_code",
-            Mail::DeletionScheduled { .. } => "deletion_scheduled",
-            Mail::DeletionCancelled => "deletion_cancelled",
-            Mail::DeletionCompleted => "deletion_completed",
+            DeletionMail::Code { .. } => "deletion_code",
+            DeletionMail::Scheduled { .. } => "deletion_scheduled",
+            DeletionMail::Cancelled => "deletion_cancelled",
+            DeletionMail::Completed => "deletion_completed",
         }
     }
 }
@@ -56,15 +56,20 @@ impl MailClient {
     /// Ask the backend to send one mail. The backend queues it and answers at
     /// once; an Err here means the backend was unreachable or refused, not
     /// that the relay failed later (that is in the backend's log).
-    pub async fn send(&self, to_email: &str, full_name: &str, mail: Mail<'_>) -> Result<(), String> {
+    pub async fn send(
+        &self,
+        to_email: &str,
+        full_name: &str,
+        mail: DeletionMail<'_>,
+    ) -> Result<(), String> {
         let mut body = serde_json::json!({
             "kind": mail.kind(),
             "to_email": to_email,
             "full_name": full_name,
         });
         match mail {
-            Mail::DeletionCode { code } => body["code"] = serde_json::json!(code),
-            Mail::DeletionScheduled { scheduled_for } => {
+            DeletionMail::Code { code } => body["code"] = serde_json::json!(code),
+            DeletionMail::Scheduled { scheduled_for } => {
                 body["scheduled_for"] = serde_json::json!(scheduled_for)
             }
             _ => {}
@@ -81,7 +86,12 @@ impl MailClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            warn!("mail {} refused by backend: {} {}", mail.kind(), status, text);
+            warn!(
+                "mail {} refused by backend: {} {}",
+                mail.kind(),
+                status,
+                text
+            );
             return Err(format!("signup backend returned {}", status));
         }
         info!("📧 mail {} queued at the signup backend", mail.kind());
@@ -103,7 +113,11 @@ impl MailClient {
             .await
         {
             Ok(resp) if resp.status().is_success() => info!("🔔 founder notified: {}", title),
-            Ok(resp) => warn!("founder notification refused by backend: {} ({})", resp.status(), title),
+            Ok(resp) => warn!(
+                "founder notification refused by backend: {} ({})",
+                resp.status(),
+                title
+            ),
             Err(e) => warn!("founder notification not sent ({}): {}", title, e),
         }
     }

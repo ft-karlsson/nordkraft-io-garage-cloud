@@ -24,7 +24,7 @@
 
 use crate::services::container_manager::ContainerManager;
 use crate::services::haproxy_client::HAProxyClientTrait;
-use crate::services::mail_client::{Mail, MailClient};
+use crate::services::mail_client::{DeletionMail, MailClient};
 use crate::services::nats_service::NatsService;
 use crate::services::peer_reconciler;
 use crate::services::pfsense_client::PfSenseClientTrait;
@@ -64,7 +64,10 @@ pub struct DeletionRecord {
 }
 
 /// The customer's open (not cancelled, not completed) request, if any.
-pub async fn open_request(pool: &PgPool, user_id: &str) -> Result<Option<DeletionRecord>, sqlx::Error> {
+pub async fn open_request(
+    pool: &PgPool,
+    user_id: &str,
+) -> Result<Option<DeletionRecord>, sqlx::Error> {
     let row = sqlx::query(
         "SELECT id, requested_at, scheduled_for, started_at FROM account_deletions
          WHERE user_id = $1 AND cancelled_at IS NULL AND completed_at IS NULL",
@@ -95,7 +98,10 @@ pub fn purge_moment(now: DateTime<Utc>, grace_days: i64) -> DateTime<Utc> {
             .and_hms_opt(h, 0, 0)
             .and_then(|t| Copenhagen.from_local_datetime(&t).earliest())
     };
-    at(3).or_else(|| at(4)).map(|t| t.with_timezone(&Utc)).unwrap_or(now)
+    at(3)
+        .or_else(|| at(4))
+        .map(|t| t.with_timezone(&Utc))
+        .unwrap_or(now)
 }
 
 /// Confirmed: record the request. The user row is untouched. `immediate`
@@ -114,7 +120,11 @@ pub async fn schedule(
     let rec = DeletionRecord {
         id: Uuid::new_v4().to_string(),
         requested_at: now,
-        scheduled_for: if immediate { now } else { purge_moment(now, grace_days) },
+        scheduled_for: if immediate {
+            now
+        } else {
+            purge_moment(now, grace_days)
+        },
         started_at: None,
     };
     sqlx::query(
@@ -151,7 +161,10 @@ pub async fn cancel(pool: &PgPool, user_id: &str) -> Result<bool, sqlx::Error> {
 /// Everything the admin purge route does after its dry-run and confirm-email
 /// checks, so the runner and the route cannot drift apart. Ok when the rows
 /// are gone; Err carries what to tell the caller and the partial report.
-pub async fn execute_purge(deps: &PurgeDeps, inv: &PurgeInventory) -> Result<PurgeReport, (String, PurgeReport)> {
+pub async fn execute_purge(
+    deps: &PurgeDeps,
+    inv: &PurgeInventory,
+) -> Result<PurgeReport, (String, PurgeReport)> {
     let mut report = PurgeReport::default();
     tenant_purge::suspend(&deps.pool, &inv.user, &mut report).await;
     if report.errors.is_empty() {
@@ -225,7 +238,10 @@ pub async fn finish_requested(deps: &PurgeDeps, user_id: &str) {
     {
         Ok(r) => r,
         Err(e) => {
-            error!("account deletion: could not mark {} complete: {}", user_id, e);
+            error!(
+                "account deletion: could not mark {} complete: {}",
+                user_id, e
+            );
             return;
         }
     };
@@ -237,18 +253,22 @@ pub async fn finish_requested(deps: &PurgeDeps, user_id: &str) {
 
     if let Some(email) = email.as_deref() {
         let name = full_name.as_deref().unwrap_or("");
-        match deps.mail.send(email, name, Mail::DeletionCompleted).await {
+        match deps.mail.send(email, name, DeletionMail::Completed).await {
             Ok(()) => {}
             Err(e) => warn!("account deletion {}: final mail not sent: {}", id, e),
         }
     }
     // The record stays (when, which slot); the person does not.
-    if let Err(e) = sqlx::query("UPDATE account_deletions SET email = NULL, full_name = NULL WHERE id = $1")
-        .bind(&id)
-        .execute(&deps.pool)
-        .await
+    if let Err(e) =
+        sqlx::query("UPDATE account_deletions SET email = NULL, full_name = NULL WHERE id = $1")
+            .bind(&id)
+            .execute(&deps.pool)
+            .await
     {
-        error!("account deletion {}: could not clear the address: {}", id, e);
+        error!(
+            "account deletion {}: could not clear the address: {}",
+            id, e
+        );
     }
 }
 
@@ -324,7 +344,11 @@ async fn tick(deps: &PurgeDeps, auto_purge: bool) {
             let giving_up = attempts + 1 >= 3;
             deps.mail
                 .notify(
-                    if giving_up { "Sletning fejlede, giver op" } else { "Sletning fejlede" },
+                    if giving_up {
+                        "Sletning fejlede, giver op"
+                    } else {
+                        "Sletning fejlede"
+                    },
                     &format!(
                         "Deletion {id} (forsøg {}): {e}{}",
                         attempts + 1,

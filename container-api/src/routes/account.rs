@@ -6,7 +6,7 @@
 
 use crate::guards::AuthenticatedUser;
 use crate::services::account_deletion as deletion;
-use crate::services::mail_client::{Mail, MailClient};
+use crate::services::mail_client::{DeletionMail, MailClient};
 use crate::services::verification;
 use crate::AppState;
 use chrono::{DateTime, Utc};
@@ -126,7 +126,7 @@ pub async fn request_deletion(
     }
 
     if let Err(e) = mail
-        .send(&u.email, &u.full_name, Mail::DeletionCode { code: &code })
+        .send(&u.email, &u.full_name, DeletionMail::Code { code: &code })
         .await
     {
         warn!("deletion request for {}: code mail not sent: {}", u.id, e);
@@ -183,7 +183,12 @@ pub async fn confirm_deletion(
     .await
     {
         Ok(Some(r)) => r,
-        Ok(None) => return err(Status::NotFound, "unknown verification; run `nordkraft account delete` again"),
+        Ok(None) => {
+            return err(
+                Status::NotFound,
+                "unknown verification; run `nordkraft account delete` again",
+            )
+        }
         Err(e) => return db_err(e),
     };
     let stored = verification::Stored {
@@ -198,13 +203,17 @@ pub async fn confirm_deletion(
     }
     match verification::check(&stored, &req.code, Utc::now()) {
         verification::Check::Dead => {
-            return err(Status::Gone, "code expired; run `nordkraft account delete` again for a new one")
+            return err(
+                Status::Gone,
+                "code expired; run `nordkraft account delete` again for a new one",
+            )
         }
         verification::Check::Wrong { attempts_left } => {
-            let _ = sqlx::query("UPDATE email_verifications SET attempts = attempts + 1 WHERE id = $1")
-                .bind(&stored.id)
-                .execute(pool)
-                .await;
+            let _ =
+                sqlx::query("UPDATE email_verifications SET attempts = attempts + 1 WHERE id = $1")
+                    .bind(&stored.id)
+                    .execute(pool)
+                    .await;
             return (
                 Status::BadRequest,
                 Json(serde_json::json!({
@@ -223,23 +232,43 @@ pub async fn confirm_deletion(
     {
         return db_err(e);
     }
-    let grace_days = if req.immediate { 0 } else { app_state.config.account_deletion_grace_days };
+    let grace_days = if req.immediate {
+        0
+    } else {
+        app_state.config.account_deletion_grace_days
+    };
     let rec = match deletion::schedule(
-        pool, &u.id, u.user_slot, &u.email, &u.full_name, grace_days, req.immediate,
+        pool,
+        &u.id,
+        u.user_slot,
+        &u.email,
+        &u.full_name,
+        grace_days,
+        req.immediate,
     )
     .await
     {
         Ok(r) => r,
-        Err(e) if e.as_database_error().map(|d| d.is_unique_violation()).unwrap_or(false) => {
+        Err(e)
+            if e.as_database_error()
+                .map(|d| d.is_unique_violation())
+                .unwrap_or(false) =>
+        {
             return err(Status::Conflict, "deletion already requested")
         }
         Err(e) => return db_err(e),
     };
     warn!(
         "🧹 deletion confirmed by {} (slot {:?}): scheduled for {}{}",
-        u.id, u.user_slot, rec.scheduled_for, if req.immediate { " (immediate)" } else { "" }
+        u.id,
+        u.user_slot,
+        rec.scheduled_for,
+        if req.immediate { " (immediate)" } else { "" }
     );
-    let slot = u.user_slot.map(|s| s.to_string()).unwrap_or_else(|| "?".into());
+    let slot = u
+        .user_slot
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "?".into());
     if req.immediate {
         // The "slettes den …" mail would arrive minutes before the final one;
         // the customer gets the goodbye mail when the purge is done.
@@ -254,7 +283,9 @@ pub async fn confirm_deletion(
             .send(
                 &u.email,
                 &u.full_name,
-                Mail::DeletionScheduled { scheduled_for: rec.scheduled_for },
+                DeletionMail::Scheduled {
+                    scheduled_for: rec.scheduled_for,
+                },
             )
             .await
         {
@@ -295,16 +326,24 @@ pub async fn cancel_deletion(
         Err(e) => return db_err(e),
     }
     info!("🧹 deletion cancelled by {}", u.id);
-    if let Err(e) = mail.send(&u.email, &u.full_name, Mail::DeletionCancelled).await {
+    if let Err(e) = mail
+        .send(&u.email, &u.full_name, DeletionMail::Cancelled)
+        .await
+    {
         warn!("deletion cancel for {}: mail not sent: {}", u.id, e);
     }
     mail.notify(
         "Sletning annulleret",
         &format!(
             "Slot {} har fortrudt og beholder sin konto.",
-            u.user_slot.map(|s| s.to_string()).unwrap_or_else(|| "?".into())
+            u.user_slot
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "?".into())
         ),
     )
     .await;
-    (Status::Ok, Json(serde_json::json!({ "status": "cancelled" })))
+    (
+        Status::Ok,
+        Json(serde_json::json!({ "status": "cancelled" })),
+    )
 }

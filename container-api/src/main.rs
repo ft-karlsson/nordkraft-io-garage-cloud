@@ -637,6 +637,7 @@ struct TenantPurgeAdminRequest {
 /// rule, then all DB rows. Dry run by default. Safe to re-run after a partial
 /// failure; DB rows go only when every step succeeded. See services/tenant_purge.rs.
 #[post("/admin/tenant/purge", data = "<req>")]
+#[allow(clippy::too_many_arguments)] // Rocket guards, one per concern
 async fn admin_purge_tenant(
     _admin: AdminAuth,
     req: Json<TenantPurgeAdminRequest>,
@@ -1218,7 +1219,11 @@ async fn rocket() -> _ {
         info!(
             "🧹 Account deletion runner: grace {} day(s), auto purge {}",
             config.account_deletion_grace_days,
-            if config.account_deletion_auto_purge { "ON" } else { "off (admin purge finishes due deletions)" }
+            if config.account_deletion_auto_purge {
+                "ON"
+            } else {
+                "off (admin purge finishes due deletions)"
+            }
         );
     }
 
