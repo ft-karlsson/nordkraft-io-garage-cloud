@@ -9,11 +9,10 @@
 Tre ting skal være på plads:
 
 1. **nordkraft.io konto** — opret på [cloud.nordkraft.io](https://cloud.nordkraft.io)
-2. **Installer CLI + forbind** — kør det kommando du fik i din velkomst-email:
+2. **Installer CLI + forbind** — aktivér kontoen med linket (eller koden) i den første mail, og kør så kommandoen, du får på siden og i den næste mail:
 ```bash
 curl -fsSL https://cloud.nordkraft.io/install.sh | sh -s NKINVITE-...
 ```
-   Kommandoen står kun i mailen: dit invite-token er dit bevis på, at adressen er din.
 3. **Tjek at alt virker:**
 ```bash
 nordkraft auth login
