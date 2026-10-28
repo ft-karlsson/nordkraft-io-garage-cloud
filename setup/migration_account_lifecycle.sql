@@ -4,7 +4,7 @@
 
 -- One row per code sent to a customer's address. The code itself is never
 -- stored, only its SHA-256. A row is spent when verified_at is set, dead when
--- expires_at has passed or attempts reached the limit (5, enforced in code).
+-- expires_at has passed or attempts reached the limit (enforced in code).
 CREATE TABLE IF NOT EXISTS public.email_verifications (
     id character varying(36) NOT NULL PRIMARY KEY,
     user_id character varying(36) NOT NULL,
