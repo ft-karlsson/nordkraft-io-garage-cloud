@@ -16,3 +16,6 @@ pub mod reaper;
 pub mod route_manager;
 pub mod tenant_purge;
 pub mod volume_backup;
+pub mod account_deletion;
+pub mod mail_client;
+pub mod verification;

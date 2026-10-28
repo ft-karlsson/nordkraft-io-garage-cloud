@@ -1,4 +1,5 @@
 // routes/mod.rs
+pub mod account;
 pub mod containers;
 pub mod domains;
 pub mod events;

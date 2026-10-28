@@ -19,6 +19,24 @@ nordkraft [KOMMANDO] --help
 
 ---
 
+## Første gang: setup og e-mail-kode
+
+```bash
+nordkraft setup NKINVITE-...
+```
+
+Efter at CLI'en har sendt sin WireGuard-nøgle, får du en 6-cifret kode på
+den e-mail, du oprettede kontoen med. Skriv koden i terminalen (eller klik på
+linket i mailen og tryk Enter); først derefter åbnes din adgang. Lukkede du
+terminalen undervejs, fortsætter du med:
+
+```bash
+nordkraft connect                 # spørger efter koden
+nordkraft connect --code 123456   # uden prompt
+```
+
+---
+
 ## Container kommandoer
 
 ### deploy
@@ -736,6 +754,44 @@ Vis detaljeret auth status.
 
 ```bash
 nordkraft auth status
+```
+
+---
+
+## Konto kommandoer
+
+### account status
+
+Vis din konto og en eventuel planlagt sletning.
+
+```bash
+nordkraft account status
+```
+
+---
+
+### account delete
+
+Slet din konto. Først sendes en 6-cifret kode til din e-mail, som du indtaster
+i terminalen. Derefter er sletningen planlagt 14 dage frem: alt virker som
+normalt indtil da, så du kan nå at hente det, du vil beholde (`nordkraft backup`).
+Når dagen kommer, fjernes containere, volumener, backups, domæner,
+WireGuard-adgang og dine oplysninger i databasen, og du får en sidste mail.
+
+```bash
+nordkraft account delete
+nordkraft account delete --yes                       # spring bekræftelsen over (koden kræves stadig)
+nordkraft account delete --verification-id <id> --code 123456   # uden prompt, fx fra et script
+```
+
+---
+
+### account restore
+
+Fortryd en planlagt sletning, så længe den ikke er gået i gang.
+
+```bash
+nordkraft account restore
 ```
 
 ---

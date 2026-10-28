@@ -78,6 +78,15 @@ pub struct AppConfig {
     pub containerd_namespace: String,
     // Upper bound for one volume restore upload (VOLUME_RESTORE_MAX_BYTES, default 20 GiB).
     pub volume_restore_max_bytes: u64,
+
+    // Account deletion (services/account_deletion.rs). The signup backend sends
+    // the customer mail; in production it runs on the same host.
+    pub signup_api_url: String, // SIGNUP_API_URL, default http://127.0.0.1:8000
+    pub account_deletion_grace_days: i64, // ACCOUNT_DELETION_GRACE_DAYS, default 14
+    /// ACCOUNT_DELETION_AUTO_PURGE: when false (default) due deletions are only
+    /// logged and the admin purge endpoint finishes them by hand.
+    pub account_deletion_auto_purge: bool,
+    pub account_deletion_interval_seconds: u64, // ACCOUNT_DELETION_INTERVAL, default 600
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -304,5 +313,20 @@ pub fn init_config() -> AppConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(20 * 1024 * 1024 * 1024),
+        signup_api_url: env::var("SIGNUP_API_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "http://127.0.0.1:8000".to_string()),
+        account_deletion_grace_days: env::var("ACCOUNT_DELETION_GRACE_DAYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(14),
+        account_deletion_auto_purge: env::var("ACCOUNT_DELETION_AUTO_PURGE")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false),
+        account_deletion_interval_seconds: env::var("ACCOUNT_DELETION_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600),
     }
 }

@@ -13,6 +13,8 @@ Tre ting skal være på plads:
 ```bash
 curl -fsSL https://cloud.nordkraft.io/install.sh | sh -s NKINVITE-...
 ```
+   Undervejs får du en 6-cifret kode på mail, som du skriver i terminalen. Lukkede du
+   terminalen, så kør `nordkraft connect` og skriv koden der.
 3. **Tjek at alt virker:**
 ```bash
 nordkraft auth login

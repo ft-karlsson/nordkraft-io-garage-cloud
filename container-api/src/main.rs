@@ -645,6 +645,7 @@ async fn admin_purge_tenant(
     pool: &rocket::State<PgPool>,
     haproxy: &rocket::State<Arc<dyn HAProxyClientTrait>>,
     pfsense: &rocket::State<Arc<dyn PfSenseClientTrait>>,
+    mail: &rocket::State<services::mail_client::MailClient>,
 ) -> (rocket::http::Status, Json<serde_json::Value>) {
     use rocket::http::Status;
     use services::tenant_purge;
@@ -709,70 +710,37 @@ async fn admin_purge_tenant(
         inv.user.user_id, inv.user.user_slot
     );
 
-    let mut report = tenant_purge::PurgeReport::default();
-    tenant_purge::suspend(pool.inner(), &inv.user, &mut report).await;
-    if report.errors.is_empty() {
-        let ctx = tenant_purge::PurgeContext {
-            pool: pool.inner(),
-            haproxy: haproxy.inner(),
-            pfsense: pfsense.inner(),
-            nats: orchestrator.nats_service.as_deref(),
-            local: local_node.map(|n| (app_state.container_manager.as_ref(), n)),
-        };
-        tenant_purge::purge_external(&ctx, &inv, &mut report).await;
-
-        // The account is suspended, so the reconciler no longer wants its
-        // peer, its children or any of their rules: one pass removes them.
-        match peer_reconciler::global() {
-            Some(rec) => {
-                let r = rec.reconcile_now().await;
-                if r.errors.is_empty() {
-                    report.done.push(format!(
-                        "WireGuard peers and nft rules converged ({} peer(s) removed)",
-                        r.wg_removed.len()
-                    ));
-                } else {
-                    report
-                        .errors
-                        .push(format!("WireGuard/nft: {}", r.errors.join("; ")));
-                }
-            }
-            None => report
-                .errors
-                .push("no peer reconciler in this mode".to_string()),
+    // Same path as the scheduled purge (services/account_deletion.rs).
+    let deps = services::account_deletion::PurgeDeps {
+        pool: pool.inner().clone(),
+        haproxy: Arc::clone(haproxy.inner()),
+        pfsense: Arc::clone(pfsense.inner()),
+        nats: orchestrator.nats_service.clone(),
+        container_manager: Arc::clone(&app_state.container_manager),
+        route_manager: Arc::clone(&app_state.route_manager),
+        local_node: local_node.map(str::to_string),
+        mail: mail.inner().clone(),
+    };
+    let report = match services::account_deletion::execute_purge(&deps, &inv).await {
+        Ok(report) => report,
+        Err((message, report)) => {
+            error!(
+                "❌ Admin purge incomplete for user {}: {:?}",
+                inv.user.user_id, report.errors
+            );
+            return (
+                Status::InternalServerError,
+                Json(serde_json::json!({
+                    "status": "incomplete",
+                    "message": message,
+                    "report": report,
+                })),
+            );
         }
-    }
-
-    if !report.errors.is_empty() {
-        error!(
-            "❌ Admin purge incomplete for user {}: {:?}",
-            inv.user.user_id, report.errors
-        );
-        return (
-            Status::InternalServerError,
-            Json(serde_json::json!({
-                "status": "incomplete",
-                "message": "The account is suspended and its DB rows are kept. Fix the errors and run the purge again.",
-                "report": report,
-            })),
-        );
-    }
-
-    if let Err(e) = tenant_purge::delete_rows(pool.inner(), &inv.user).await {
-        report.errors.push(format!("DB delete: {}", e));
-        return (
-            Status::InternalServerError,
-            Json(serde_json::json!({
-                "status": "incomplete",
-                "message": "Everything outside the DB is gone, but the rows could not be deleted. Run the purge again.",
-                "report": report,
-            })),
-        );
-    }
-    report.done.push("DB rows deleted".to_string());
-    peer_reconciler::kick();
-
-    tenant_purge::remove_controller_routes(&app_state.route_manager, &inv).await;
+    };
+    // If the customer had asked to leave, this closes their request and
+    // sends the last mail; for any other account it does nothing.
+    services::account_deletion::finish_requested(&deps, &inv.user.user_id).await;
 
     warn!(
         "🧨 Admin purge complete: user {} (slot {})",
@@ -1221,6 +1189,37 @@ async fn rocket() -> _ {
         .spawn();
     }
 
+    // Customer mail goes through the signup backend; the deletion runner
+    // purges due requests (controller/hybrid only, see ACCOUNT_LIFECYCLE.md).
+    let mail_client =
+        services::mail_client::MailClient::new(&config.signup_api_url, &config.admin_api_key);
+    if matches!(
+        config.mode,
+        config::OperationMode::Controller | config::OperationMode::Hybrid
+    ) {
+        let deps = Arc::new(services::account_deletion::PurgeDeps {
+            pool: db_pool.clone(),
+            haproxy: Arc::clone(&haproxy_client),
+            pfsense: Arc::clone(&pfsense_client),
+            nats: nats_service.clone(),
+            container_manager: Arc::clone(&app_state.container_manager),
+            route_manager: Arc::clone(&app_state.route_manager),
+            local_node: matches!(config.mode, config::OperationMode::Hybrid)
+                .then(|| config.node_id.clone()),
+            mail: mail_client.clone(),
+        });
+        services::account_deletion::spawn_runner(
+            deps,
+            config.account_deletion_auto_purge,
+            std::time::Duration::from_secs(config.account_deletion_interval_seconds.max(30)),
+        );
+        info!(
+            "🧹 Account deletion runner: grace {} day(s), auto purge {}",
+            config.account_deletion_grace_days,
+            if config.account_deletion_auto_purge { "ON" } else { "off (admin purge finishes due deletions)" }
+        );
+    }
+
     // Log startup info
     log_startup_info(&config, nats_service.is_some());
 
@@ -1237,6 +1236,7 @@ async fn rocket() -> _ {
         .manage(macvlan_manager)
         .manage(event_store)
         .manage(db_pool)
+        .manage(mail_client)
         .manage(custom_domains.routes_config)
         .manage(custom_domains.challenge_store)
         .manage(custom_domains.dns_verifier);
@@ -1292,6 +1292,11 @@ async fn rocket() -> _ {
                     routes::status::get_status,
                     routes::status::verify_auth,
                     routes::status::get_network_info,
+                    // Own account: status, deletion with emailed code, restore
+                    routes::account::get_account,
+                    routes::account::request_deletion,
+                    routes::account::confirm_deletion,
+                    routes::account::cancel_deletion,
                     // IPv6 firewall management
                     routes::ipv6::open_ipv6_firewall,
                     routes::ipv6::close_ipv6_firewall,
