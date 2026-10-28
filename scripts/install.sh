@@ -213,6 +213,18 @@ verify_installation() {
     fi
 }
 
+# `curl … | sh` leaves stdin on the pipe, so an interactive setup (and any
+# prompt in it) would see no terminal. Hand it /dev/tty when there is one.
+run_setup() {
+    if [ -t 0 ]; then
+        nordkraft setup "${INVITE_TOKEN}"
+    elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
+        nordkraft setup "${INVITE_TOKEN}" < /dev/tty
+    else
+        nordkraft setup "${INVITE_TOKEN}"
+    fi
+}
+
 # Function to show next steps
 show_next_steps() {
     echo ""
@@ -222,7 +234,7 @@ show_next_steps() {
     if [ -n "${INVITE_TOKEN}" ]; then
         say "${CYAN}Running setup with your invite token...${NC}"
         echo ""
-        nordkraft setup "${INVITE_TOKEN}"
+        run_setup
     else
         say "${CYAN}Next step:${NC}"
         echo "  Run the setup command from your signup page:"
@@ -261,7 +273,7 @@ main() {
             echo ""
             say "${CYAN}Running setup with your invite token...${NC}"
             echo ""
-            nordkraft setup "${INVITE_TOKEN}"
+            run_setup
             exit 0
         else
             echo ""

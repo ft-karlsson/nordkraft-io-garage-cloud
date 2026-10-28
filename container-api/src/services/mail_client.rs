@@ -6,6 +6,9 @@
 // authenticated with the shared admin key the backend already uses to call
 // this service. The recipient travels in the body because, for the final
 // mail, the users row is already gone.
+//
+// `notify` goes the same way to `POST /api/internal/notify`: a short note to
+// the founder (ntfy push + mail), so a deletion never happens unseen.
 
 use chrono::{DateTime, Utc};
 use std::time::Duration;
@@ -83,5 +86,25 @@ impl MailClient {
         }
         info!("📧 mail {} queued at the signup backend", mail.kind());
         Ok(())
+    }
+
+    /// Tell the founder. `title` and `message` must not carry personal data
+    /// (they go to a push service); slot numbers and dates are fine. Failures
+    /// are logged, never returned: a notification must not block a purge.
+    pub async fn notify(&self, title: &str, message: &str) {
+        let url = format!("{}/api/internal/notify", self.base_url);
+        let body = serde_json::json!({ "title": title, "message": message });
+        match self
+            .http
+            .post(&url)
+            .header("X-Admin-API-Key", &self.admin_key)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => info!("🔔 founder notified: {}", title),
+            Ok(resp) => warn!("founder notification refused by backend: {} ({})", resp.status(), title),
+            Err(e) => warn!("founder notification not sent ({}): {}", title, e),
+        }
     }
 }

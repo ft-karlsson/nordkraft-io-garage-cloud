@@ -283,11 +283,7 @@ enum Commands {
         token: String,
     },
     /// Connect to NordKraft via WireGuard
-    Connect {
-        /// Verification code from the activation email (first connect only)
-        #[arg(long)]
-        code: Option<String>,
-    },
+    Connect,
     /// Disconnect WireGuard
     Disconnect,
     /// Full reset: disconnect VPN, remove all local config (for testing)
@@ -396,6 +392,9 @@ enum AccountCommands {
         /// Skip the confirmation prompt (the emailed code is still required)
         #[arg(short, long)]
         yes: bool,
+        /// No grace period: delete right after the code is confirmed
+        #[arg(long)]
+        now: bool,
         /// Code from the email (non-interactive; together with --verification-id)
         #[arg(long)]
         code: Option<String>,
@@ -1709,10 +1708,6 @@ struct ConnectionConfig {
     /// Public signup API endpoint. Default: https://cloud.nordkraft.io/api
     #[serde(default, skip_serializing_if = "Option::is_none")]
     public_api_url: Option<String>,
-    /// Set between claim and the emailed code: the peer is not provisioned
-    /// until `POST /verify` succeeds. `nordkraft connect` finishes it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pending_verification: Option<String>,
 }
 
 // Claim API types
@@ -1740,29 +1735,6 @@ struct ClaimData {
     email: String,
     plan_id: String,
     assigned_garage: String,
-    #[serde(default)]
-    verification_id: Option<String>,
-    #[serde(default)]
-    email_verification_required: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct VerifyApiResponse {
-    #[allow(dead_code)]
-    success: bool,
-    data: Option<VerifyStatusData>,
-    error: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct VerifyStatusData {
-    #[serde(default)]
-    verified: bool,
-    #[serde(default)]
-    expired: bool,
-    #[serde(default)]
-    #[allow(dead_code)]
-    attempts_left: i32,
 }
 
 // Auth
@@ -2179,7 +2151,7 @@ async fn main() {
 
         // WireGuard management
         Commands::Setup { token } => handle_setup(token, json_output).await,
-        Commands::Connect { code } => handle_connect(code, json_output).await,
+        Commands::Connect => handle_connect(json_output).await,
         Commands::Disconnect => handle_disconnect(json_output).await,
         Commands::Reset { force } => handle_reset(force, json_output).await,
 
@@ -7350,14 +7322,8 @@ async fn handle_setup(token: String, json_output: bool) -> Result<(), Box<dyn st
         &data.allowed_ips,
     )?;
 
-    // 4. Save connection config (with the pending verification, so an
-    //    interrupted setup resumes with `nordkraft connect`)
-    let pending = if data.email_verification_required {
-        data.verification_id.clone()
-    } else {
-        None
-    };
-    let mut conn_config = ConnectionConfig {
+    // 4. Save connection config
+    let conn_config = ConnectionConfig {
         user_id: data.user_id,
         full_name: data.full_name.clone(),
         email: data.email.clone(),
@@ -7369,17 +7335,8 @@ async fn handle_setup(token: String, json_output: bool) -> Result<(), Box<dyn st
         allowed_ips: data.allowed_ips,
         api_endpoint: None,
         public_api_url: None,
-        pending_verification: pending,
     };
     save_connection_config(&conn_config)?;
-
-    // 4b. The emailed code: until it is entered, the server has no peer for
-    //     this key, so bringing WireGuard up would only time out.
-    if conn_config.pending_verification.is_some()
-        && !complete_email_verification(&mut conn_config, None, json_output).await?
-    {
-        return Ok(());
-    }
 
     // 5. Bring WireGuard up
     if !json_output {
@@ -7495,19 +7452,10 @@ async fn handle_setup(token: String, json_output: bool) -> Result<(), Box<dyn st
     Ok(())
 }
 
-async fn handle_connect(code: Option<String>, json_output: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_connect(json_output: bool) -> Result<(), Box<dyn std::error::Error>> {
     let wg_path = get_wg_config_path();
     if !wg_path.exists() {
         return Err("No WireGuard config found. Run 'nordkraft setup <token>' first.".into());
-    }
-
-    // Setup was interrupted before the emailed code was entered.
-    if let Some(mut config) = load_connection_config() {
-        if config.pending_verification.is_some()
-            && !complete_email_verification(&mut config, code, json_output).await?
-        {
-            return Ok(());
-        }
     }
 
     if !json_output {
@@ -7552,213 +7500,6 @@ async fn handle_disconnect(json_output: bool) -> Result<(), Box<dyn std::error::
     }
 
     Ok(())
-}
-
-// ============= EMAIL VERIFICATION (after claim) =============
-
-async fn verify_api_call(
-    client: &Client,
-    method: reqwest::Method,
-    url: &str,
-    body: Option<serde_json::Value>,
-) -> Result<(reqwest::StatusCode, VerifyApiResponse), Box<dyn std::error::Error>> {
-    let mut req = client.request(method, url);
-    if let Some(b) = body {
-        req = req.json(&b);
-    }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach signup API: {e}"))?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    let parsed: VerifyApiResponse = serde_json::from_str(&text).unwrap_or(VerifyApiResponse {
-        success: false,
-        data: None,
-        error: Some(if text.is_empty() {
-            format!("HTTP {status}")
-        } else {
-            text
-        }),
-    });
-    Ok((status, parsed))
-}
-
-/// Walk the user through the code that was emailed after claim. Returns
-/// Ok(true) once the server has accepted the code (the peer is being
-/// provisioned), Ok(false) when it could not be done now (non-interactive)
-/// and the caller should stop quietly; the pending state stays in
-/// connection.json so `nordkraft connect` picks it up again.
-async fn complete_email_verification(
-    config: &mut ConnectionConfig,
-    code_arg: Option<String>,
-    json_output: bool,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let Some(verification_id) = config.pending_verification.clone() else {
-        return Ok(true);
-    };
-    let client = Client::builder().timeout(Duration::from_secs(15)).build()?;
-    let base = &*PUBLIC_API_URL;
-    let status_url = format!("{base}/verify/{verification_id}");
-    let verify_url = format!("{base}/verify");
-    let resend_url = format!("{base}/verify/{verification_id}/resend");
-
-    fn done(config: &mut ConnectionConfig) -> Result<(), Box<dyn std::error::Error>> {
-        config.pending_verification = None;
-        save_connection_config(config)
-    }
-
-    // Maybe the link in the mail was already clicked.
-    let (st, resp) = verify_api_call(&client, reqwest::Method::GET, &status_url, None).await?;
-    let mut known_dead = false;
-    match (st.as_u16(), resp.data) {
-        (200, Some(d)) if d.verified => {
-            done(config)?;
-            if !json_output {
-                println!("{}", "  ✓ Email already verified".green());
-            }
-            return Ok(true);
-        }
-        (200, Some(d)) if d.expired => known_dead = true,
-        (404, _) => {
-            // The server no longer knows this verification (reset, purge).
-            done(config)?;
-            return Err("This setup is no longer valid. Get a new invite from cloud.nordkraft.io and run `nordkraft setup` again.".into());
-        }
-        _ => {}
-    }
-
-    let non_interactive = NON_INTERACTIVE.load(std::sync::atomic::Ordering::Relaxed);
-
-    // A code given on the command line is tried first.
-    let mut pending_code = code_arg
-        .map(|c| c.trim().to_string())
-        .filter(|c| !c.is_empty());
-
-    if pending_code.is_none() && (json_output || non_interactive) {
-        if json_output {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "status": "verification_required",
-                    "verification_id": verification_id,
-                    "email": config.email,
-                    "next": "nordkraft connect --code <code from the email>",
-                })
-            );
-        } else {
-            println!();
-            println!("{}", "📧 Check your email".yellow().bold());
-            println!("   A 6-digit code was sent to {}.", config.email);
-            println!("   Finish with:  nordkraft connect --code <code>");
-            println!("   (or click the link in the email, then: nordkraft connect)");
-        }
-        return Ok(false);
-    }
-
-    if !json_output && pending_code.is_none() {
-        println!();
-        println!("{}", "📧 One more step: verify your email".yellow().bold());
-        println!("   I sent a 6-digit code to {}.", config.email.cyan());
-        println!("   Type it below, or click the link in the email and press Enter.");
-        println!("   {}", "Type r to resend the code.".dimmed());
-        println!();
-    }
-
-    loop {
-        if known_dead {
-            known_dead = false;
-            if json_output || non_interactive {
-                return Err(
-                    "The code has expired. Run `nordkraft connect` again to get a new one.".into(),
-                );
-            }
-            let again = Confirm::with_theme(&ColorfulTheme::default())
-                .with_prompt("The code has expired. Send a new one?")
-                .default(true)
-                .interact()?;
-            if !again {
-                return Ok(false);
-            }
-            pending_code = Some("r".to_string());
-        }
-
-        let input = match pending_code.take() {
-            Some(c) => c,
-            None => Input::<String>::with_theme(&ColorfulTheme::default())
-                .with_prompt("Code")
-                .allow_empty(true)
-                .interact_text()?
-                .trim()
-                .to_string(),
-        };
-
-        if input.eq_ignore_ascii_case("r") || input.eq_ignore_ascii_case("resend") {
-            let (st, resp) =
-                verify_api_call(&client, reqwest::Method::POST, &resend_url, None).await?;
-            match st.as_u16() {
-                200 => println!(
-                    "   {}",
-                    "✓ New code sent. Check your inbox (and spam).".green()
-                ),
-                409 => {
-                    done(config)?;
-                    println!("   {}", "✓ Already verified".green());
-                    return Ok(true);
-                }
-                _ => println!(
-                    "   {}",
-                    format!("Could not resend: {}", resp.error.unwrap_or_default()).yellow()
-                ),
-            }
-            continue;
-        }
-
-        if input.is_empty() {
-            let (st, resp) =
-                verify_api_call(&client, reqwest::Method::GET, &status_url, None).await?;
-            match (st.as_u16(), resp.data) {
-                (200, Some(d)) if d.verified => {
-                    done(config)?;
-                    println!("   {}", "✓ Email verified".green());
-                    return Ok(true);
-                }
-                (200, Some(d)) if d.expired => known_dead = true,
-                _ => println!(
-                    "   {}",
-                    "Not verified yet. Type the code, or click the link in the email and press Enter again."
-                        .dimmed()
-                ),
-            }
-            continue;
-        }
-
-        let body = serde_json::json!({ "verification_id": verification_id, "code": input });
-        let (st, resp) =
-            verify_api_call(&client, reqwest::Method::POST, &verify_url, Some(body)).await?;
-        match st.as_u16() {
-            200 => {
-                done(config)?;
-                if !json_output {
-                    println!("   {}", "✓ Email verified".green());
-                }
-                return Ok(true);
-            }
-            410 => known_dead = true,
-            409 => {
-                // The account is no longer pending (already active): nothing to verify.
-                done(config)?;
-                return Ok(true);
-            }
-            _ => {
-                let msg = resp.error.unwrap_or_else(|| format!("HTTP {st}"));
-                if json_output || non_interactive {
-                    return Err(format!("Verification failed: {msg}").into());
-                }
-                println!("   {}", format!("✗ {msg}").red());
-            }
-        }
-    }
 }
 
 // ============= ACCOUNT HANDLERS =============
@@ -7845,10 +7586,11 @@ async fn handle_account(
         }
         AccountCommands::Delete {
             yes,
+            now,
             code,
             verification_id,
         } => {
-            handle_account_delete(&client, yes, code, verification_id, json_output).await?;
+            handle_account_delete(&client, yes, now, code, verification_id, json_output).await?;
         }
         AccountCommands::Restore => {
             let resp = client
@@ -7884,6 +7626,7 @@ async fn handle_account(
 async fn handle_account_delete(
     client: &Client,
     yes: bool,
+    now: bool,
     code: Option<String>,
     verification_id: Option<String>,
     json_output: bool,
@@ -7901,14 +7644,24 @@ async fn handle_account_delete(
             if !json_output {
                 println!("{}", "🗑️  Delete your Garage Cloud account".red().bold());
                 println!();
-                println!("This will, after a grace period:");
+                if now {
+                    println!("This will, {}:", "right after you confirm".bold());
+                } else {
+                    println!("This will, after a 14-day grace period:");
+                }
                 println!("   • remove every container, volume and volume backup");
                 println!("   • remove ingress subdomains, custom domains and IPv6 rules");
                 println!("   • remove your WireGuard access and extra peers");
                 println!("   • delete your name, address and email from the database");
                 println!();
-                println!("Until then everything keeps working, so you can back up what you want to keep,");
-                println!("and `nordkraft account restore` cancels the whole thing.");
+                if now {
+                    println!("There is no way back once the code is confirmed. Without --now you get");
+                    println!("14 days to change your mind or fetch what you want to keep.");
+                } else {
+                    println!("Until then everything keeps working, so you can back up what you want to keep,");
+                    println!("and `nordkraft account restore` cancels the whole thing.");
+                    println!("In a hurry? `nordkraft account delete --now` skips the grace period.");
+                }
                 println!();
                 println!("To make sure it is really you, a 6-digit code is sent to your email first.");
                 println!();
@@ -8019,7 +7772,11 @@ async fn handle_account_delete(
         }
         let resp = client
             .post(format!("{base}/account/deletion/confirm"))
-            .json(&serde_json::json!({ "verification_id": verification_id, "code": input }))
+            .json(&serde_json::json!({
+                "verification_id": verification_id,
+                "code": input,
+                "immediate": now,
+            }))
             .send()
             .await
             .map_err(unreachable_api)?;
@@ -8030,19 +7787,32 @@ async fn handle_account_delete(
                 println!("{}", serde_json::to_string_pretty(&v)?);
                 return Ok(());
             }
-            let when = fmt_date(&v["deletion"]["scheduled_for"]);
             println!();
-            println!(
-                "{}",
-                format!("✅ Confirmed. Your account will be deleted on {when}.")
-                    .green()
-                    .bold()
-            );
-            println!();
-            println!("Until then everything works as before. To keep something:");
-            println!("   nordkraft backup <container>      Save a volume locally");
-            println!("Changed your mind?");
-            println!("   nordkraft account restore         Cancels the deletion");
+            if v["immediate"].as_bool().unwrap_or(false) {
+                println!(
+                    "{}",
+                    "✅ Confirmed. Your account is being deleted now.".green().bold()
+                );
+                println!();
+                println!("The tunnel closes in a moment, and a last email arrives when it is done.");
+                println!("Then clean up this machine with:");
+                println!("   nordkraft reset                   Removes local keys and config");
+            } else {
+                let when = fmt_date(&v["deletion"]["scheduled_for"]);
+                println!(
+                    "{}",
+                    format!("✅ Confirmed. Your account will be deleted on {when}.")
+                        .green()
+                        .bold()
+                );
+                println!();
+                println!("Until then everything works as before. To keep something:");
+                println!("   nordkraft backup <container>      Save a volume locally");
+                println!("Changed your mind?");
+                println!("   nordkraft account restore         Cancels the deletion");
+                println!("After that date:");
+                println!("   nordkraft reset                   Removes local keys and config");
+            }
             println!();
             println!("Thank you for trying Garage Cloud. All the best, and maybe see you again some day. 😃");
             return Ok(());
@@ -8244,14 +8014,14 @@ fn show_help() {
     println!("{}", "CONNECTION:".yellow().bold());
     println!("   nordkraft setup <token>                 First-time setup with invite token");
     println!("   nordkraft connect                       Connect WireGuard VPN");
-    println!("   nordkraft connect --code <code>         Finish setup with the emailed code");
     println!("   nordkraft disconnect                    Disconnect WireGuard VPN");
     println!("   nordkraft reset                         Full cleanup (remove all local config)");
     println!();
 
     println!("{}", "ACCOUNT:".yellow().bold());
     println!("   nordkraft account status                Show account and pending deletion");
-    println!("   nordkraft account delete                Delete account (code by email, grace period)");
+    println!("   nordkraft account delete                Delete account (code by email, 14-day grace)");
+    println!("   nordkraft account delete --now          Same, without the grace period");
     println!("   nordkraft account restore               Cancel a pending deletion");
     println!();
 

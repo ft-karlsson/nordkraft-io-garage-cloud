@@ -6,16 +6,21 @@
 //      a six-digit code goes to the account's address (email_verifications,
 //      purpose 'delete'). Nothing else changes.
 //   2. The code is typed back → POST /api/account/deletion/confirm:
-//      a row in account_deletions with scheduled_for = now + grace period.
-//      The account stays active so the customer can fetch what they want to
-//      keep, and `nordkraft account restore` (…/cancel) undoes it.
+//      a row in account_deletions with scheduled_for = 03:00 Copenhagen time,
+//      grace-period days ahead (so the date in the mail is exact and the purge
+//      runs at night), or right now with `immediate` (`--now`). The account
+//      stays active so the customer can fetch what they want to keep, and
+//      `nordkraft account restore` (…/cancel) undoes it.
 //   3. When scheduled_for passes, the runner below purges the tenant with the
 //      same code path as the admin purge (services/tenant_purge.rs), marks the
 //      deletion complete, sends the last mail and forgets the address.
 //
-// The runner only purges when ACCOUNT_DELETION_AUTO_PURGE=true. Otherwise it
-// logs due deletions every tick and the admin purge endpoint finishes them by
-// hand; that endpoint completes the record and sends the mail the same way.
+// The founder hears about every step (schedule, cancel, purge, failure) via
+// MailClient::notify, which the backend turns into a push and a mail.
+//
+// ACCOUNT_DELETION_AUTO_PURGE=false turns the runner into a logger; the admin
+// purge endpoint then finishes due deletions by hand, completing the record
+// and sending the last mail the same way.
 
 use crate::services::container_manager::ContainerManager;
 use crate::services::haproxy_client::HAProxyClientTrait;
@@ -25,7 +30,8 @@ use crate::services::peer_reconciler;
 use crate::services::pfsense_client::PfSenseClientTrait;
 use crate::services::route_manager::StaticRouteManager;
 use crate::services::tenant_purge::{self, PurgeInventory, PurgeReport};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono_tz::Europe::Copenhagen;
 use serde::Serialize;
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
@@ -74,7 +80,27 @@ pub async fn open_request(pool: &PgPool, user_id: &str) -> Result<Option<Deletio
     }))
 }
 
-/// Confirmed: record the request. The user row is untouched.
+/// Handle to the runner's dependencies for request handlers: `None` on a
+/// plain agent (no runner), so an immediate deletion simply waits for the
+/// controller's next tick.
+pub struct Runner(pub Option<Arc<PurgeDeps>>);
+
+/// When a confirmed deletion runs: 03:00 in Copenhagen, `grace_days` calendar
+/// days after `now` (local date). That is also the day the customer reads in
+/// the mail; the UTC day is the same because 03:00 local is 01:00 or 02:00 UTC.
+pub fn purge_moment(now: DateTime<Utc>, grace_days: i64) -> DateTime<Utc> {
+    let local_day = now.with_timezone(&Copenhagen).date_naive() + Duration::days(grace_days.max(0));
+    let at = |h| {
+        local_day
+            .and_hms_opt(h, 0, 0)
+            .and_then(|t| Copenhagen.from_local_datetime(&t).earliest())
+    };
+    at(3).or_else(|| at(4)).map(|t| t.with_timezone(&Utc)).unwrap_or(now)
+}
+
+/// Confirmed: record the request. The user row is untouched. `immediate`
+/// (`nordkraft account delete --now`) schedules it for right now; the runner
+/// picks it up on its next tick, or at once via [`kick`].
 pub async fn schedule(
     pool: &PgPool,
     user_id: &str,
@@ -82,12 +108,13 @@ pub async fn schedule(
     email: &str,
     full_name: &str,
     grace_days: i64,
+    immediate: bool,
 ) -> Result<DeletionRecord, sqlx::Error> {
     let now = Utc::now();
     let rec = DeletionRecord {
         id: Uuid::new_v4().to_string(),
         requested_at: now,
-        scheduled_for: now + Duration::days(grace_days.max(0)),
+        scheduled_for: if immediate { now } else { purge_moment(now, grace_days) },
         started_at: None,
     };
     sqlx::query(
@@ -238,6 +265,17 @@ pub fn spawn_runner(deps: Arc<PurgeDeps>, auto_purge: bool, interval: std::time:
     });
 }
 
+/// Run a tick soon, outside the schedule: after an immediate deletion is
+/// confirmed. The delay lets the confirming request finish and the CLI print
+/// its goodbye before the tunnel goes away.
+pub fn kick(runner: &Runner, auto_purge: bool) {
+    let Some(deps) = runner.0.clone() else { return };
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        tick(&deps, auto_purge).await;
+    });
+}
+
 async fn due(pool: &PgPool) -> Result<Vec<(String, String, i32)>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, user_id, attempts FROM account_deletions
@@ -273,10 +311,7 @@ async fn tick(deps: &PurgeDeps, auto_purge: bool) {
     }
     for (id, user_id, attempts) in due {
         if attempts >= 3 {
-            warn!(
-                "account deletion {}: {} failed attempts, leaving it for the admin purge",
-                id, attempts
-            );
+            // Said once, when the third attempt failed; not every tick.
             continue;
         }
         if let Err(e) = purge_one(deps, &id, &user_id).await {
@@ -285,6 +320,21 @@ async fn tick(deps: &PurgeDeps, auto_purge: bool) {
                 .bind(&id)
                 .bind(e.to_string())
                 .execute(&deps.pool)
+                .await;
+            let giving_up = attempts + 1 >= 3;
+            deps.mail
+                .notify(
+                    if giving_up { "Sletning fejlede, giver op" } else { "Sletning fejlede" },
+                    &format!(
+                        "Deletion {id} (forsøg {}): {e}{}",
+                        attempts + 1,
+                        if giving_up {
+                            "\nKontoen er suspenderet; afslut med POST /api/admin/tenant/purge."
+                        } else {
+                            "\nPrøver igen ved næste tick."
+                        }
+                    ),
+                )
                 .await;
         }
     }
@@ -311,8 +361,48 @@ async fn purge_one(deps: &PurgeDeps, id: &str, user_id: &str) -> Result<(), BoxE
         Ok(report) => {
             info!("🧨 Scheduled purge complete: {:?}", report.done);
             finish_requested(deps, user_id).await;
+            deps.mail
+                .notify(
+                    "Konto slettet",
+                    &format!(
+                        "Slot {} er fjernet som ønsket af kunden ({} trin).",
+                        inv.user.user_slot,
+                        report.done.len()
+                    ),
+                )
+                .await;
             Ok(())
         }
         Err((msg, report)) => Err(format!("{} ({})", msg, report.errors.join("; ")).into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn utc(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn purge_moment_is_three_in_copenhagen_on_the_right_day() {
+        // 23:30 Danish time on 28 Oct (CET, UTC+1) is 22:30 UTC the same day;
+        // 14 days on is 11 Nov, 03:00 CET = 02:00 UTC.
+        let t = purge_moment(utc("2026-10-28T22:30:00Z"), 14);
+        assert_eq!(t, utc("2026-11-11T02:00:00Z"));
+        // Summer: 03:00 CEST = 01:00 UTC.
+        let t = purge_moment(utc("2026-06-01T10:00:00Z"), 14);
+        assert_eq!(t, utc("2026-06-15T01:00:00Z"));
+        // The UTC calendar day matches the Danish one, so a UTC date formatter
+        // prints the day the customer was told.
+        assert_eq!(t.date_naive().to_string(), "2026-06-15");
+    }
+
+    #[test]
+    fn purge_moment_zero_days_is_tonight_or_already_past() {
+        // Grace 0 at 10:00 Danish time gives 03:00 the same day, i.e. due at once.
+        let now = utc("2026-06-01T08:00:00Z");
+        assert!(purge_moment(now, 0) <= now);
     }
 }

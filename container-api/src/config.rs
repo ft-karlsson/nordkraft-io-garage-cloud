@@ -83,8 +83,8 @@ pub struct AppConfig {
     // the customer mail; in production it runs on the same host.
     pub signup_api_url: String, // SIGNUP_API_URL, default http://127.0.0.1:8000
     pub account_deletion_grace_days: i64, // ACCOUNT_DELETION_GRACE_DAYS, default 14
-    /// ACCOUNT_DELETION_AUTO_PURGE: when false (default) due deletions are only
-    /// logged and the admin purge endpoint finishes them by hand.
+    /// ACCOUNT_DELETION_AUTO_PURGE (default true): the runner purges due
+    /// deletions itself. `false` only logs them, for the admin purge to finish.
     pub account_deletion_auto_purge: bool,
     pub account_deletion_interval_seconds: u64, // ACCOUNT_DELETION_INTERVAL, default 600
 }
@@ -322,8 +322,8 @@ pub fn init_config() -> AppConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(14),
         account_deletion_auto_purge: env::var("ACCOUNT_DELETION_AUTO_PURGE")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false),
+            .map(|v| !(v == "false" || v == "0"))
+            .unwrap_or(true),
         account_deletion_interval_seconds: env::var("ACCOUNT_DELETION_INTERVAL")
             .ok()
             .and_then(|v| v.parse().ok())

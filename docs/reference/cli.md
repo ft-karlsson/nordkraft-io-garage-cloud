@@ -19,21 +19,15 @@ nordkraft [KOMMANDO] --help
 
 ---
 
-## Første gang: setup og e-mail-kode
+## Første gang: setup
 
 ```bash
 nordkraft setup NKINVITE-...
 ```
 
-Efter at CLI'en har sendt sin WireGuard-nøgle, får du en 6-cifret kode på
-den e-mail, du oprettede kontoen med. Skriv koden i terminalen (eller klik på
-linket i mailen og tryk Enter); først derefter åbnes din adgang. Lukkede du
-terminalen undervejs, fortsætter du med:
-
-```bash
-nordkraft connect                 # spørger efter koden
-nordkraft connect --code 123456   # uden prompt
-```
+Dit invite-token står kun i velkomstmailen. At du kan køre kommandoen fra den,
+er beviset på, at adressen er din, så setup spørger ikke om mere: nøglepar
+genereres lokalt, token sendes ind, og WireGuard forbindes.
 
 ---
 
@@ -773,13 +767,18 @@ nordkraft account status
 ### account delete
 
 Slet din konto. Først sendes en 6-cifret kode til din e-mail, som du indtaster
-i terminalen. Derefter er sletningen planlagt 14 dage frem: alt virker som
-normalt indtil da, så du kan nå at hente det, du vil beholde (`nordkraft backup`).
-Når dagen kommer, fjernes containere, volumener, backups, domæner,
-WireGuard-adgang og dine oplysninger i databasen, og du får en sidste mail.
+i terminalen. Derefter er sletningen planlagt 14 dage frem, kl. 03 dansk tid:
+alt virker som normalt indtil da, så du kan nå at hente det, du vil beholde
+(`nordkraft backup`). Når dagen kommer, fjernes containere, volumener, backups,
+domæner, WireGuard-adgang og dine oplysninger i databasen, og du får en sidste
+mail. Bagefter fjerner `nordkraft reset` nøgler og konfiguration på din egen maskine.
+
+Vil du ikke vente, springer `--now` fristen over: sletningen går i gang få
+minutter efter koden, og der er ingen fortrydelsesret.
 
 ```bash
 nordkraft account delete
+nordkraft account delete --now                       # ingen frist
 nordkraft account delete --yes                       # spring bekræftelsen over (koden kræves stadig)
 nordkraft account delete --verification-id <id> --code 123456   # uden prompt, fx fra et script
 ```

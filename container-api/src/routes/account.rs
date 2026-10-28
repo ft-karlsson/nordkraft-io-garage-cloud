@@ -155,6 +155,9 @@ pub async fn request_deletion(
 pub struct ConfirmRequest {
     pub verification_id: String,
     pub code: String,
+    /// `nordkraft account delete --now`: no grace period.
+    #[serde(default)]
+    pub immediate: bool,
 }
 
 /// Step two: the code is right, the clock starts.
@@ -165,6 +168,7 @@ pub async fn confirm_deletion(
     pool: &State<PgPool>,
     mail: &State<MailClient>,
     app_state: &State<AppState>,
+    runner: &State<deletion::Runner>,
 ) -> Reply {
     let u = &user.0;
     let pool = pool.inner();
@@ -219,8 +223,12 @@ pub async fn confirm_deletion(
     {
         return db_err(e);
     }
-    let grace_days = app_state.config.account_deletion_grace_days;
-    let rec = match deletion::schedule(pool, &u.id, u.user_slot, &u.email, &u.full_name, grace_days).await {
+    let grace_days = if req.immediate { 0 } else { app_state.config.account_deletion_grace_days };
+    let rec = match deletion::schedule(
+        pool, &u.id, u.user_slot, &u.email, &u.full_name, grace_days, req.immediate,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) if e.as_database_error().map(|d| d.is_unique_violation()).unwrap_or(false) => {
             return err(Status::Conflict, "deletion already requested")
@@ -228,18 +236,39 @@ pub async fn confirm_deletion(
         Err(e) => return db_err(e),
     };
     warn!(
-        "🧹 deletion confirmed by {} (slot {:?}): scheduled for {}",
-        u.id, u.user_slot, rec.scheduled_for
+        "🧹 deletion confirmed by {} (slot {:?}): scheduled for {}{}",
+        u.id, u.user_slot, rec.scheduled_for, if req.immediate { " (immediate)" } else { "" }
     );
-    if let Err(e) = mail
-        .send(
-            &u.email,
-            &u.full_name,
-            Mail::DeletionScheduled { scheduled_for: rec.scheduled_for },
+    let slot = u.user_slot.map(|s| s.to_string()).unwrap_or_else(|| "?".into());
+    if req.immediate {
+        // The "slettes den …" mail would arrive minutes before the final one;
+        // the customer gets the goodbye mail when the purge is done.
+        mail.notify(
+            "Konto slettes nu",
+            &format!("Slot {slot} har bekræftet sletning uden frist. Purge starter om lidt."),
         )
-        .await
-    {
-        warn!("deletion {}: confirmation mail not sent: {}", rec.id, e);
+        .await;
+        deletion::kick(runner, app_state.config.account_deletion_auto_purge);
+    } else {
+        if let Err(e) = mail
+            .send(
+                &u.email,
+                &u.full_name,
+                Mail::DeletionScheduled { scheduled_for: rec.scheduled_for },
+            )
+            .await
+        {
+            warn!("deletion {}: confirmation mail not sent: {}", rec.id, e);
+        }
+        mail.notify(
+            "Sletning planlagt",
+            &format!(
+                "Slot {slot} har bekræftet sletning af sin konto. Slettes {} ({} dages frist). Kunden kan fortryde med nordkraft account restore.",
+                rec.scheduled_for.format("%d-%m-%Y %H:%M UTC"),
+                grace_days
+            ),
+        )
+        .await;
     }
     (
         Status::Ok,
@@ -247,6 +276,7 @@ pub async fn confirm_deletion(
             "status": "scheduled",
             "deletion": rec,
             "grace_days": grace_days,
+            "immediate": req.immediate,
         })),
     )
 }
@@ -268,5 +298,13 @@ pub async fn cancel_deletion(
     if let Err(e) = mail.send(&u.email, &u.full_name, Mail::DeletionCancelled).await {
         warn!("deletion cancel for {}: mail not sent: {}", u.id, e);
     }
+    mail.notify(
+        "Sletning annulleret",
+        &format!(
+            "Slot {} har fortrudt og beholder sin konto.",
+            u.user_slot.map(|s| s.to_string()).unwrap_or_else(|| "?".into())
+        ),
+    )
+    .await;
     (Status::Ok, Json(serde_json::json!({ "status": "cancelled" })))
 }

@@ -1193,6 +1193,7 @@ async fn rocket() -> _ {
     // purges due requests (controller/hybrid only, see ACCOUNT_LIFECYCLE.md).
     let mail_client =
         services::mail_client::MailClient::new(&config.signup_api_url, &config.admin_api_key);
+    let mut deletion_runner = services::account_deletion::Runner(None);
     if matches!(
         config.mode,
         config::OperationMode::Controller | config::OperationMode::Hybrid
@@ -1208,6 +1209,7 @@ async fn rocket() -> _ {
                 .then(|| config.node_id.clone()),
             mail: mail_client.clone(),
         });
+        deletion_runner = services::account_deletion::Runner(Some(Arc::clone(&deps)));
         services::account_deletion::spawn_runner(
             deps,
             config.account_deletion_auto_purge,
@@ -1237,6 +1239,7 @@ async fn rocket() -> _ {
         .manage(event_store)
         .manage(db_pool)
         .manage(mail_client)
+        .manage(deletion_runner)
         .manage(custom_domains.routes_config)
         .manage(custom_domains.challenge_store)
         .manage(custom_domains.dns_verifier);
