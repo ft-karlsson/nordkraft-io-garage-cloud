@@ -1,3 +1,4 @@
+pub mod account_deletion;
 pub mod acme_manager;
 pub mod container_manager;
 pub mod dns_verifier;
@@ -7,6 +8,7 @@ pub mod event_store;
 pub mod haproxy_client;
 pub mod image_policy;
 pub mod macvlan_manager;
+pub mod mail_client;
 pub mod nats_service;
 pub mod peer_reconciler;
 pub mod peer_resolver;
@@ -15,4 +17,5 @@ pub mod pfsense_client;
 pub mod reaper;
 pub mod route_manager;
 pub mod tenant_purge;
+pub mod verification;
 pub mod volume_backup;

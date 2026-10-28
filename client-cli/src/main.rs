@@ -97,6 +97,11 @@ enum Commands {
         #[command(subcommand)]
         command: AuthCommands,
     },
+    /// Your account: status, deletion (confirmed by an emailed code), restore
+    Account {
+        #[command(subcommand)]
+        command: AccountCommands,
+    },
     /// Container management
     #[command(alias = "c")]
     Container {
@@ -373,6 +378,33 @@ enum AuthCommands {
     Status,
     /// Show detailed user info
     Whoami,
+}
+
+// ============= ACCOUNT COMMANDS =============
+
+#[derive(Subcommand)]
+enum AccountCommands {
+    /// Show your account and any pending deletion
+    Status,
+    /// Delete your account. A code is emailed to you; once confirmed, everything
+    /// is removed after a grace period. `nordkraft account restore` cancels.
+    Delete {
+        /// Skip the confirmation prompt (the emailed code is still required)
+        #[arg(short, long)]
+        yes: bool,
+        /// No grace period: delete right after the code is confirmed
+        #[arg(long)]
+        now: bool,
+        /// Code from the email (non-interactive; together with --verification-id)
+        #[arg(long)]
+        code: Option<String>,
+        /// Verification id printed by an earlier `account delete`
+        #[arg(long = "verification-id")]
+        verification_id: Option<String>,
+    },
+    /// Cancel a pending deletion
+    #[command(alias = "cancel")]
+    Restore,
 }
 
 // ============= CONTAINER COMMANDS =============
@@ -2097,6 +2129,7 @@ async fn main() {
 
     let result = match cli.command {
         Commands::Auth { command } => handle_auth(command, json_output).await,
+        Commands::Account { command } => handle_account(command, json_output).await,
         Commands::Container { command } => handle_container(command, json_output).await,
         Commands::Ingress { command } => handle_ingress(command, json_output).await,
         Commands::Domain { command } => handle_domain(command, json_output).await,
@@ -7469,6 +7502,332 @@ async fn handle_disconnect(json_output: bool) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+// ============= ACCOUNT HANDLERS =============
+
+/// Pull `{"error": "..."}` out of an API reply, or fall back to the status.
+async fn api_error_text(resp: reqwest::Response) -> String {
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| {
+            if text.is_empty() {
+                format!("HTTP {status}")
+            } else {
+                text
+            }
+        })
+}
+
+fn fmt_date(value: &serde_json::Value) -> String {
+    value
+        .as_str()
+        .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
+        .map(|t| t.format("%-d %B %Y").to_string())
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn unreachable_api(e: reqwest::Error) -> String {
+    if e.is_connect() || e.is_timeout() {
+        "Cannot reach the API. Is WireGuard connected? (nordkraft connect)".to_string()
+    } else {
+        format!("Network error: {e}")
+    }
+}
+
+async fn handle_account(
+    command: AccountCommands,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = create_client()?;
+    let base = &*API_BASE_URL;
+    match command {
+        AccountCommands::Status => {
+            let resp = client
+                .get(format!("{base}/account"))
+                .send()
+                .await
+                .map_err(unreachable_api)?;
+            if !resp.status().is_success() {
+                return Err(api_error_text(resp).await.into());
+            }
+            let v: serde_json::Value = resp.json().await?;
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                return Ok(());
+            }
+            println!("{}", "👤 Account".cyan().bold());
+            println!("   {} {}", "Name:".cyan(), v["full_name"].as_str().unwrap_or("-"));
+            println!("   {} {}", "Email:".cyan(), v["email"].as_str().unwrap_or("-"));
+            println!("   {} {}", "Plan:".cyan(), v["plan_id"].as_str().unwrap_or("-"));
+            println!(
+                "   {} {}",
+                "Status:".cyan(),
+                v["account_status"].as_str().unwrap_or("-")
+            );
+            if v["deletion"].is_object() {
+                println!();
+                println!(
+                    "{}",
+                    format!(
+                        "⚠️  Deletion scheduled for {} (requested {})",
+                        fmt_date(&v["deletion"]["scheduled_for"]),
+                        fmt_date(&v["deletion"]["requested_at"])
+                    )
+                    .yellow()
+                );
+                println!("   Changed your mind?  nordkraft account restore");
+            }
+        }
+        AccountCommands::Delete {
+            yes,
+            now,
+            code,
+            verification_id,
+        } => {
+            handle_account_delete(&client, yes, now, code, verification_id, json_output).await?;
+        }
+        AccountCommands::Restore => {
+            let resp = client
+                .post(format!("{base}/account/deletion/cancel"))
+                .send()
+                .await
+                .map_err(unreachable_api)?;
+            if resp.status().as_u16() == 404 {
+                if json_output {
+                    println!("{}", serde_json::json!({"status": "nothing_pending"}));
+                } else {
+                    println!("{}", "No pending deletion. Nothing to restore.".dimmed());
+                }
+                return Ok(());
+            }
+            if !resp.status().is_success() {
+                return Err(api_error_text(resp).await.into());
+            }
+            if json_output {
+                println!("{}", serde_json::json!({"status": "cancelled"}));
+            } else {
+                println!(
+                    "{}",
+                    "✅ Deletion cancelled. Everything stays as it is.".green().bold()
+                );
+                println!("   Good to still have you around.");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_account_delete(
+    client: &Client,
+    yes: bool,
+    now: bool,
+    code: Option<String>,
+    verification_id: Option<String>,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = &*API_BASE_URL;
+    let non_interactive = NON_INTERACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+
+    // Step 1: request a code (unless the caller already has one).
+    let (verification_id, email) = match (verification_id, &code) {
+        (Some(id), Some(_)) => (id, None),
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("--verification-id and --code go together".into());
+        }
+        (None, None) => {
+            if !json_output {
+                println!("{}", "🗑️  Delete your Garage Cloud account".red().bold());
+                println!();
+                if now {
+                    println!("This will, {}:", "right after you confirm".bold());
+                } else {
+                    println!("This will, after a 14-day grace period:");
+                }
+                println!("   • remove every container, volume and volume backup");
+                println!("   • remove ingress subdomains, custom domains and IPv6 rules");
+                println!("   • remove your WireGuard access and extra peers");
+                println!("   • delete your name, address and email from the database");
+                println!();
+                if now {
+                    println!("There is no way back once the code is confirmed. Without --now you get");
+                    println!("14 days to change your mind or fetch what you want to keep.");
+                } else {
+                    println!("Until then everything keeps working, so you can back up what you want to keep,");
+                    println!("and `nordkraft account restore` cancels the whole thing.");
+                    println!("In a hurry? `nordkraft account delete --now` skips the grace period.");
+                }
+                println!();
+                println!("To make sure it is really you, a 6-digit code is sent to your email first.");
+                println!();
+            }
+            if !yes && !non_interactive {
+                let confirmed = Confirm::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Send me the code")
+                    .default(false)
+                    .interact()?;
+                if !confirmed {
+                    println!("{}", "Cancelled. Nothing changed.".dimmed());
+                    return Ok(());
+                }
+            }
+            let resp = client
+                .post(format!("{base}/account/deletion/request"))
+                .send()
+                .await
+                .map_err(unreachable_api)?;
+            match resp.status().as_u16() {
+                202 => {}
+                409 => {
+                    let v: serde_json::Value = resp.json().await.unwrap_or_default();
+                    let when = fmt_date(&v["deletion"]["scheduled_for"]);
+                    if json_output {
+                        println!(
+                            "{}",
+                            serde_json::json!({"status": "already_scheduled", "deletion": v["deletion"]})
+                        );
+                    } else {
+                        println!(
+                            "{}",
+                            format!("Deletion is already scheduled for {when}.").yellow()
+                        );
+                        println!("   nordkraft account restore   cancels it");
+                    }
+                    return Ok(());
+                }
+                _ => return Err(api_error_text(resp).await.into()),
+            }
+            let v: serde_json::Value = resp.json().await?;
+            let id = v["verification_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let email = v["email"].as_str().unwrap_or_default().to_string();
+            if id.is_empty() {
+                return Err("API did not return a verification id".into());
+            }
+            (id, Some(email))
+        }
+    };
+
+    // Step 2: the code.
+    let mut pending_code = code;
+    if pending_code.is_none() && (json_output || non_interactive) {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "code_sent",
+                    "verification_id": verification_id,
+                    "email": email,
+                    "next": "nordkraft account delete --verification-id <id> --code <code>",
+                })
+            );
+        } else {
+            println!("A code was sent to {}.", email.unwrap_or_default());
+            println!(
+                "Finish with:  nordkraft account delete --verification-id {verification_id} --code <code>"
+            );
+        }
+        return Ok(());
+    }
+    if !json_output && pending_code.is_none() {
+        println!();
+        println!(
+            "{}",
+            format!(
+                "📧 I sent a 6-digit code to {}.",
+                email.clone().unwrap_or_default()
+            )
+            .yellow()
+        );
+        println!(
+            "   {}",
+            "It is valid for 30 minutes. Press Enter without a code to abort.".dimmed()
+        );
+        println!();
+    }
+
+    loop {
+        let input = match pending_code.take() {
+            Some(c) => c.trim().to_string(),
+            None => Input::<String>::with_theme(&ColorfulTheme::default())
+                .with_prompt("Code")
+                .allow_empty(true)
+                .interact_text()?
+                .trim()
+                .to_string(),
+        };
+        if input.is_empty() {
+            println!(
+                "{}",
+                "Aborted. Your account is untouched; the code simply expires.".dimmed()
+            );
+            return Ok(());
+        }
+        let resp = client
+            .post(format!("{base}/account/deletion/confirm"))
+            .json(&serde_json::json!({
+                "verification_id": verification_id,
+                "code": input,
+                "immediate": now,
+            }))
+            .send()
+            .await
+            .map_err(unreachable_api)?;
+        let status = resp.status();
+        if status.is_success() {
+            let v: serde_json::Value = resp.json().await?;
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                return Ok(());
+            }
+            println!();
+            if v["immediate"].as_bool().unwrap_or(false) {
+                println!(
+                    "{}",
+                    "✅ Confirmed. Your account is being deleted now.".green().bold()
+                );
+                println!();
+                println!("The tunnel closes in a moment, and a last email arrives when it is done.");
+                println!("Then clean up this machine with:");
+                println!("   nordkraft reset                   Removes local keys and config");
+            } else {
+                let when = fmt_date(&v["deletion"]["scheduled_for"]);
+                println!(
+                    "{}",
+                    format!("✅ Confirmed. Your account will be deleted on {when}.")
+                        .green()
+                        .bold()
+                );
+                println!();
+                println!("Until then everything works as before. To keep something:");
+                println!("   nordkraft backup <container>      Save a volume locally");
+                println!("Changed your mind?");
+                println!("   nordkraft account restore         Cancels the deletion");
+                println!("After that date:");
+                println!("   nordkraft reset                   Removes local keys and config");
+            }
+            println!();
+            println!("Thank you for trying Garage Cloud. All the best, and maybe see you again some day. 😃");
+            return Ok(());
+        }
+        let msg = api_error_text(resp).await;
+        match status.as_u16() {
+            400 if !(json_output || non_interactive) => {
+                println!("   {}", format!("✗ {msg}").red());
+                continue;
+            }
+            _ => return Err(msg.into()),
+        }
+    }
+}
+
 async fn handle_reset(force: bool, json_output: bool) -> Result<(), Box<dyn std::error::Error>> {
     if !json_output {
         println!("{}", "🧹 NordKraft Reset".red().bold());
@@ -7656,7 +8015,14 @@ fn show_help() {
     println!("   nordkraft setup <token>                 First-time setup with invite token");
     println!("   nordkraft connect                       Connect WireGuard VPN");
     println!("   nordkraft disconnect                    Disconnect WireGuard VPN");
-    println!("   nordkraft reset                         Full cleanup (remove all config)");
+    println!("   nordkraft reset                         Full cleanup (remove all local config)");
+    println!();
+
+    println!("{}", "ACCOUNT:".yellow().bold());
+    println!("   nordkraft account status                Show account and pending deletion");
+    println!("   nordkraft account delete                Delete account (code by email, 14-day grace)");
+    println!("   nordkraft account delete --now          Same, without the grace period");
+    println!("   nordkraft account restore               Cancel a pending deletion");
     println!();
 
     println!("{}", "JSON OUTPUT:".yellow().bold());
