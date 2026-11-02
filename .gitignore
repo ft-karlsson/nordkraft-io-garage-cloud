@@ -11,3 +11,4 @@ database-backups-dev/
 dist/
 build_push_to_ry-1.sh
 .deploy.log
+nordkraft-meterd/target/

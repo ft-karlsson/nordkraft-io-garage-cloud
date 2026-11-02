@@ -4,6 +4,20 @@
 
 ---
 
+## November 2026 — v0.3.51
+
+**Watt og CO₂ per container**
+
+`nordkraft energy` viser hvad dine containere trækker lige nu, og kWh og gram CO₂ over det
+vindue du vælger. `nordkraft ps` får en `Power:`-linje. Noden måles ved stikkontakten; hver
+container får sin andel af målingen, fordelt efter reserveret vCPU og brugt CPU-tid, og CLI'en
+siger hver gang at det er en fordeling. CO₂ bruger Energinets 5-minutters tal for DK1/DK2.
+Måleren læses af en lille daemon, `nordkraft-meterd` (Shelly over Bluetooth eller LAN, NETIO
+PDU'er), og mangler en måling, mangler minuttet i stedet for at blive gættet. Se
+[guiden](guides/energy.md).
+
+---
+
 ## Oktober 2026 — v0.3.45
 
 **`start` med `?wait=true`**

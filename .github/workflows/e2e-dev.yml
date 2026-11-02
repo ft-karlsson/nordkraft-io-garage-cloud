@@ -41,10 +41,14 @@ jobs:
         run: cd container-api && cargo clippy --all-targets -- -D warnings
       - name: clippy (client-cli)
         run: cd client-cli && cargo clippy --all-targets -- -D warnings
+      - name: clippy (nordkraft-meterd)
+        run: cd nordkraft-meterd && cargo clippy --all-targets -- -D warnings
       - name: fmt (container-api)
         run: cd container-api && cargo fmt --check
       - name: unit tests
         run: cd container-api && cargo test
+      - name: unit tests (nordkraft-meterd)
+        run: cd nordkraft-meterd && cargo test
       # The golden rulesets the PeerReconciler renders must be valid nft syntax
       # (dry run against the real parser; nothing is applied).
       - name: nft syntax check of generated rulesets

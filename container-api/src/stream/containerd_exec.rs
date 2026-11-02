@@ -110,6 +110,16 @@ impl ContainerdExec {
         }
     }
 
+    /// The shared gRPC channel, for other read-only containerd users on
+    /// this node (the energy CPU sampler).
+    pub async fn grpc_channel(&self) -> Result<Channel, ExecError> {
+        self.channel().await
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.ns
+    }
+
     async fn channel(&self) -> Result<Channel, ExecError> {
         let ch = self
             .channel
@@ -657,7 +667,7 @@ fn unblock_fifos(dir: &Path, tty: bool) {
     }
 }
 
-fn with_ns<T>(msg: T, ns: &str) -> Request<T> {
+pub(crate) fn with_ns<T>(msg: T, ns: &str) -> Request<T> {
     let mut req = Request::new(msg);
     req.metadata_mut().insert(
         "containerd-namespace",

@@ -334,6 +334,26 @@ nordkraft deploy ghcr.io/basecamp/once-campfire:latest --port 3000 \
 
 ---
 
+### energy
+
+Watt lige nu, kWh og CO₂ over et vindue: for hele kontoen eller én container.
+
+```bash
+nordkraft energy
+nordkraft energy CONTAINER [--since 24h]
+```
+
+**Flag:**
+
+| Flag | Beskrivelse |
+|------|-------------|
+| `--since` | Vindue: `90m`, `24h` (standard), `7d`, `30d` |
+| `--json` | Rå svar fra API'et, med `method` og `hourly[]` |
+
+Containerens watt er dens andel af nodens målte forbrug. Se [guiden](../guides/energy.md).
+
+---
+
 ## Deklarative deployments (.nk specs)
 
 NordKraft.io gemmer hver deployment som en `.nk` spec-fil (TOML-format) i `~/.nordkraft/deployments/`. Du kan redigere dem direkte, diff'e mod kørende containere og applicere ændringer — ligesom Kubernetes manifests, men enklere.

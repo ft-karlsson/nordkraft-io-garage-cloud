@@ -2,6 +2,7 @@
 pub mod account;
 pub mod containers;
 pub mod domains;
+pub mod energy;
 pub mod events;
 pub mod ingress;
 pub mod ipv6;

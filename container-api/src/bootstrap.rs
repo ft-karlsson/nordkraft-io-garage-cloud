@@ -17,6 +17,7 @@ const MIGRATION_CONTAINER_STATUS_SQL: &str =
 const MIGRATION_CHILD_PEERS_SQL: &str = include_str!("../../setup/migration_child_peers.sql");
 const MIGRATION_ACCOUNT_LIFECYCLE_SQL: &str =
     include_str!("../../setup/migration_account_lifecycle.sql");
+const MIGRATION_ENERGY_SQL: &str = include_str!("../../setup/migration_energy.sql");
 
 /// Identity of the dev user — must match the shortcut in guards.rs.
 pub const DEV_USER_ID: &str = "dev-user-id";
@@ -85,6 +86,7 @@ pub async fn ensure_migrations(
     sqlx::raw_sql(MIGRATION_ACCOUNT_LIFECYCLE_SQL)
         .execute(pool)
         .await?;
+    sqlx::raw_sql(MIGRATION_ENERGY_SQL).execute(pool).await?;
     Ok(())
 }
 

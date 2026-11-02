@@ -36,6 +36,7 @@ It runs on hardware you already own. A Raspberry Pi and an old PC are enough. An
 - **IPv4 and IPv6 support** — works out of the box, globally routable when you need it
 - **Optional HTTPS ingress** — real certificates, real domains, when you need them
 - **Bring your own domain** — point `customer1.net` at your container; verification and TLS are handled automatically (see `setup/CUSTOM_DOMAINS.md`)
+- **Watts and CO₂ per container** — every node is metered at the wall; `nordkraft energy` shows each container's share and its CO₂ from Energinet's live grid intensity (see `setup/ENERGY.md`)
 
 ---
 

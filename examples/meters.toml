@@ -1,0 +1,42 @@
+# nordkraft-meterd configuration: which meter measures which node.
+# Lives at /etc/nordkraft/meters.toml on the host that reaches the meters.
+# See setup/ENERGY.md.
+
+nats_url = "nats://10.0.0.200:4222"
+interval_seconds = 60
+read_timeout_seconds = 30
+
+# A Shelly plug read over Bluetooth from this host. The plug joins no
+# network; pair it once with `bluetoothctl pair`.
+[[meter]]
+node_id = "ry-optiplex-1"
+kind = "shelly-ble"
+address = "AA:BB:CC:DD:EE:FF"
+# name = "ShellyPlugSG3-ABCDEF123456"   # instead of address (needed on macOS)
+component = "switch"
+component_id = 0
+
+# A Shelly Pro on the LAN (wired), with device authentication on.
+# [[meter]]
+# node_id = "ry-rpi4-2"
+# kind = "shelly-http"
+# url = "http://10.0.0.50"
+# password = "device-auth-password"
+# component = "switch"
+
+# A Shelly Pro 3EM in monophase profile: one clamp per node.
+# [[meter]]
+# node_id = "ry-rpi4-2"
+# kind = "shelly-http"
+# url = "http://10.0.0.51"
+# component = "em1"
+# component_id = 1
+
+# A NETIO PowerBOX / PowerPDU with per-outlet metering.
+# [[meter]]
+# node_id = "ry-rpi4-2"
+# kind = "netio"
+# url = "http://10.0.0.60"
+# outlet = 2
+# username = "admin"
+# password = "..."

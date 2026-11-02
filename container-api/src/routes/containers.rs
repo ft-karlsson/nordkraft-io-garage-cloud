@@ -512,8 +512,24 @@ pub async fn list_containers_route(
                 }
             }
 
+            let watts = crate::services::energy::store::watts_now_by_name(pool.inner(), &user.0.id)
+                .await
+                .unwrap_or_default();
+            let mut list = serde_json::to_value(filter_by_labels(containers, &label))
+                .unwrap_or(serde_json::Value::Array(vec![]));
+            if let Some(items) = list.as_array_mut() {
+                for item in items {
+                    let w = item
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .and_then(|n| watts.get(n).copied());
+                    if let (Some(obj), Some(w)) = (item.as_object_mut(), w) {
+                        obj.insert("watts".into(), serde_json::json!(w));
+                    }
+                }
+            }
             return Json(serde_json::json!({
-                "containers": filter_by_labels(containers, &label),
+                "containers": list,
                 "source": "multi-node"
             }));
         }
@@ -1348,6 +1364,7 @@ async fn upgrade_local(
 pub async fn get_usage(
     user: AuthenticatedUser,
     pool: &rocket::State<sqlx::PgPool>,
+    price_area: &rocket::State<crate::routes::energy::EnergyPriceArea>,
 ) -> Json<serde_json::Value> {
     let plan = match get_user_plan_limits(pool.inner(), &user.0.id).await {
         Ok(p) => p,
@@ -1387,6 +1404,7 @@ pub async fn get_usage(
             "cpu": if plan.max_vcpus > 0.0 { usage.total_cpu as f64 / plan.max_vcpus as f64 } else { 0.0 },
             "memory": if plan.max_memory_mb > 0 { usage.total_memory_mb as f64 / plan.max_memory_mb as f64 } else { 0.0 },
             "disk": if plan.max_storage_mb > 0 { usage.total_disk_mb as f64 / plan.max_storage_mb as f64 } else { 0.0 },
-        }
+        },
+        "energy": crate::routes::energy::usage_block(pool.inner(), &user.0.id, &price_area.0).await,
     }))
 }

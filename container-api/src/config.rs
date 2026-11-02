@@ -87,6 +87,18 @@ pub struct AppConfig {
     /// deletions itself. `false` only logs them, for the admin purge to finish.
     pub account_deletion_auto_purge: bool,
     pub account_deletion_interval_seconds: u64, // ACCOUNT_DELETION_INTERVAL, default 600
+
+    // Energy transparency (see setup/ENERGY.md)
+    /// ENERGY_ENABLED (default true): agents sample CPU time per container,
+    /// the controller attributes meter readings and polls Energinet.
+    pub energy_enabled: bool,
+    /// ENERGY_SAMPLE_INTERVAL (default 60): seconds between CPU samples.
+    pub energy_sample_interval_seconds: u64,
+    /// ENERGY_PRICE_AREA (default DK1): Energinet price area for nodes that
+    /// have none set, and for the "grid now" line.
+    pub energy_price_area: String,
+    /// ENERGINET_API_URL (default https://api.energidataservice.dk).
+    pub energinet_api_url: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -328,5 +340,21 @@ pub fn init_config() -> AppConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(600),
+        energy_enabled: env::var("ENERGY_ENABLED")
+            .map(|v| !(v == "false" || v == "0"))
+            .unwrap_or(true),
+        energy_sample_interval_seconds: env::var("ENERGY_SAMPLE_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(|v: u64| v.max(10))
+            .unwrap_or(60),
+        energy_price_area: env::var("ENERGY_PRICE_AREA")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "DK1".to_string()),
+        energinet_api_url: env::var("ENERGINET_API_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| crate::services::energy::energinet::DEFAULT_API_URL.to_string()),
     }
 }
