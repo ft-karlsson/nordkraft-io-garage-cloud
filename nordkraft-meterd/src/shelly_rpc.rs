@@ -33,11 +33,16 @@ impl Component {
 
 /// A JSON-RPC request frame, as the device wants it over any transport.
 pub fn request(id: u64, method: &str, component_id: u32) -> Vec<u8> {
+    request_with(id, method, serde_json::json!({ "id": component_id }))
+}
+
+/// Same frame with free-form params, for one-off calls (`nordkraft-meterd rpc`).
+pub fn request_with(id: u64, method: &str, params: serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "id": id,
         "src": "nordkraft-meterd",
         "method": method,
-        "params": { "id": component_id },
+        "params": params,
     }))
     .expect("static json")
 }

@@ -53,6 +53,15 @@ enum Cmd {
         #[arg(long, default_value = "10")]
         seconds: u64,
     },
+    /// Send one RPC call to a node's meter and print the reply, for setup
+    /// (e.g. `rpc dellopt1 WiFi.GetStatus`, or
+    /// `rpc dellopt1 WiFi.SetConfig '{"config":{"sta":{"enable":false}}}'`).
+    Rpc {
+        node_id: String,
+        method: String,
+        /// JSON params; defaults to `{}`.
+        params: Option<String>,
+    },
 }
 
 /// Mirrors `container-api::services::energy::NodePowerSample`.
@@ -77,6 +86,11 @@ async fn main() {
         Cmd::Run => run(&cli.config).await,
         Cmd::Probe { node_id } => probe(&cli.config, node_id.as_deref()).await,
         Cmd::Scan { seconds } => scan(seconds).await,
+        Cmd::Rpc {
+            node_id,
+            method,
+            params,
+        } => rpc(&cli.config, &node_id, &method, params.as_deref()).await,
     };
     std::process::exit(code);
 }
@@ -87,6 +101,51 @@ fn load(path: &std::path::Path) -> Option<Config> {
         Err(e) => {
             error!("{e}");
             None
+        }
+    }
+}
+
+async fn rpc(path: &std::path::Path, node_id: &str, method: &str, params: Option<&str>) -> i32 {
+    let Some(cfg) = load(path) else { return 2 };
+    let Some(m) = cfg.meters.iter().find(|m| m.node_id == node_id) else {
+        error!("no meter for node '{node_id}' in {}", path.display());
+        return 2;
+    };
+    let params: serde_json::Value = match params.map(serde_json::from_str).transpose() {
+        Ok(p) => p.unwrap_or_else(|| serde_json::json!({})),
+        Err(e) => {
+            error!("params are not JSON: {e}");
+            return 2;
+        }
+    };
+    let meter = match meters::build(m) {
+        Ok(x) => x,
+        Err(e) => {
+            error!("{node_id}: {e}");
+            return 2;
+        }
+    };
+    match tokio::time::timeout(
+        Duration::from_secs(cfg.read_timeout_seconds),
+        meter.call(method, params),
+    )
+    .await
+    {
+        Ok(Ok(reply)) => {
+            println!("{}", serde_json::to_string_pretty(&reply).unwrap());
+            if reply.get("error").is_some() {
+                1
+            } else {
+                0
+            }
+        }
+        Ok(Err(e)) => {
+            error!("{node_id}: {e}");
+            1
+        }
+        Err(_) => {
+            error!("{node_id}: timed out after {}s", cfg.read_timeout_seconds);
+            1
         }
     }
 }

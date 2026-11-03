@@ -12,11 +12,19 @@ use std::future::Future;
 use std::pin::Pin;
 
 pub type ReadFuture<'a> = Pin<Box<dyn Future<Output = Result<Reading, String>> + Send + 'a>>;
+pub type CallFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + 'a>>;
 
 pub trait Meter: Send + Sync {
     /// Short tag stored with each sample: `shelly-http`, `shelly-ble`, `netio`.
     fn source(&self) -> &'static str;
     fn read(&self) -> ReadFuture<'_>;
+    /// One arbitrary RPC call on the device, for setup from the command line
+    /// (`nordkraft-meterd rpc`). Not every meter kind speaks RPC.
+    fn call<'a>(&'a self, method: &'a str, params: serde_json::Value) -> CallFuture<'a> {
+        let _ = (method, params);
+        Box::pin(async move { Err(format!("{} meters take no RPC calls", self.source())) })
+    }
 }
 
 pub fn build(cfg: &MeterConfig) -> Result<Box<dyn Meter>, String> {

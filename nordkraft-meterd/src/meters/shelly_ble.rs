@@ -17,7 +17,7 @@
 //! The connection is made per reading and dropped again; once a minute
 //! that is nothing, and a dropped link heals itself on the next tick.
 
-use super::{Meter, ReadFuture, Reading};
+use super::{CallFuture, Meter, ReadFuture, Reading};
 use crate::config::MeterConfig;
 use crate::shelly_rpc::{self, Component};
 use btleplug::api::{
@@ -185,6 +185,25 @@ async fn rpc(p: &Peripheral, frame: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+impl ShellyBle {
+    /// Find, connect and discover; the caller disconnects.
+    async fn session(&self) -> Result<Peripheral, String> {
+        let central = adapter().await?;
+        let p = find(self, &central).await?;
+        if !p.is_connected().await.unwrap_or(false) {
+            timeout(Duration::from_secs(15), p.connect())
+                .await
+                .map_err(|_| "connect timed out".to_string())?
+                .map_err(|e| format!("connect: {e} (paired?)"))?;
+        }
+        if let Err(e) = p.discover_services().await {
+            let _ = p.disconnect().await;
+            return Err(format!("discover: {e}"));
+        }
+        Ok(p)
+    }
+}
+
 impl Meter for ShellyBle {
     fn source(&self) -> &'static str {
         "shelly-ble"
@@ -192,18 +211,8 @@ impl Meter for ShellyBle {
 
     fn read(&self) -> ReadFuture<'_> {
         Box::pin(async move {
-            let central = adapter().await?;
-            let p = find(self, &central).await?;
-            if !p.is_connected().await.unwrap_or(false) {
-                timeout(Duration::from_secs(15), p.connect())
-                    .await
-                    .map_err(|_| "connect timed out".to_string())?
-                    .map_err(|e| format!("connect: {e} (paired?)"))?;
-            }
+            let p = self.session().await?;
             let result = async {
-                p.discover_services()
-                    .await
-                    .map_err(|e| format!("discover: {e}"))?;
                 let id = self.seq.fetch_add(1, Ordering::Relaxed);
                 let frame =
                     shelly_rpc::request(id, self.component.status_method(), self.component_id);
@@ -220,6 +229,17 @@ impl Meter for ShellyBle {
             .await;
             let _ = p.disconnect().await;
             result
+        })
+    }
+
+    fn call<'a>(&'a self, method: &'a str, params: serde_json::Value) -> CallFuture<'a> {
+        Box::pin(async move {
+            let p = self.session().await?;
+            let id = self.seq.fetch_add(1, Ordering::Relaxed);
+            let result = rpc(&p, &shelly_rpc::request_with(id, method, params)).await;
+            let _ = p.disconnect().await;
+            let body = result?;
+            serde_json::from_slice(&body).map_err(|e| format!("bad reply: {e}"))
         })
     }
 }

@@ -92,26 +92,45 @@ Commands:
 ```bash
 nordkraft-meterd probe                  # read every meter once, print the samples, no NATS
 nordkraft-meterd probe ry-optiplex-1    # one node
-nordkraft-meterd scan                   # Bluetooth: what advertises the Shelly RPC service
+nordkraft-meterd scan                   # Bluetooth: everything nearby with a name, Shelly first
+nordkraft-meterd rpc ry-optiplex-1 WiFi.GetStatus          # one RPC call, reply printed
+nordkraft-meterd rpc ry-optiplex-1 WiFi.SetConfig '{"config":{"sta":{"enable":false}}}'
 nordkraft-meterd                        # run (the service)
 ```
 
-`probe` also builds and runs on a Mac, so a Bluetooth plug can be checked
-from a laptop before anything is installed on the controller.
+`probe`, `scan` and `rpc` also build and run on a Mac, so a Bluetooth plug
+can be checked from a laptop before anything is installed on the controller
+(verified 2026-11-03 against a Plug S Gen3, firmware 1.7.3). On macOS the
+binary carries an embedded Info.plist so the system asks for Bluetooth
+access instead of killing the process; that covers Terminal. Started from
+some other parent app, wrap it in a minimal `.app` bundle and launch it
+with `open -W -n --stdout out --stderr err the.app --args ...`. On macOS
+every device reports address `00:00:00:00:00:00`, so match on `name` there.
 
 ### Shelly over Bluetooth, step by step
 
 The plug never joins a network. It talks to one bonded host, and that host
 reads it once a minute.
 
-1. On the plug (Shelly app, or `http://<plug>/rpc/...` while it is still
-   on its setup access point): turn WiFi station mode off, Shelly Cloud off,
-   and Bluetooth RPC on (`BLE.SetConfig {"config":{"rpc":{"enable":true}}}`).
-   Set device authentication if the plug will ever see a network again.
+1. On the plug: Bluetooth RPC must be on. The Shelly app is the only way
+   to flip it on a fresh plug, and the app insists on an account and a WiFi
+   network first; go through that once, enable "Bluetooth RPC" in the
+   device settings, then take the plug off WiFi again over Bluetooth:
+
+   ```bash
+   nordkraft-meterd rpc <node> WiFi.SetConfig '{"config":{"sta":{"enable":false}}}'
+   nordkraft-meterd rpc <node> WiFi.GetStatus      # "status": "disconnected"
+   ```
+
+   The app will then show the plug offline, which is fine: nothing uses
+   it from here on. Set device authentication if the plug will ever see a
+   network again.
 2. On the reader host (the controller): `apt install bluez`, then
    `systemctl enable --now bluetooth`.
-3. Open a pairing window on the plug (`BLE.StartPairing`, 180 s; the Shelly
-   app has a button for it), then on the host:
+3. Try `nordkraft-meterd probe` first: a Plug S Gen3 accepted an unpaired
+   connection from a Mac. Only if connecting is refused, open a pairing
+   window on the plug (`BLE.StartPairing`, 180 s; the Shelly app has a
+   button for it), then on the host:
 
    ```bash
    bluetoothctl scan on          # note the plug's address, name ShellyPlugSG3-...
