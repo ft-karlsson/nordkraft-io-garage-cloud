@@ -1,6 +1,6 @@
 [package]
 name = "nordkraft-meterd"
-version = "0.3.50"
+version = "0.3.51"
 edition = "2021"
 description = "Reads power meters (Shelly over HTTP or Bluetooth, NETIO PDUs) and publishes what each node draws to NATS, for Nordkraft's per-container watts and CO₂"
 authors = ["Nordkraft.io"]
