@@ -4,6 +4,7 @@ pub mod container_manager;
 pub mod dns_verifier;
 pub mod domain_reconciler;
 pub mod domain_validation;
+pub mod energy;
 pub mod event_store;
 pub mod haproxy_client;
 pub mod image_policy;

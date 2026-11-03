@@ -1,0 +1,43 @@
+[package]
+name = "nordkraft-meterd"
+version = "0.3.51"
+edition = "2021"
+description = "Reads power meters (Shelly over HTTP or Bluetooth, NETIO PDUs) and publishes what each node draws to NATS, for Nordkraft's per-container watts and CO₂"
+authors = ["Nordkraft.io"]
+license = "MIT"
+repository = "https://github.com/ft-karlsson/nordkraft-io-garage-cloud"
+
+[[bin]]
+name = "nordkraft-meterd"
+path = "src/main.rs"
+
+[features]
+default = ["ble"]
+# Bluetooth Low Energy readers (Shelly plugs over GATT). On Linux this
+# needs BlueZ (bluetoothd) at runtime; libdbus is built in, so the binary
+# cross-compiles like the others.
+ble = ["dep:btleplug", "dep:libdbus-sys"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+async-nats = "0.33"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = "1"
+futures = "0.3"
+btleplug = { version = "0.13", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libdbus-sys = { version = "0.2", features = ["vendored"], optional = true }
+
+[profile.release]
+opt-level = 3

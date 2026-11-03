@@ -358,6 +358,14 @@ enum Commands {
     },
     /// Show plan usage vs. limits
     Usage,
+    /// Watts and CO₂: your containers' share of the node's measured power
+    Energy {
+        /// Container name or alias; omit for the account overview
+        container: Option<String>,
+        /// Window: 1h, 24h, 7d, 30d
+        #[arg(long, default_value = "24h")]
+        since: String,
+    },
     /// Show deploy lifecycle events
     Events {
         /// Filter by container name or alias
@@ -462,6 +470,14 @@ enum ContainerCommands {
     Inspect {
         /// Container name, alias, or omit for interactive selection
         container: Option<String>,
+    },
+    /// Watts and CO₂ for a container (its share of the node's measured power)
+    Energy {
+        /// Container name, alias, or omit for interactive selection
+        container: Option<String>,
+        /// Window: 1h, 24h, 7d, 30d
+        #[arg(long, default_value = "24h")]
+        since: String,
     },
 }
 
@@ -1778,6 +1794,9 @@ struct ContainerInfo {
     ipv6_enabled: bool,
     #[serde(default)]
     labels: HashMap<String, String>,
+    /// Attributed share of the node's measured watts, when the node is metered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    watts: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -2179,6 +2198,9 @@ async fn main() {
             spec_ops::handle_spec_delete(container, yes, json_output).await
         }
         Commands::Usage => handle_usage(json_output).await,
+        Commands::Energy { container, since } => {
+            handle_energy(container, &since, json_output).await
+        }
         Commands::Events { container, limit } => handle_events(container, limit, json_output).await,
 
         // Shortcuts with interactive selection
@@ -2376,6 +2398,10 @@ async fn handle_container(
             let container = get_container_or_select(container, json_output).await?;
             handle_container_inspect(&container, json_output).await
         }
+        ContainerCommands::Energy { container, since } => {
+            let container = get_container_or_select(container, json_output).await?;
+            handle_energy(Some(container), &since, json_output).await
+        }
     }
 }
 
@@ -2563,6 +2589,9 @@ async fn handle_container_list(
         }
         println!("    {} {}", "Image:".dimmed(), c.image);
         println!("    {} {}", "Status:".dimmed(), status_colored);
+        if let Some(w) = c.watts {
+            println!("    {} {}", "Power:".dimmed(), format!("{w:.1} W").yellow());
+        }
 
         // Show failure reason
         if let Some(reason) = failure_reason {
@@ -4400,6 +4429,191 @@ async fn handle_usage(json_output: bool) -> Result<(), Box<dyn std::error::Error
     println!();
     println!("   {} {} active", "Containers:".dimmed(), containers);
 
+    Ok(())
+}
+
+// ============= ENERGY =============
+
+fn fmt_wh(wh: f64) -> String {
+    if wh >= 1000.0 {
+        format!("{:.2} kWh", wh / 1000.0)
+    } else {
+        format!("{wh:.0} Wh")
+    }
+}
+
+fn fmt_co2(g: Option<f64>) -> String {
+    match g {
+        Some(g) if g >= 1000.0 => format!("{:.2} kg CO₂", g / 1000.0),
+        Some(g) => format!("{g:.0} g CO₂"),
+        None => "CO₂ n/a".to_string(),
+    }
+}
+
+fn fmt_watts(w: Option<f64>) -> String {
+    match w {
+        Some(w) => format!("{w:.1} W"),
+        None => "no reading".to_string(),
+    }
+}
+
+/// `nordkraft energy [name] [--since 24h]`: the account overview, or one
+/// container with its hourly series.
+async fn handle_energy(
+    container: Option<String>,
+    since: &str,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = create_client()?;
+    let container = container.map(|c| resolve_alias(&c));
+    let url = match &container {
+        Some(name) => format!(
+            "{}/containers/{}/energy?since={}",
+            *API_BASE_URL, name, since
+        ),
+        None => format!("{}/energy?since={}", *API_BASE_URL, since),
+    };
+    let response = client.get(&url).send().await?;
+    if !response.status().is_success() {
+        let error: ApiError = response.json().await?;
+        return Err(format!("Failed to fetch energy: {}", error.error).into());
+    }
+    let data: serde_json::Value = response.json().await?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&data)?);
+        return Ok(());
+    }
+    if let Some(err) = data["error"].as_str() {
+        println!("{}", err.yellow());
+        if let Some(hint) = data["hint"].as_str() {
+            println!("   {}", hint.dimmed());
+        }
+        return Ok(());
+    }
+
+    let grid = &data["grid"];
+    let grid_line = match grid["g_per_kwh"].as_f64() {
+        Some(g) => {
+            let tag = if grid["forecast"].as_bool().unwrap_or(false) {
+                " (forecast)"
+            } else {
+                ""
+            };
+            format!(
+                "{:.0} g CO₂/kWh in {}{}",
+                g,
+                grid["price_area"].as_str().unwrap_or("DK1"),
+                tag
+            )
+        }
+        None => "grid intensity unavailable".to_string(),
+    };
+
+    let total = &data["total"];
+    let now = &data["now"];
+    match &container {
+        Some(name) => {
+            let c = &data["container"];
+            println!(
+                "{}",
+                format!("⚡ {} on {}", name, c["node_id"].as_str().unwrap_or("?"))
+                    .cyan()
+                    .bold()
+            );
+            println!();
+            println!(
+                "   {} {}",
+                "Now:".dimmed(),
+                fmt_watts(now["watts"].as_f64()).yellow()
+            );
+            println!(
+                "   {} {}  ·  {}",
+                format!("Last {since}:").dimmed(),
+                fmt_wh(total["wh"].as_f64().unwrap_or(0.0)),
+                fmt_co2(total["co2_g"].as_f64())
+            );
+            println!("   {} {}", "Grid now:".dimmed(), grid_line);
+            if let Some(hours) = data["hourly"].as_array().filter(|h| !h.is_empty()) {
+                println!();
+                println!("   {}", "Per hour (UTC)".dimmed());
+                let max_w = hours
+                    .iter()
+                    .filter_map(|h| h["watts_avg"].as_f64())
+                    .fold(0.0_f64, f64::max)
+                    .max(0.1);
+                for h in hours
+                    .iter()
+                    .rev()
+                    .take(24)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                {
+                    let w = h["watts_avg"].as_f64().unwrap_or(0.0);
+                    let hour = h["hour"].as_str().unwrap_or("");
+                    let hh = hour.get(11..16).unwrap_or(hour);
+                    let (filled, empty) = render_bar(w / max_w, 20);
+                    println!(
+                        "   {}  {}{}  {:>6.1} W  {:>8}  {}",
+                        hh.dimmed(),
+                        "█".repeat(filled).yellow(),
+                        "░".repeat(empty).dimmed(),
+                        w,
+                        fmt_wh(h["wh"].as_f64().unwrap_or(0.0)),
+                        fmt_co2(h["co2_g"].as_f64()).dimmed()
+                    );
+                }
+            }
+        }
+        None => {
+            println!("{}", "⚡ Energy".cyan().bold());
+            println!();
+            println!(
+                "   {} {}",
+                "Now:".dimmed(),
+                fmt_watts(now["watts"].as_f64()).yellow()
+            );
+            println!(
+                "   {} {}  ·  {}",
+                format!("Last {since}:").dimmed(),
+                fmt_wh(total["wh"].as_f64().unwrap_or(0.0)),
+                fmt_co2(total["co2_g"].as_f64())
+            );
+            println!("   {} {}", "Grid now:".dimmed(), grid_line);
+            if let Some(list) = data["containers"].as_array().filter(|l| !l.is_empty()) {
+                println!();
+                for c in list {
+                    println!(
+                        "   {:<24} {:>9}  {:>10}  {}",
+                        c["name"].as_str().unwrap_or("?").white().bold(),
+                        fmt_watts(c["watts_now"].as_f64()),
+                        fmt_wh(c["wh"].as_f64().unwrap_or(0.0)),
+                        fmt_co2(c["co2_g"].as_f64()).dimmed()
+                    );
+                }
+            } else {
+                println!();
+                println!(
+                    "   {}",
+                    "No readings yet: numbers appear once the node's meter and agent both report."
+                        .dimmed()
+                );
+            }
+        }
+    }
+    let unpriced = total["unpriced_samples"].as_i64().unwrap_or(0);
+    if unpriced > 0 {
+        println!();
+        println!(
+            "   {}",
+            format!("{unpriced} interval(s) had no grid value (Energinet unreachable); their CO₂ is left out.")
+                .dimmed()
+        );
+    }
+    if let Some(text) = data["method"]["text"].as_str() {
+        println!();
+        println!("   {}", text.dimmed());
+    }
     Ok(())
 }
 
@@ -7510,11 +7724,7 @@ async fn api_error_text(resp: reqwest::Response) -> String {
     let text = resp.text().await.unwrap_or_default();
     serde_json::from_str::<serde_json::Value>(&text)
         .ok()
-        .and_then(|v| {
-            v.get("error")
-                .and_then(|e| e.as_str())
-                .map(str::to_string)
-        })
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
         .unwrap_or_else(|| {
             if text.is_empty() {
                 format!("HTTP {status}")
@@ -7562,9 +7772,21 @@ async fn handle_account(
                 return Ok(());
             }
             println!("{}", "👤 Account".cyan().bold());
-            println!("   {} {}", "Name:".cyan(), v["full_name"].as_str().unwrap_or("-"));
-            println!("   {} {}", "Email:".cyan(), v["email"].as_str().unwrap_or("-"));
-            println!("   {} {}", "Plan:".cyan(), v["plan_id"].as_str().unwrap_or("-"));
+            println!(
+                "   {} {}",
+                "Name:".cyan(),
+                v["full_name"].as_str().unwrap_or("-")
+            );
+            println!(
+                "   {} {}",
+                "Email:".cyan(),
+                v["email"].as_str().unwrap_or("-")
+            );
+            println!(
+                "   {} {}",
+                "Plan:".cyan(),
+                v["plan_id"].as_str().unwrap_or("-")
+            );
             println!(
                 "   {} {}",
                 "Status:".cyan(),
@@ -7614,7 +7836,9 @@ async fn handle_account(
             } else {
                 println!(
                     "{}",
-                    "✅ Deletion cancelled. Everything stays as it is.".green().bold()
+                    "✅ Deletion cancelled. Everything stays as it is."
+                        .green()
+                        .bold()
                 );
                 println!("   Good to still have you around.");
             }
@@ -7655,15 +7879,21 @@ async fn handle_account_delete(
                 println!("   • delete your name, address and email from the database");
                 println!();
                 if now {
-                    println!("There is no way back once the code is confirmed. Without --now you get");
+                    println!(
+                        "There is no way back once the code is confirmed. Without --now you get"
+                    );
                     println!("14 days to change your mind or fetch what you want to keep.");
                 } else {
                     println!("Until then everything keeps working, so you can back up what you want to keep,");
                     println!("and `nordkraft account restore` cancels the whole thing.");
-                    println!("In a hurry? `nordkraft account delete --now` skips the grace period.");
+                    println!(
+                        "In a hurry? `nordkraft account delete --now` skips the grace period."
+                    );
                 }
                 println!();
-                println!("To make sure it is really you, a 6-digit code is sent to your email first.");
+                println!(
+                    "To make sure it is really you, a 6-digit code is sent to your email first."
+                );
                 println!();
             }
             if !yes && !non_interactive {
@@ -7791,10 +8021,14 @@ async fn handle_account_delete(
             if v["immediate"].as_bool().unwrap_or(false) {
                 println!(
                     "{}",
-                    "✅ Confirmed. Your account is being deleted now.".green().bold()
+                    "✅ Confirmed. Your account is being deleted now."
+                        .green()
+                        .bold()
                 );
                 println!();
-                println!("The tunnel closes in a moment, and a last email arrives when it is done.");
+                println!(
+                    "The tunnel closes in a moment, and a last email arrives when it is done."
+                );
                 println!("Then clean up this machine with:");
                 println!("   nordkraft reset                   Removes local keys and config");
             } else {
@@ -8020,7 +8254,9 @@ fn show_help() {
 
     println!("{}", "ACCOUNT:".yellow().bold());
     println!("   nordkraft account status                Show account and pending deletion");
-    println!("   nordkraft account delete                Delete account (code by email, 14-day grace)");
+    println!(
+        "   nordkraft account delete                Delete account (code by email, 14-day grace)"
+    );
     println!("   nordkraft account delete --now          Same, without the grace period");
     println!("   nordkraft account restore               Cancel a pending deletion");
     println!();

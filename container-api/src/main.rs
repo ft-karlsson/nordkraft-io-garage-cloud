@@ -1054,6 +1054,31 @@ async fn rocket() -> _ {
     }
 
     // =========================================================
+    // ENERGY — watts and CO₂ per container (services/energy)
+    // Controller: join meter readings with the agents' CPU samples,
+    // poll Energinet for grid intensity, roll minute rows up hourly.
+    // =========================================================
+    if config.energy_enabled {
+        if let Some(nats) = &nats_service {
+            if nats.is_controller() {
+                services::energy::collector::EnergyCollector::new(db_pool.clone())
+                    .start(nats.get_client().clone())
+                    .await;
+                services::energy::energinet::EnerginetPoller::new(
+                    db_pool.clone(),
+                    config.energinet_api_url.clone(),
+                    config.energy_price_area.clone(),
+                )
+                .spawn(std::time::Duration::from_secs(300));
+                services::energy::rollup::spawn(
+                    db_pool.clone(),
+                    std::time::Duration::from_secs(600),
+                );
+            }
+        }
+    }
+
+    // =========================================================
     // CUSTOM DOMAINS (BYO domain) — controller/hybrid only
     // 1. Spawn the dedicated ACME challenge listener (second socket in
     //    THIS process — one binary, two binds; the main API stays
@@ -1171,6 +1196,20 @@ async fn rocket() -> _ {
         }
     }
 
+    // Energy: CPU time per container, published for the controller to
+    // attribute meter readings with. Any node that runs containers.
+    if config.energy_enabled && config.mode.is_agent() {
+        if let Some(nats) = &nats_service {
+            services::energy::cpu_sampler::CpuSampler {
+                exec: Arc::clone(&app_state.exec),
+                nats: nats.get_client().clone(),
+                node_id: config.node_id.clone(),
+                interval: std::time::Duration::from_secs(config.energy_sample_interval_seconds),
+            }
+            .spawn();
+        }
+    }
+
     // Lifecycle reaper — any node that runs containers (agent / hybrid / dev)
     if config.mode.is_agent() {
         let pool_for_reaper = if matches!(config.mode, config::OperationMode::Hybrid) {
@@ -1247,7 +1286,10 @@ async fn rocket() -> _ {
         .manage(deletion_runner)
         .manage(custom_domains.routes_config)
         .manage(custom_domains.challenge_store)
-        .manage(custom_domains.dns_verifier);
+        .manage(custom_domains.dns_verifier)
+        .manage(routes::energy::EnergyPriceArea(
+            config.energy_price_area.clone(),
+        ));
 
     // Mount routes based on mode
     match config.mode {
@@ -1339,6 +1381,9 @@ async fn rocket() -> _ {
                     admin_tenants_ruleset,
                     // usage
                     routes::containers::get_usage,
+                    // Energy: watts and CO₂ per container
+                    routes::energy::account_energy,
+                    routes::energy::container_energy,
                     // Deploy lifecycle events
                     routes::events::get_events,
                 ],

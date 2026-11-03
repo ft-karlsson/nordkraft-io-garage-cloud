@@ -126,6 +126,9 @@ enum BgMsg {
         cpu_label: String,
         ram_label: String,
         disk_label: String,
+        co2_g_kwh: Option<f64>,
+        watts_now: Option<f64>,
+        co2_24h_g: Option<f64>,
     },
 }
 
@@ -133,21 +136,23 @@ enum BgMsg {
 
 /// Snapshot of cluster-wide state shown in the TUI header/footer.
 /// Some fields are populated but not yet surfaced in the UI — they're
-/// reserved for upcoming metrics work (MARK II observability + Energinet).
+/// reserved for upcoming metrics work (MARK II observability).
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 struct ClusterSnapshot {
     garage: String,
     node_count: usize,
     nodes_online: usize,
-    cpu_used: f64,      // ratio 0.0-1.0 from /api/usage
-    ram_used: f64,      // ratio 0.0-1.0 from /api/usage
-    disk_used: f64,     // ratio 0.0-1.0 from /api/usage
-    cpu_label: String,  // e.g. "1.0/2.0 vCPU"
-    ram_label: String,  // e.g. "1536/4096 MB"
-    disk_label: String, // e.g. "1.0/100.0GB"
-    traffic_gb: f64,    // TODO: /api/usage
-    co2_g_kwh: f64,     // TODO: Energinet API (MARK III)
+    cpu_used: f64,          // ratio 0.0-1.0 from /api/usage
+    ram_used: f64,          // ratio 0.0-1.0 from /api/usage
+    disk_used: f64,         // ratio 0.0-1.0 from /api/usage
+    cpu_label: String,      // e.g. "1.0/2.0 vCPU"
+    ram_label: String,      // e.g. "1536/4096 MB"
+    disk_label: String,     // e.g. "1.0/100.0GB"
+    traffic_gb: f64,        // TODO: /api/usage
+    co2_g_kwh: Option<f64>, // grid intensity now, from /api/usage energy.grid
+    watts_now: Option<f64>, // sum of the containers' attributed watts
+    co2_24h_g: Option<f64>, // gram CO₂ over the last 24 h
 }
 
 impl ClusterSnapshot {
@@ -163,7 +168,9 @@ impl ClusterSnapshot {
             ram_label: "loading...".into(),
             disk_label: "loading...".into(),
             traffic_gb: 0.0,
-            co2_g_kwh: 82.0,
+            co2_g_kwh: None,
+            watts_now: None,
+            co2_24h_g: None,
         }
     }
 }
@@ -437,6 +444,9 @@ impl App {
                         cpu_label: format!("{:.1}/{:.1} vCPU", cpu_used, cpu_max),
                         ram_label: format!("{}/{}MB", mem_used, mem_max),
                         disk_label,
+                        co2_g_kwh: data["energy"]["grid"]["g_per_kwh"].as_f64(),
+                        watts_now: data["energy"]["now"]["watts"].as_f64(),
+                        co2_24h_g: data["energy"]["last_24h"]["co2_g"].as_f64(),
                     })
                     .await;
             }
@@ -504,6 +514,9 @@ impl App {
                     cpu_label,
                     ram_label,
                     disk_label,
+                    co2_g_kwh,
+                    watts_now,
+                    co2_24h_g,
                 } => {
                     self.cluster.cpu_used = cpu_ratio;
                     self.cluster.ram_used = ram_ratio;
@@ -511,6 +524,9 @@ impl App {
                     self.cluster.cpu_label = cpu_label;
                     self.cluster.ram_label = ram_label;
                     self.cluster.disk_label = disk_label;
+                    self.cluster.co2_g_kwh = co2_g_kwh;
+                    self.cluster.watts_now = watts_now;
+                    self.cluster.co2_24h_g = co2_24h_g;
                 }
             }
         }
@@ -881,8 +897,8 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
             Span::raw("   "),
             co2_badge(app.cluster.co2_g_kwh),
             Span::styled(
-                "  [TODO: Energinet API]",
-                Style::default().fg(Color::Rgb(45, 50, 65)),
+                energy_line(app.cluster.watts_now, app.cluster.co2_24h_g),
+                Style::default().fg(MUTED),
             ),
         ]),
     ];
@@ -939,15 +955,34 @@ fn status_pill(running: usize, total: usize) -> Span<'static> {
     )
 }
 
-fn co2_badge(g: f64) -> Span<'static> {
-    let (label, color) = if g < 100.0 {
-        (format!("⚡ {g:.0} gCO₂/kWh  green"), EMERALD)
-    } else if g < 200.0 {
-        (format!("⚡ {g:.0} gCO₂/kWh  mixed"), AMBER)
-    } else {
-        (format!("⚡ {g:.0} gCO₂/kWh  grid"), ROSE)
+fn co2_badge(g: Option<f64>) -> Span<'static> {
+    let (label, color) = match g {
+        Some(g) if g < 100.0 => (format!("⚡ {g:.0} gCO₂/kWh  green"), EMERALD),
+        Some(g) if g < 200.0 => (format!("⚡ {g:.0} gCO₂/kWh  mixed"), AMBER),
+        Some(g) => (format!("⚡ {g:.0} gCO₂/kWh  grid"), ROSE),
+        None => ("⚡ grid CO₂ n/a".to_string(), MUTED),
     };
     Span::styled(label, Style::default().fg(color))
+}
+
+/// "  12.3 W now · 41 g CO₂ 24h", or what is known of it.
+fn energy_line(watts: Option<f64>, co2_24h_g: Option<f64>) -> String {
+    let mut parts = Vec::new();
+    if let Some(w) = watts {
+        parts.push(format!("{w:.1} W now"));
+    }
+    if let Some(g) = co2_24h_g {
+        if g >= 1000.0 {
+            parts.push(format!("{:.2} kg CO₂ 24h", g / 1000.0));
+        } else {
+            parts.push(format!("{g:.0} g CO₂ 24h"));
+        }
+    }
+    if parts.is_empty() {
+        "  no meter reading".to_string()
+    } else {
+        format!("  {}", parts.join(" · "))
+    }
 }
 
 // ── Gauge row ─────────────────────────────────────────────────────────────────
