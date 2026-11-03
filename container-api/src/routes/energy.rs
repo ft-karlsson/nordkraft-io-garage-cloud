@@ -8,7 +8,7 @@
 // the response says which method produced them.
 
 use crate::guards::AuthenticatedUser;
-use crate::services::energy::attribution::{METHOD_BASELINE, METHOD_CPUTIME};
+use crate::services::energy::attribution::{self, METHOD_BASELINE, METHOD_CPUTIME};
 use crate::services::energy::store;
 use chrono::{DateTime, Duration, Utc};
 use rocket::serde::json::Json;
@@ -43,6 +43,23 @@ fn method_text(method: &str) -> &'static str {
         }
         _ => "Attributed share of the node's measured watts.",
     }
+}
+
+/// The method the user's rows were produced with; before any row exists, the
+/// one the next rows will use.
+async fn method_json(
+    pool: &sqlx::PgPool,
+    user_id: &str,
+    since: DateTime<Utc>,
+) -> serde_json::Value {
+    let used = match store::method_for_user(pool, user_id, since).await {
+        Ok(Some(m)) => m,
+        _ => {
+            let idle = store::any_idle_baseline(pool).await.unwrap_or(false);
+            attribution::method(if idle { Some(0.0) } else { None }).to_string()
+        }
+    };
+    serde_json::json!({ "id": used, "text": method_text(&used) })
 }
 
 async fn grid_now(pool: &sqlx::PgPool, area: &str) -> serde_json::Value {
@@ -102,7 +119,7 @@ pub async fn account_energy(
         "now": now,
         "total": total,
         "containers": containers,
-        "method": { "id": METHOD_BASELINE, "text": method_text(METHOD_BASELINE) },
+        "method": method_json(pool.inner(), &user.0.id, since_ts).await,
     }))
 }
 
@@ -142,7 +159,7 @@ pub async fn container_energy(
         "now": now,
         "total": total,
         "hourly": hourly,
-        "method": { "id": METHOD_BASELINE, "text": method_text(METHOD_BASELINE) },
+        "method": method_json(pool.inner(), &user.0.id, since_ts).await,
     }))
 }
 

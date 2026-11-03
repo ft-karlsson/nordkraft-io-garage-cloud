@@ -290,6 +290,32 @@ pub async fn totals_for_user(
 /// Latest attributed watts per container id, when read in the last three
 /// minutes. Older than that the meter or the agent is silent, and the CLI
 /// shows nothing rather than a stale number.
+/// The attribution method behind this user's most recent minute row in the
+/// window, so the API describes what was done, not what is configured. None
+/// when there are no rows.
+pub async fn method_for_user(
+    pool: &PgPool,
+    user_id: &str,
+    since: DateTime<Utc>,
+) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT method FROM container_energy_minutes
+         WHERE user_id = $1 AND ts >= $2
+         ORDER BY ts DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(since)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Whether any node has an idle baseline set (what the next rows will use).
+pub async fn any_idle_baseline(pool: &PgPool) -> sqlx::Result<bool> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM nodes WHERE power_idle_watts IS NOT NULL)")
+        .fetch_one(pool)
+        .await
+}
+
 pub async fn watts_now_for_user(
     pool: &PgPool,
     user_id: &str,
