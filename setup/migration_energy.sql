@@ -68,3 +68,22 @@ CREATE INDEX IF NOT EXISTS container_energy_hourly_user_hour_idx
 -- split by CPU time), and which Energinet price area it sits in.
 ALTER TABLE public.nodes ADD COLUMN IF NOT EXISTS power_idle_watts double precision;
 ALTER TABLE public.nodes ADD COLUMN IF NOT EXISTS price_area character varying(8) NOT NULL DEFAULT 'DK1';
+
+-- Per node and hour, from the node readings, independent of customers: the
+-- platform's own record of what a garage drew and emitted, kept forever
+-- (24 rows per node per day). Customers' rows come and go with accounts;
+-- this one does not. Wh integrates each reading over the time since the
+-- previous one (capped at 150 s, the same freshness rule as attribution);
+-- co2_g prices each reading with the grid value at that time, and
+-- `unpriced` counts readings that had none.
+CREATE TABLE IF NOT EXISTS public.node_energy_hourly (
+    node_id character varying(50) NOT NULL,
+    hour timestamp with time zone NOT NULL,
+    samples integer NOT NULL,
+    unpriced integer NOT NULL DEFAULT 0,
+    watts_avg double precision NOT NULL,
+    watts_max double precision NOT NULL,
+    wh double precision NOT NULL,
+    co2_g double precision NOT NULL,
+    PRIMARY KEY (node_id, hour)
+);

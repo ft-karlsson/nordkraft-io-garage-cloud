@@ -186,6 +186,41 @@ pub async fn insert_minutes(pool: &PgPool, rows: &[MinuteRow]) -> sqlx::Result<(
 /// current hour included, so it is simply overwritten as it fills), then
 /// prune: minute rows after 7 days, node readings after 30, forecasts after
 /// a day. Returns (hour rows written, minute rows pruned).
+/// Node readings → `node_energy_hourly`, the platform's own long-term record.
+/// Each reading covers the time since the previous one, capped at 150 s
+/// (a longer gap is a missing minute, not a longer minute); the first
+/// reading in the window counts as 60 s. CO₂ uses the grid value at the
+/// reading's time: measured within 45 min preferred, else the forecast.
+/// Re-run every tick over the last 26 hours, so late grid data or late
+/// readings correct the hour they belong to.
+pub const NODE_HOURLY_ROLLUP_SQL: &str = "
+    WITH s AS (
+        SELECT node_id, ts, watts,
+               LEAST(EXTRACT(EPOCH FROM (ts - lag(ts) OVER (PARTITION BY node_id ORDER BY ts))), 150) AS dt
+        FROM node_power_samples
+        WHERE ts >= now() - interval '27 hours'
+    ), p AS (
+        SELECT s.node_id, s.ts, s.watts, COALESCE(s.dt, 60) AS dt,
+               (SELECT g.g_per_kwh FROM grid_co2 g
+                 JOIN nodes n ON n.node_id = s.node_id AND g.price_area = n.price_area
+                WHERE g.ts <= s.ts AND g.ts >= s.ts - interval '45 minutes'
+                ORDER BY g.forecast, g.ts DESC LIMIT 1) AS g_per_kwh
+        FROM s
+        WHERE s.ts >= now() - interval '26 hours'
+    )
+    INSERT INTO node_energy_hourly (node_id, hour, samples, unpriced, watts_avg, watts_max, wh, co2_g)
+    SELECT node_id, date_trunc('hour', ts), count(*),
+           count(*) FILTER (WHERE g_per_kwh IS NULL),
+           avg(watts), max(watts),
+           sum(watts * dt / 3600.0),
+           coalesce(sum(watts * dt / 3600.0 * g_per_kwh / 1000.0), 0)
+    FROM p
+    GROUP BY node_id, date_trunc('hour', ts)
+    ON CONFLICT (node_id, hour) DO UPDATE SET
+        samples = EXCLUDED.samples, unpriced = EXCLUDED.unpriced,
+        watts_avg = EXCLUDED.watts_avg, watts_max = EXCLUDED.watts_max,
+        wh = EXCLUDED.wh, co2_g = EXCLUDED.co2_g";
+
 pub async fn rollup_and_prune(pool: &PgPool) -> sqlx::Result<(u64, u64)> {
     let hours = sqlx::query(
         "INSERT INTO container_energy_hourly
@@ -203,6 +238,7 @@ pub async fn rollup_and_prune(pool: &PgPool) -> sqlx::Result<(u64, u64)> {
     .execute(pool)
     .await?
     .rows_affected();
+    sqlx::query(NODE_HOURLY_ROLLUP_SQL).execute(pool).await?;
     let pruned =
         sqlx::query("DELETE FROM container_energy_minutes WHERE ts < now() - interval '7 days'")
             .execute(pool)

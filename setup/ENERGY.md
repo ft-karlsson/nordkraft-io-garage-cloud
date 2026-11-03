@@ -193,9 +193,33 @@ the CLI says how many intervals were left unpriced.
 | `container_energy_minutes` | attributed watts, Wh and CO₂ per container per interval | 7 days |
 | `container_energy_hourly` | rollup of the minute rows; the invoice-grade record | forever |
 | `grid_co2` | Energinet values per price area | forever (forecasts a day) |
+| `node_energy_hourly` | per node and hour from the readings: Wh, CO₂, avg/max W | forever |
 
 The per-container tables reference `users` with `ON DELETE CASCADE`, so an
 account purge takes its energy history with it.
+
+### Platform totals
+
+`node_energy_hourly` is the platform's own record and the only one that
+outlives customers and the 30-day reading window: 24 rows per node per day.
+It is rebuilt from the readings over the last 26 hours on every rollup tick,
+so late grid data corrects the hour it belongs to. Each reading covers the
+time since the previous one, capped at 150 s (a longer gap is a missing
+minute, not a longer minute). `unpriced` counts readings that had no grid
+value; their Wh are in `wh`, their CO₂ is not in `co2_g`.
+
+The sum of the customers' attributed rows is always at or below this number:
+containers the controller does not know take part in the split but get no
+row, and a minute without a fresh reading gets none either. Report the
+garage from here, never by adding customers up.
+
+```sql
+-- what the garage drew and emitted per month
+SELECT node_id, date_trunc('month', hour) AS month,
+       round(sum(wh) / 1000, 2) AS kwh, round(sum(co2_g) / 1000, 3) AS co2_kg,
+       sum(unpriced) AS unpriced_readings
+FROM node_energy_hourly GROUP BY 1, 2 ORDER BY 2, 1;
+```
 
 ## Configuration
 
