@@ -153,17 +153,26 @@ async fn scan(seconds: u64) -> i32 {
     {
         match meters::shelly_ble::scan(seconds).await {
             Ok(list) if list.is_empty() => {
-                println!("nothing advertising the Shelly RPC service in {seconds}s (is BLE RPC enabled on the device?)");
+                println!("nothing with a name advertised in {seconds}s (is Bluetooth on, is the plug powered?)");
                 1
             }
             Ok(list) => {
-                for (addr, name, rssi) in list {
+                let shellys = list.iter().filter(|s| s.shelly).count();
+                for s in &list {
                     println!(
-                        "{addr}  {}  rssi {rssi}",
-                        name.unwrap_or_else(|| "-".into())
+                        "{}  {:<34}  rssi {:>4}  {}",
+                        s.address,
+                        s.name.as_deref().unwrap_or("-"),
+                        s.rssi,
+                        if s.shelly { "shelly" } else { "" }
                     );
                 }
-                0
+                if shellys == 0 {
+                    println!("no Shelly among them (is the app still connected to it? it only takes one connection)");
+                    1
+                } else {
+                    0
+                }
             }
             Err(e) => {
                 error!("{e}");

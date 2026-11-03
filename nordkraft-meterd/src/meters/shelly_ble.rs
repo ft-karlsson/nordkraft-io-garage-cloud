@@ -103,9 +103,7 @@ async fn find(me: &ShellyBle, central: &Adapter) -> Result<Peripheral, String> {
     }
     let mut events = central.events().await.map_err(|e| e.to_string())?;
     central
-        .start_scan(ScanFilter {
-            services: vec![SVC],
-        })
+        .start_scan(ScanFilter::default())
         .await
         .map_err(|e| format!("scan: {e}"))?;
     let found = timeout(SCAN_FOR, async {
@@ -226,23 +224,47 @@ impl Meter for ShellyBle {
     }
 }
 
-/// `nordkraft-meterd scan`: list what advertises the Shelly RPC service.
-pub async fn scan(seconds: u64) -> Result<Vec<(String, Option<String>, i16)>, String> {
+/// One device seen by `nordkraft-meterd scan`.
+pub struct Seen {
+    pub address: String,
+    pub name: Option<String>,
+    pub rssi: i16,
+    /// Advertised the Shelly RPC service, or carries a Shelly name.
+    pub shelly: bool,
+}
+
+/// `nordkraft-meterd scan`: list everything nearby that has a name, Shelly
+/// devices first. The scan is unfiltered on purpose: a plug does not always
+/// put the RPC service UUID in its advertisement, so filtering on it can
+/// hide the very device being looked for.
+pub async fn scan(seconds: u64) -> Result<Vec<Seen>, String> {
     let central = adapter().await?;
     central
-        .start_scan(ScanFilter {
-            services: vec![SVC],
-        })
+        .start_scan(ScanFilter::default())
         .await
         .map_err(|e| format!("scan: {e}"))?;
     tokio::time::sleep(Duration::from_secs(seconds)).await;
     let _ = central.stop_scan().await;
     let mut out = Vec::new();
     for p in central.peripherals().await.map_err(|e| e.to_string())? {
-        let props = p.properties().await.ok().flatten();
-        let name = props.as_ref().and_then(|pr| pr.local_name.clone());
-        let rssi = props.as_ref().and_then(|pr| pr.rssi).unwrap_or(0);
-        out.push((p.address().to_string(), name, rssi));
+        let Some(props) = p.properties().await.ok().flatten() else {
+            continue;
+        };
+        let name = props.local_name.clone();
+        let shelly = props.services.contains(&SVC)
+            || name
+                .as_deref()
+                .is_some_and(|n| n.to_ascii_lowercase().starts_with("shelly"));
+        if name.is_none() && !shelly {
+            continue;
+        }
+        out.push(Seen {
+            address: p.address().to_string(),
+            name,
+            rssi: props.rssi.unwrap_or(0),
+            shelly,
+        });
     }
+    out.sort_by_key(|s| (!s.shelly, -(s.rssi as i32)));
     Ok(out)
 }
