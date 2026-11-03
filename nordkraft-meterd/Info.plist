@@ -7,7 +7,7 @@
 	<key>CFBundleName</key>
 	<string>nordkraft-meterd</string>
 	<key>CFBundleVersion</key>
-	<string>0.3.50</string>
+	<string>0.3.51</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>nordkraft-meterd reads power meters (Shelly plugs) over Bluetooth.</string>
 </dict>
