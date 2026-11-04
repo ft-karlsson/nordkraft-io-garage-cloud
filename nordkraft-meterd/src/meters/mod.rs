@@ -14,6 +14,7 @@ use std::pin::Pin;
 pub type ReadFuture<'a> = Pin<Box<dyn Future<Output = Result<Reading, String>> + Send + 'a>>;
 pub type CallFuture<'a> =
     Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + 'a>>;
+pub type CloseFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 pub trait Meter: Send + Sync {
     /// Short tag stored with each sample: `shelly-http`, `shelly-ble`, `netio`.
@@ -24,6 +25,12 @@ pub trait Meter: Send + Sync {
     fn call<'a>(&'a self, method: &'a str, params: serde_json::Value) -> CallFuture<'a> {
         let _ = (method, params);
         Box::pin(async move { Err(format!("{} meters take no RPC calls", self.source())) })
+    }
+    /// Drop whatever the reader keeps open between readings (a Bluetooth
+    /// link). Called after a reading timed out, and when a one-shot command
+    /// is done. Readers that keep nothing do nothing.
+    fn close(&self) -> CloseFuture<'_> {
+        Box::pin(async {})
     }
 }
 

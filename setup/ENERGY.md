@@ -109,8 +109,11 @@ every device reports address `00:00:00:00:00:00`, so match on `name` there.
 
 ### Shelly over Bluetooth, step by step
 
-The plug never joins a network. It talks to one bonded host, and that host
-reads it once a minute.
+The plug never joins a network. It talks to one host, and that host keeps
+one Bluetooth connection open and reads over it once a minute. The plug
+takes a single connection, so while the service runs neither
+`bluetoothctl`, the Shelly app nor `nordkraft-meterd probe` can reach it:
+`systemctl stop nordkraft-meterd` first, start it again after.
 
 1. On the plug: Bluetooth RPC must be on. The Shelly app is the only way
    to flip it on a fresh plug, and the app insists on an account and a WiFi
@@ -160,7 +163,9 @@ reads it once a minute.
 
 Range: Bluetooth Low Energy wants the plug within a few metres of the host
 with no closed metal cabinet between them. A dropped link shows up as a
-missing minute, never as a wrong number.
+missing minute, never as a wrong number: the service connects again on the
+next tick, and after ten failed minutes in a row it exits so that systemd
+starts a fresh process with a fresh Bluetooth session (`Restart=always`).
 
 ### Scaling to more nodes
 

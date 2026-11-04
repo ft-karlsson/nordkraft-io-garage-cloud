@@ -28,6 +28,12 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 const SUBJECT: &str = "nordkraft.energy.node";
+/// Failed readings in a row before the process gives up and lets systemd
+/// start a fresh one. A fresh process is the one sure way out of a stuck
+/// Bluetooth session (the adapter, the system bus, a half-done exchange).
+const MAX_FAILURES: u32 = 10;
+/// Hanging up must not hold anything up for long.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
 #[command(name = "nordkraft-meterd", version, about)]
@@ -125,12 +131,13 @@ async fn rpc(path: &std::path::Path, node_id: &str, method: &str, params: Option
             return 2;
         }
     };
-    match tokio::time::timeout(
+    let result = tokio::time::timeout(
         Duration::from_secs(cfg.read_timeout_seconds),
         meter.call(method, params),
     )
-    .await
-    {
+    .await;
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, meter.close()).await;
+    match result {
         Ok(Ok(reply)) => {
             println!("{}", serde_json::to_string_pretty(&reply).unwrap());
             if reply.get("error").is_some() {
@@ -167,9 +174,11 @@ async fn probe(path: &std::path::Path, only: Option<&str>) -> i32 {
             }
         };
         let started = std::time::Instant::now();
-        match tokio::time::timeout(Duration::from_secs(cfg.read_timeout_seconds), meter.read())
-            .await
-        {
+        let result =
+            tokio::time::timeout(Duration::from_secs(cfg.read_timeout_seconds), meter.read())
+                .await;
+        let _ = tokio::time::timeout(CLOSE_TIMEOUT, meter.close()).await;
+        match result {
             Ok(Ok(r)) => {
                 let s = Sample {
                     node_id: &m.node_id,
@@ -304,20 +313,30 @@ async fn run(path: &std::path::Path) -> i32 {
                     }
                     Ok(Err(e)) => {
                         failures += 1;
-                        if failures <= 3 || failures.is_multiple_of(30) {
-                            warn!("{}: reading failed ({failures} in a row): {e}", m.node_id);
-                        }
+                        warn!("{}: reading failed ({failures} in a row): {e}", m.node_id);
                     }
                     Err(_) => {
                         failures += 1;
-                        if failures <= 3 || failures.is_multiple_of(30) {
-                            warn!("{}: reading timed out ({failures} in a row)", m.node_id);
-                        }
+                        warn!("{}: reading timed out ({failures} in a row)", m.node_id);
+                        // The exchange may be half done; start over next tick.
+                        let _ = tokio::time::timeout(CLOSE_TIMEOUT, meter.close()).await;
                     }
+                }
+                if failures >= MAX_FAILURES {
+                    error!(
+                        "{}: {failures} readings failed in a row, giving up so systemd starts a fresh process",
+                        m.node_id
+                    );
+                    return;
                 }
             }
         }));
     }
-    let _ = futures::future::join_all(tasks).await;
-    0
+    if tasks.is_empty() {
+        error!("no meters in {}", path.display());
+        return 2;
+    }
+    // One reader giving up ends the whole process (see MAX_FAILURES).
+    let _ = futures::future::select_all(tasks).await;
+    3
 }

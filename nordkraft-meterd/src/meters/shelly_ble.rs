@@ -14,10 +14,15 @@
 //! during a `BLE.StartPairing` window). No IP network is involved: the
 //! plug reaches nothing, and nothing reaches the plug but this host.
 //!
-//! The connection is made per reading and dropped again; once a minute
-//! that is nothing, and a dropped link heals itself on the next tick.
+//! The link is made once and kept: the plug takes a single Bluetooth
+//! connection and nothing else needs it, so every reading is one short
+//! GATT exchange on a standing connection. A reading that fails hangs up,
+//! and the next tick finds and connects the plug again. One adapter (one
+//! D-Bus session) lives as long as the meter does: opening a new one per
+//! reading leaked a connection every minute, until the system bus refused
+//! the 257th and every reading after it.
 
-use super::{CallFuture, Meter, ReadFuture, Reading};
+use super::{CallFuture, CloseFuture, Meter, ReadFuture, Reading};
 use crate::config::MeterConfig;
 use crate::shelly_rpc::{self, Component};
 use btleplug::api::{
@@ -27,6 +32,7 @@ use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::StreamExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 use uuid::Uuid;
 
@@ -46,6 +52,15 @@ pub struct ShellyBle {
     component: Component,
     component_id: u32,
     seq: AtomicU64,
+    link: Mutex<Link>,
+}
+
+/// What the meter keeps between readings: the adapter for its lifetime,
+/// the plug while its connection lasts.
+#[derive(Default)]
+struct Link {
+    central: Option<Adapter>,
+    plug: Option<Peripheral>,
 }
 
 impl ShellyBle {
@@ -56,6 +71,7 @@ impl ShellyBle {
             component: Component::parse(&cfg.component).ok_or("bad component")?,
             component_id: cfg.component_id,
             seq: AtomicU64::new(1),
+            link: Mutex::new(Link::default()),
         })
     }
 
@@ -186,9 +202,25 @@ async fn rpc(p: &Peripheral, frame: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 impl ShellyBle {
-    /// Find, connect and discover; the caller disconnects.
-    async fn session(&self) -> Result<Peripheral, String> {
-        let central = adapter().await?;
+    /// The connected plug: the one kept from last time while its link is
+    /// up, otherwise found, connected and discovered anew.
+    async fn plug(&self, link: &mut Link) -> Result<Peripheral, String> {
+        if let Some(p) = &link.plug {
+            if p.is_connected().await.unwrap_or(false) {
+                return Ok(p.clone());
+            }
+            // The link went away (plug rebooted, radio hiccup): start over
+            // with the plug, keep the adapter.
+            link.plug = None;
+        }
+        let central = match &link.central {
+            Some(c) => c.clone(),
+            None => {
+                let c = adapter().await?;
+                link.central = Some(c.clone());
+                c
+            }
+        };
         let p = find(self, &central).await?;
         if !p.is_connected().await.unwrap_or(false) {
             timeout(Duration::from_secs(15), p.connect())
@@ -200,7 +232,15 @@ impl ShellyBle {
             let _ = p.disconnect().await;
             return Err(format!("discover: {e}"));
         }
+        link.plug = Some(p.clone());
         Ok(p)
+    }
+
+    /// Hang up and forget the plug, so the next reading starts over.
+    async fn hang_up(link: &mut Link) {
+        if let Some(p) = link.plug.take() {
+            let _ = p.disconnect().await;
+        }
     }
 }
 
@@ -211,7 +251,8 @@ impl Meter for ShellyBle {
 
     fn read(&self) -> ReadFuture<'_> {
         Box::pin(async move {
-            let p = self.session().await?;
+            let mut link = self.link.lock().await;
+            let p = self.plug(&mut link).await?;
             let result = async {
                 let id = self.seq.fetch_add(1, Ordering::Relaxed);
                 let frame =
@@ -227,20 +268,29 @@ impl Meter for ShellyBle {
                 Ok::<Reading, String>(reading)
             }
             .await;
-            let _ = p.disconnect().await;
+            if result.is_err() {
+                Self::hang_up(&mut link).await;
+            }
             result
         })
     }
 
     fn call<'a>(&'a self, method: &'a str, params: serde_json::Value) -> CallFuture<'a> {
         Box::pin(async move {
-            let p = self.session().await?;
+            let mut link = self.link.lock().await;
+            let p = self.plug(&mut link).await?;
             let id = self.seq.fetch_add(1, Ordering::Relaxed);
             let result = rpc(&p, &shelly_rpc::request_with(id, method, params)).await;
-            let _ = p.disconnect().await;
+            if result.is_err() {
+                Self::hang_up(&mut link).await;
+            }
             let body = result?;
             serde_json::from_slice(&body).map_err(|e| format!("bad reply: {e}"))
         })
+    }
+
+    fn close(&self) -> CloseFuture<'_> {
+        Box::pin(async move { Self::hang_up(&mut *self.link.lock().await).await })
     }
 }
 
