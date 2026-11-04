@@ -129,7 +129,27 @@ enum BgMsg {
         co2_g_kwh: Option<f64>,
         watts_now: Option<f64>,
         co2_24h_g: Option<f64>,
+        price_area: Option<String>,
     },
+    Nodes(Vec<NodeView>),
+}
+
+/// One node as `/api/nodes` reports it. The address is deliberately not
+/// kept: a customer's view of the garage is its nodes and their state, not
+/// the LAN.
+#[derive(Debug, Clone, Deserialize)]
+struct NodeView {
+    id: String,
+    status: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    location: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NodesResponse {
+    nodes: Vec<NodeView>,
 }
 
 // ─── Cluster Snapshot ────────────────────────────────────────────────────────
@@ -140,7 +160,8 @@ enum BgMsg {
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 struct ClusterSnapshot {
-    garage: String,
+    price_area: Option<String>, // from /api/usage energy.grid
+    nodes: Vec<NodeView>,       // from /api/nodes
     node_count: usize,
     nodes_online: usize,
     cpu_used: f64,          // ratio 0.0-1.0 from /api/usage
@@ -158,9 +179,10 @@ struct ClusterSnapshot {
 impl ClusterSnapshot {
     fn stub() -> Self {
         Self {
-            garage: "Kolo DK1 · Skanderborg".into(),
-            node_count: 2,
-            nodes_online: 2,
+            price_area: None,
+            nodes: Vec::new(),
+            node_count: 0,
+            nodes_online: 0,
             cpu_used: 0.0,
             ram_used: 0.0,
             disk_used: 0.0,
@@ -447,8 +469,14 @@ impl App {
                         co2_g_kwh: data["energy"]["grid"]["g_per_kwh"].as_f64(),
                         watts_now: data["energy"]["now"]["watts"].as_f64(),
                         co2_24h_g: data["energy"]["last_24h"]["co2_g"].as_f64(),
+                        price_area: data["energy"]["grid"]["price_area"]
+                            .as_str()
+                            .map(str::to_string),
                     })
                     .await;
+            }
+            if let Ok(nodes) = fetch_nodes(&client).await {
+                let _ = tx.send(BgMsg::Nodes(nodes)).await;
             }
         });
     }
@@ -517,6 +545,7 @@ impl App {
                     co2_g_kwh,
                     watts_now,
                     co2_24h_g,
+                    price_area,
                 } => {
                     self.cluster.cpu_used = cpu_ratio;
                     self.cluster.ram_used = ram_ratio;
@@ -527,6 +556,15 @@ impl App {
                     self.cluster.co2_g_kwh = co2_g_kwh;
                     self.cluster.watts_now = watts_now;
                     self.cluster.co2_24h_g = co2_24h_g;
+                    if price_area.is_some() {
+                        self.cluster.price_area = price_area;
+                    }
+                }
+                BgMsg::Nodes(nodes) => {
+                    self.cluster.node_count = nodes.len();
+                    self.cluster.nodes_online =
+                        nodes.iter().filter(|n| n.status == "online").count();
+                    self.cluster.nodes = nodes;
                 }
             }
         }
@@ -552,6 +590,18 @@ async fn fetch_usage(client: &Client) -> Result<serde_json::Value, String> {
         .await
         .map_err(|e| e.to_string())?;
     resp.json().await.map_err(|e| e.to_string())
+}
+
+async fn fetch_nodes(client: &Client) -> Result<Vec<NodeView>, String> {
+    let resp = client
+        .get(format!("{}/nodes", *API_BASE_URL))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let data: NodesResponse = resp.json().await.map_err(|e| e.to_string())?;
+    let mut nodes = data.nodes;
+    nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(nodes)
 }
 
 async fn fetch_ingress(client: &Client) -> Result<Vec<IngressRoute>, String> {
@@ -879,7 +929,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
             ),
             Span::styled("  ·  ", Style::default().fg(MUTED)),
-            Span::styled(app.cluster.garage.clone(), Style::default().fg(INDIGO)),
+            Span::styled(garage_label(&app.cluster), Style::default().fg(INDIGO)),
         ]),
         Line::from(vec![Span::raw("   "), status_pill(running, total)]),
         Line::from(vec![
@@ -915,27 +965,27 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         " NODES",
         Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
     ))];
-    // TODO: replace with real data from /api/nodes
-    let stub_nodes = vec![
-        ("dell-r640", "online", "172.20.0.1"),
-        ("optiplex-01", "online", "172.20.0.2"),
-    ];
-    for (id, status, addr) in &stub_nodes {
-        let (icon, color) = if *status == "online" {
+    if app.cluster.nodes.is_empty() {
+        node_lines.push(Line::from(Span::styled(
+            " no nodes reported yet",
+            Style::default().fg(MUTED),
+        )));
+    }
+    for n in &app.cluster.nodes {
+        let (icon, color) = if n.status == "online" {
             ("●", EMERALD)
         } else {
             ("○", ROSE)
         };
         node_lines.push(Line::from(vec![
             Span::styled(format!(" {icon} "), Style::default().fg(color)),
-            Span::styled(format!("{id:<14}"), Style::default().fg(Color::White)),
-            Span::styled(format!(" {addr}"), Style::default().fg(MUTED)),
+            Span::styled(format!("{:<16}", n.id), Style::default().fg(Color::White)),
+            Span::styled(
+                format!(" {}", n.name.as_deref().unwrap_or(&n.status)),
+                Style::default().fg(MUTED),
+            ),
         ]));
     }
-    node_lines.push(Line::from(Span::styled(
-        " [TODO: /api/nodes]",
-        Style::default().fg(Color::Rgb(45, 50, 65)),
-    )));
 
     let right = Paragraph::new(node_lines).block(
         Block::default()
@@ -944,6 +994,24 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().bg(HEADER_BG)),
     );
     f.render_widget(right, cols[1]);
+}
+
+/// "Ry, Denmark · DK1 · 1/1 nodes online", all from the API; "garage"
+/// until it answers.
+fn garage_label(c: &ClusterSnapshot) -> String {
+    let area = c.price_area.as_deref().unwrap_or("garage");
+    let place = c.nodes.iter().find_map(|n| n.location.clone());
+    let mut s = match place {
+        Some(p) => format!("{p} · {area}"),
+        None => area.to_string(),
+    };
+    if c.node_count > 0 {
+        s.push_str(&format!(
+            " · {}/{} nodes online",
+            c.nodes_online, c.node_count
+        ));
+    }
+    s
 }
 
 fn status_pill(running: usize, total: usize) -> Span<'static> {

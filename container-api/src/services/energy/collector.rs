@@ -30,6 +30,10 @@ struct Cached<T> {
 pub struct EnergyCollector {
     pool: PgPool,
     latest_power: Mutex<HashMap<String, NodePowerSample>>,
+    /// When each node's agent last published a CPU sample, whether or not
+    /// a reading was there to join it with. The one live signal the
+    /// controller has per node, used by `/api/nodes`.
+    last_cpu: Mutex<HashMap<String, DateTime<Utc>>>,
     meta: Mutex<HashMap<String, Cached<Option<NodeMeta>>>>,
     tenants: Mutex<HashMap<String, Cached<HashMap<String, TenantContainer>>>>,
 }
@@ -39,6 +43,7 @@ impl EnergyCollector {
         Arc::new(Self {
             pool,
             latest_power: Mutex::new(HashMap::new()),
+            last_cpu: Mutex::new(HashMap::new()),
             meta: Mutex::new(HashMap::new()),
             tenants: Mutex::new(HashMap::new()),
         })
@@ -88,7 +93,26 @@ impl EnergyCollector {
         self.latest_power.lock().await.insert(s.node_id.clone(), s);
     }
 
+    /// Per node: when its agent last published a CPU sample.
+    pub async fn nodes_seen(&self) -> HashMap<String, DateTime<Utc>> {
+        self.last_cpu.lock().await.clone()
+    }
+
+    /// Per node: when its meter last reported.
+    pub async fn meters_seen(&self) -> HashMap<String, DateTime<Utc>> {
+        self.latest_power
+            .lock()
+            .await
+            .iter()
+            .map(|(k, v)| (k.clone(), v.ts))
+            .collect()
+    }
+
     async fn on_cpu(&self, sample: ContainerCpuSample) {
+        self.last_cpu
+            .lock()
+            .await
+            .insert(sample.node_id.clone(), Utc::now());
         let reading = {
             let map = self.latest_power.lock().await;
             map.get(&sample.node_id).cloned()

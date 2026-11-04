@@ -36,10 +36,10 @@ pub fn parse_since(s: Option<&str>) -> Result<Duration, String> {
 fn method_text(method: &str) -> &'static str {
     match method {
         m if m == METHOD_BASELINE => {
-            "The node's watts are measured at the wall. Its idle draw is split between containers by reserved vCPU, the rest by CPU time used in each interval. CO₂ uses Energinet's 5-minute grid intensity for the node's price area."
+            "Your node's power is measured at the wall socket. The part it draws just by being on is shared by the vCPU each container reserves; the rest follows the CPU time each container actually used. CO₂ comes from Energinet's 5-minute figure for the node's price area."
         }
         m if m == METHOD_CPUTIME => {
-            "The node's watts are measured at the wall and split between containers by CPU time used in each interval (no idle baseline is set for the node). CO₂ uses Energinet's 5-minute grid intensity for the node's price area."
+            "Your node's power is measured at the wall socket and shared between containers by the CPU time each one actually used. Once the node's idle draw is calibrated, that part will be shared by reserved vCPU instead. CO₂ comes from Energinet's 5-minute figure for the node's price area."
         }
         _ => "Attributed share of the node's measured watts.",
     }

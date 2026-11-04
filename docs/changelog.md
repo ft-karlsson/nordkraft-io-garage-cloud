@@ -4,6 +4,18 @@
 
 ---
 
+## Ikke udgivet endnu
+
+**Energi: små tal, dansk tid, rigtige noder**
+
+`nordkraft energy` viser decimaler under 10 Wh og 10 g, så en container på en halv watt ikke
+står som "0". Timebjælkerne vises i dansk tid i stedet for UTC. Forklaringen under tallene er
+skrevet om i almindelige ord. TUI'ens topbjælke og nodeliste kommer nu fra API'et: sted,
+prisområde og hvilke noder der er online, i stedet for faste pladsholdere. Platformen gemmer
+desuden sit eget time-regnskab per node, uafhængigt af kundekonti.
+
+---
+
 ## November 2026 — v0.3.51
 
 **Watt og CO₂ per container**

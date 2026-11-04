@@ -4434,19 +4434,47 @@ async fn handle_usage(json_output: bool) -> Result<(), Box<dyn std::error::Error
 
 // ============= ENERGY =============
 
+/// Small amounts keep decimals: a 10 W node makes fractions of a Wh per
+/// container per hour, and "0 Wh" would read as "nothing measured".
+fn fmt_small(v: f64) -> String {
+    if v < 1.0 {
+        format!("{v:.2}")
+    } else if v < 10.0 {
+        format!("{v:.1}")
+    } else {
+        format!("{v:.0}")
+    }
+}
+
 fn fmt_wh(wh: f64) -> String {
     if wh >= 1000.0 {
         format!("{:.2} kWh", wh / 1000.0)
     } else {
-        format!("{wh:.0} Wh")
+        format!("{} Wh", fmt_small(wh))
     }
 }
 
 fn fmt_co2(g: Option<f64>) -> String {
     match g {
         Some(g) if g >= 1000.0 => format!("{:.2} kg CO₂", g / 1000.0),
-        Some(g) => format!("{g:.0} g CO₂"),
+        Some(g) => format!("{} g CO₂", fmt_small(g)),
         None => "CO₂ n/a".to_string(),
+    }
+}
+
+/// An API hour (UTC, RFC 3339) as the local wall-clock hour, "23:00".
+fn local_hour(utc: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(utc)
+        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+        .unwrap_or_else(|_| utc.get(11..16).unwrap_or(utc).to_string())
+}
+
+fn local_zone_label() -> String {
+    let off = chrono::Local::now().format("%:z").to_string();
+    match off.as_str() {
+        "+01:00" => "CET".to_string(),
+        "+02:00" => "CEST".to_string(),
+        other => format!("UTC{other}"),
     }
 }
 
@@ -4535,7 +4563,10 @@ async fn handle_energy(
             println!("   {} {}", "Grid now:".dimmed(), grid_line);
             if let Some(hours) = data["hourly"].as_array().filter(|h| !h.is_empty()) {
                 println!();
-                println!("   {}", "Per hour (UTC)".dimmed());
+                println!(
+                    "   {}",
+                    format!("Per hour ({})", local_zone_label()).dimmed()
+                );
                 let max_w = hours
                     .iter()
                     .filter_map(|h| h["watts_avg"].as_f64())
@@ -4550,8 +4581,7 @@ async fn handle_energy(
                     .rev()
                 {
                     let w = h["watts_avg"].as_f64().unwrap_or(0.0);
-                    let hour = h["hour"].as_str().unwrap_or("");
-                    let hh = hour.get(11..16).unwrap_or(hour);
+                    let hh = local_hour(h["hour"].as_str().unwrap_or(""));
                     let (filled, empty) = render_bar(w / max_w, 20);
                     println!(
                         "   {}  {}{}  {:>6.1} W  {:>8}  {}",

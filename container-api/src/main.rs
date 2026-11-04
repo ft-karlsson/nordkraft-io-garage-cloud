@@ -1058,12 +1058,16 @@ async fn rocket() -> _ {
     // Controller: join meter readings with the agents' CPU samples,
     // poll Energinet for grid intensity, roll minute rows up hourly.
     // =========================================================
+    let mut energy_collector: Option<std::sync::Arc<services::energy::collector::EnergyCollector>> =
+        None;
     if config.energy_enabled {
         if let Some(nats) = &nats_service {
             if nats.is_controller() {
-                services::energy::collector::EnergyCollector::new(db_pool.clone())
+                let collector = services::energy::collector::EnergyCollector::new(db_pool.clone());
+                std::sync::Arc::clone(&collector)
                     .start(nats.get_client().clone())
                     .await;
+                energy_collector = Some(collector);
                 services::energy::energinet::EnerginetPoller::new(
                     db_pool.clone(),
                     config.energinet_api_url.clone(),
@@ -1287,6 +1291,7 @@ async fn rocket() -> _ {
         .manage(custom_domains.routes_config)
         .manage(custom_domains.challenge_store)
         .manage(custom_domains.dns_verifier)
+        .manage(routes::nodes::EnergyLiveness(energy_collector))
         .manage(routes::energy::EnergyPriceArea(
             config.energy_price_area.clone(),
         ));
