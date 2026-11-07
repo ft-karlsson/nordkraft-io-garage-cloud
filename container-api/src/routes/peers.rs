@@ -9,10 +9,17 @@
 // no API identity (guards.rs refuses its address range outright).
 //
 // Endpoints (owner-authenticated over WireGuard):
-//   POST   /api/peers                    create {name, public_key, scope?, targets?}
+//   POST   /api/peers                    create {name, public_key, scope?, targets?,
+//                                                callable?, callable_ports?}
 //   GET    /api/peers                    list, with live handshake data
 //   GET    /api/peers/<name>             one peer
-//   PATCH  /api/peers/<name>             {scope?, targets? | add_targets? / remove_targets?}
+//   PATCH  /api/peers/<name>             {scope?, targets? | add_targets? / remove_targets?,
+//                                         callable?, callable_ports?}
+//
+// `callable` is the one reverse grant: by default a peer may open connections
+// to the owner's containers and never the other way round. A callable peer may
+// also be called BY the owner's containers (optionally on `callable_ports`
+// only) — a sandbox talking to an inference API on a peered GPU machine.
 //   POST   /api/peers/<name>/enable      put the peer back
 //   POST   /api/peers/<name>/disable     keep the row, remove peer + rules
 //   POST   /api/peers/<name>/rotate      {public_key}: new key, same address
@@ -59,12 +66,24 @@ pub struct CreatePeerRequest {
     pub scope: Option<String>,
     #[serde(default)]
     pub targets: Vec<TargetRequest>,
+    /// May the owner's containers open connections to this peer? Default false.
+    #[serde(default)]
+    pub callable: Option<bool>,
+    /// With callable: accepted TCP ports on the peer; omitted or empty = every port.
+    #[serde(default)]
+    pub callable_ports: Option<Vec<u16>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub struct PatchPeerRequest {
     #[serde(default)]
     pub scope: Option<String>,
+    /// Turn the reverse grant on or off.
+    #[serde(default)]
+    pub callable: Option<bool>,
+    /// Replace the callable port list (implies callable = true). Empty = every port.
+    #[serde(default)]
+    pub callable_ports: Option<Vec<u16>>,
     /// Replace the whole target list (implies scope "containers").
     #[serde(default)]
     pub targets: Option<Vec<TargetRequest>>,
@@ -115,6 +134,26 @@ fn validate_ports(ports: &Option<Vec<u16>>) -> Result<Option<Vec<u16>>, String> 
     }
 }
 
+fn ports_i32(ports: &Option<Vec<u16>>) -> Option<Vec<i32>> {
+    ports
+        .as_ref()
+        .map(|v| v.iter().map(|p| i32::from(*p)).collect())
+}
+
+fn callable_label(callable: bool, ports: &Option<Vec<u16>>) -> String {
+    match (callable, ports) {
+        (false, _) => String::new(),
+        (true, None) => ", callable".into(),
+        (true, Some(p)) => format!(
+            ", callable tcp {}",
+            p.iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    }
+}
+
 fn parse_scope(s: &str) -> Result<&'static str, String> {
     match s {
         "all" => Ok("all"),
@@ -132,11 +171,15 @@ struct PeerRow {
     public_key: String,
     scope: String,
     status: String,
+    callable: bool,
+    /// None = every port (only meaningful while callable)
+    callable_ports: Option<Vec<u16>>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 fn row_to_peer(r: sqlx::postgres::PgRow) -> PeerRow {
+    let callable_ports: Option<Vec<i32>> = r.get("callable_ports");
     PeerRow {
         id: r.get("id"),
         name: r.get("name"),
@@ -144,6 +187,12 @@ fn row_to_peer(r: sqlx::postgres::PgRow) -> PeerRow {
         public_key: r.get("public_key"),
         scope: r.get("scope"),
         status: r.get("status"),
+        callable: r.get("callable"),
+        callable_ports: callable_ports.map(|v| {
+            v.into_iter()
+                .filter_map(|x| u16::try_from(x).ok())
+                .collect()
+        }),
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
     }
@@ -151,7 +200,8 @@ fn row_to_peer(r: sqlx::postgres::PgRow) -> PeerRow {
 
 async fn load_peer(pool: &PgPool, user_id: &str, name: &str) -> Result<Option<PeerRow>, BoxError> {
     Ok(sqlx::query(
-        "SELECT id, name, peer_index, public_key, scope, status, created_at, updated_at
+        "SELECT id, name, peer_index, public_key, scope, status, callable, callable_ports,
+                created_at, updated_at
          FROM tenant_peers WHERE user_id = $1 AND name = $2",
     )
     .bind(user_id)
@@ -163,7 +213,8 @@ async fn load_peer(pool: &PgPool, user_id: &str, name: &str) -> Result<Option<Pe
 
 async fn load_peers(pool: &PgPool, user_id: &str) -> Result<Vec<PeerRow>, BoxError> {
     Ok(sqlx::query(
-        "SELECT id, name, peer_index, public_key, scope, status, created_at, updated_at
+        "SELECT id, name, peer_index, public_key, scope, status, callable, callable_ports,
+                created_at, updated_at
          FROM tenant_peers WHERE user_id = $1 ORDER BY peer_index",
     )
     .bind(user_id)
@@ -374,6 +425,9 @@ async fn peer_json(
         "status": p.status,
         "targets": if p.scope == "containers" { targets.to_vec() } else { Vec::new() },
         "dangling": targets.iter().filter(|t| t["dangling"] == true).count(),
+        // Reverse grant: may the owner's containers call this peer, and on which ports
+        "callable": p.callable,
+        "callable_ports": if p.callable { p.callable_ports.clone() } else { None },
         "created_at": p.created_at.to_rfc3339(),
         "updated_at": p.updated_at.to_rfc3339(),
         // What the device's [Peer] section needs. AllowedIPs is always the
@@ -436,6 +490,12 @@ pub async fn create_peer(
             "scope \"containers\" needs at least one target; use scope \"all\" for every container",
         );
     }
+    let callable_ports = match validate_ports(&req.callable_ports) {
+        Ok(p) => p,
+        Err(e) => return err(format!("callable_ports: {}", e)),
+    };
+    // ports given without callable:true means callable — nobody lists ports for a grant they don't want
+    let callable = req.callable.unwrap_or(false) || callable_ports.is_some();
     let ctx = match context(pool, user).await {
         Ok(c) => c,
         Err(e) => return err(e),
@@ -482,8 +542,8 @@ pub async fn create_peer(
     let result: Result<(), BoxError> = async {
         let mut tx = pool.begin().await?;
         sqlx::query(
-            "INSERT INTO tenant_peers (id, user_id, name, peer_index, public_key, scope)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO tenant_peers (id, user_id, name, peer_index, public_key, scope, callable, callable_ports)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(&id)
         .bind(&user.id)
@@ -491,6 +551,8 @@ pub async fn create_peer(
         .bind(index)
         .bind(&key)
         .bind(scope)
+        .bind(callable)
+        .bind(ports_i32(&callable_ports))
         .execute(&mut *tx)
         .await?;
         replace_targets(&mut tx, &id, &targets).await?;
@@ -502,8 +564,13 @@ pub async fn create_peer(
         return err(format!("could not create peer: {}", e));
     }
     info!(
-        "🔗 Child peer {} created for user {} → 172.20.{}.{} ({})",
-        name, user.id, ctx.slot, index, scope
+        "🔗 Child peer {} created for user {} → 172.20.{}.{} ({}{})",
+        name,
+        user.id,
+        ctx.slot,
+        index,
+        scope,
+        callable_label(callable, &callable_ports)
     );
 
     let report = converge().await;
@@ -690,14 +757,34 @@ pub async fn patch_peer(
     if scope == "all" {
         targets.clear();
     }
+    let mut callable = p.callable;
+    let mut callable_ports = p.callable_ports.clone();
+    if let Some(ports) = &req.callable_ports {
+        callable_ports = match validate_ports(&Some(ports.clone())) {
+            Ok(p) => p,
+            Err(e) => return err(format!("callable_ports: {}", e)),
+        };
+        callable = true;
+    }
+    if let Some(c) = req.callable {
+        callable = c;
+    }
+    if !callable {
+        callable_ports = None;
+    }
 
     let result: Result<(), BoxError> = async {
         let mut tx = pool.begin().await?;
-        sqlx::query("UPDATE tenant_peers SET scope = $2, updated_at = now() WHERE id = $1")
-            .bind(&p.id)
-            .bind(&scope)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE tenant_peers SET scope = $2, callable = $3, callable_ports = $4, updated_at = now()
+             WHERE id = $1",
+        )
+        .bind(&p.id)
+        .bind(&scope)
+        .bind(callable)
+        .bind(ports_i32(&callable_ports))
+        .execute(&mut *tx)
+        .await?;
         replace_targets(&mut tx, &p.id, &targets).await?;
         tx.commit().await?;
         Ok(())
@@ -707,11 +794,12 @@ pub async fn patch_peer(
         return err(format!("could not update peer: {}", e));
     }
     info!(
-        "🔗 Child peer {} of user {} updated: scope {} ({} target(s))",
+        "🔗 Child peer {} of user {} updated: scope {} ({} target(s){})",
         name,
         user.id,
         scope,
-        targets.len()
+        targets.len(),
+        callable_label(callable, &callable_ports)
     );
     let report = converge().await;
     respond_with_peer(app_state, pool, &ctx, &user.id, &name, report.as_ref()).await
@@ -892,6 +980,18 @@ mod tests {
             Some(vec![80, 443])
         );
         assert!(validate_ports(&Some(vec![0])).is_err());
+    }
+
+    #[test]
+    fn callable_labels() {
+        assert_eq!(callable_label(false, &Some(vec![1])), "");
+        assert_eq!(callable_label(true, &None), ", callable");
+        assert_eq!(
+            callable_label(true, &Some(vec![11434, 8000])),
+            ", callable tcp 11434,8000"
+        );
+        assert_eq!(ports_i32(&Some(vec![80, 443])), Some(vec![80, 443]));
+        assert_eq!(ports_i32(&None), None);
     }
 
     #[test]

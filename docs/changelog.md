@@ -4,6 +4,19 @@
 
 ---
 
+## November 2026 — v0.3.52
+
+**Peers dine containere må kalde**
+
+Hidtil gik trafikken til en peer kun én vej: peeren måtte nå dine containere, containerne måtte
+svare. `nordkraft peer add … --callable [--callable-ports 11434]` (eller `nordkraft peer callable
+NAVN`) vender det for én peer ad gangen: dine egne containere må åbne forbindelser til den, evt.
+kun på de porte du nævner. Det er lavet til én ting: en sandbox hos Nordkraft, der skal tale med
+en sprogmodel på en GPU-maskine du selv har peeret ind. Stadig kun dine containere, stadig kun den
+ene peer; default er uændret. Se [guiden](guides/peers.md#lad-dine-containere-kalde-en-peer).
+
+---
+
 ## November 2026 — v0.3.51
 
 **Watt og CO₂ per container**

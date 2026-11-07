@@ -61,6 +61,26 @@ nordkraft peer set ci --all
 nordkraft peer set ci --only web,db
 ```
 
+## Lad dine containere kalde en peer
+
+Som udgangspunkt går trafikken én vej: en peer må åbne forbindelser til dine
+containere, og containerne må svare – men de må ikke selv ringe op til
+peeren. Har du en maskine, dine containere *skal* kunne kalde, fx en
+GPU-maskine med en sprogmodel bag et OpenAI-kompatibelt API, slår du det til
+for netop den peer:
+
+```bash
+nordkraft peer add gpu-box --all --callable --callable-ports 11434
+# eller bagefter:
+nordkraft peer callable gpu-box --ports 11434
+nordkraft peer callable gpu-box --off
+```
+
+Så kan en container nå `http://172.20.<slot>.<n>:11434` (adressen står i
+`nordkraft peer show gpu-box`). Det gælder kun dine egne containere og kun den
+ene peer; udelader du `--ports`, gælder det alle porte. Andre peers og andre
+kunder rører det ikke.
+
 ## Se hvem der er på
 
 ```bash
@@ -90,6 +110,11 @@ mister den gamle konfiguration forbindelsen i samme sekund.
 | Din egen nøgle | `172.20.0.<slot>` |
 | Dine peers | `172.20.<slot>.2` til `172.20.<slot>.254` |
 | Dine containere | `172.21.<slot>.0/24` |
+
+Reglerne på noden tillader *peer → dine containere* (hele området eller de
+containere, du har nævnt) og kun svar den anden vej. Med `--callable` kommer
+der én regel mere for den peer: *dine containere → peeren*, evt. kun på de
+porte, du har angivet.
 
 Konfigurationen, du giver videre, ruter kun dit containerområde ind i
 tunnelen. Det er bekvemmelighed, ikke sikkerhed: det er noden, der håndhæver,

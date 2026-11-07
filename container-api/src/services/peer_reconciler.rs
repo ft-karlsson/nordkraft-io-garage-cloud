@@ -177,6 +177,10 @@ pub struct ChildPeer {
     /// The owner's container range (see Owner::container_subnet).
     pub container_subnet: Subnet,
     pub scope: Scope,
+    /// Reverse direction: may the owner's containers open connections to
+    /// this peer? None = no (the default). Some(None) = yes, every port.
+    /// Some(Some(ports)) = yes, these TCP ports only.
+    pub callable: Option<Option<Vec<u16>>>,
 }
 
 impl ChildPeer {
@@ -282,7 +286,8 @@ pub async fn load_desired(pool: &PgPool) -> Result<DesiredState, BoxError> {
     let mut children_by_id: BTreeMap<String, ChildPeer> = BTreeMap::new();
     let mut scoped: BTreeSet<String> = BTreeSet::new();
     for row in sqlx::query(
-        "SELECT p.id, p.user_id, p.name, p.peer_index, p.public_key, p.scope, u.user_slot
+        "SELECT p.id, p.user_id, p.name, p.peer_index, p.public_key, p.scope,
+                p.callable, p.callable_ports, u.user_slot
          FROM tenant_peers p
          JOIN users u ON u.id = p.user_id
          WHERE p.status = 'active' AND u.account_status = 'active' AND u.user_slot IS NOT NULL
@@ -298,6 +303,18 @@ pub async fn load_desired(pool: &PgPool) -> Result<DesiredState, BoxError> {
         let key: String = row.get("public_key");
         let scope: String = row.get("scope");
         let slot: i32 = row.get("user_slot");
+        let callable_flag: bool = row.get("callable");
+        let callable_ports: Option<Vec<i32>> = row.get("callable_ports");
+        let callable = if callable_flag {
+            Some(callable_ports.map(|v| {
+                v.into_iter()
+                    .filter_map(|p| u16::try_from(p).ok())
+                    .filter(|p| *p > 0)
+                    .collect::<Vec<u16>>()
+            }))
+        } else {
+            None
+        };
         if !is_wireguard_key(&key) {
             warn!(
                 "peer reconciler: child peer {} has no valid key, skipped",
@@ -342,6 +359,7 @@ pub async fn load_desired(pool: &PgPool) -> Result<DesiredState, BoxError> {
                 public_key: key,
                 container_subnet: subnet_for(&user_id, slot),
                 scope,
+                callable,
             },
         );
     }
@@ -437,9 +455,10 @@ pub fn render_ruleset(state: &DesiredState, wg_interface: &str, mode: DenyMode) 
     out.push_str("# on every reconcile. See setup/CHILD_PEERS.md.\n");
     let _ = writeln!(
         out,
-        "# {} owner(s), {} child peer(s), deny mode: {}",
+        "# {} owner(s), {} child peer(s) ({} callable), deny mode: {}",
         owners.len(),
         children.len(),
+        children.iter().filter(|c| c.callable.is_some()).count(),
         match mode {
             DenyMode::Drop => "drop",
             DenyMode::Audit => "audit (log only)",
@@ -531,6 +550,32 @@ pub fn render_ruleset(state: &DesiredState, wg_interface: &str, mode: DenyMode) 
                 }
             }
         }
+    }
+
+    // Reverse direction, opt-in per peer: the owner's containers may open
+    // connections to a callable child peer (a sandbox calling an inference
+    // API on a GPU box, say). Matched on the egress interface, so it holds
+    // whatever LAN interface the container traffic arrives on. Still scoped
+    // to the owner's own subnet → that one /32, so a tenant can never reach
+    // another tenant's peers this way.
+    out.push_str("\t\t# callable peers: owner's containers -> 172.20.<slot>.<index>\n");
+    for c in &children {
+        let Some(ports) = &c.callable else {
+            continue;
+        };
+        let ports = match ports {
+            Some(p) if !p.is_empty() => format!(" tcp dport {}", port_set(p)),
+            _ => String::new(),
+        };
+        let _ = writeln!(
+            out,
+            "\t\toifname {} ip saddr {} ip daddr {}{} accept comment {}",
+            wg,
+            c.container_subnet,
+            c.vpn_ip(),
+            ports,
+            comment(&format!("peer-{}-{} {} callable", c.slot, c.index, c.name))
+        );
     }
 
     out.push_str("\t\t# anything else arriving from the VPN\n");
@@ -1023,6 +1068,7 @@ mod tests {
                             ports: None,
                         },
                     ]),
+                    callable: None,
                 },
                 ChildPeer {
                     slot: 5,
@@ -1031,6 +1077,16 @@ mod tests {
                     public_key: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCB=".into(),
                     container_subnet: Subnet::legacy_for_slot(5),
                     scope: Scope::AllContainers,
+                    callable: None,
+                },
+                ChildPeer {
+                    slot: 12,
+                    index: 4,
+                    name: "gpu-box".into(),
+                    public_key: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=".into(),
+                    container_subnet: Subnet::legacy_for_slot(12),
+                    scope: Scope::AllContainers,
+                    callable: Some(Some(vec![11434, 8000, 11434])),
                 },
             ],
         }
@@ -1182,6 +1238,7 @@ mod tests {
                     public_key: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=".into(),
                     container_subnet: big,
                     scope: Scope::AllContainers,
+                    callable: Some(None),
                 },
                 ChildPeer {
                     slot: 2,
@@ -1201,6 +1258,7 @@ mod tests {
                             ports: None,
                         },
                     ]),
+                    callable: None,
                 },
             ],
         };
@@ -1215,6 +1273,26 @@ mod tests {
         assert!(r.contains("172.21.2.7 is outside 172.21.16.0/20, refused"));
         // children stay in the VPN range whatever the container subnet is
         assert!(!r.contains("172.20.16."));
+        // callable follows the allocation too: whole /20 may call the peer
+        assert!(r.contains(
+            "oifname \"wg0\" ip saddr 172.21.16.0/20 ip daddr 172.20.2.2 accept comment \"peer-2-2 all callable\""
+        ));
+    }
+
+    #[test]
+    fn callable_is_opt_in_port_scoped_and_owner_bound() {
+        let r = render_ruleset(&sample(), "wg0", DenyMode::Drop);
+        // only the gpu-box is callable, from its owner's subnet only, on its ports only
+        assert!(r.contains(
+            "oifname \"wg0\" ip saddr 172.21.12.0/24 ip daddr 172.20.12.4 tcp dport { 8000, 11434 } accept comment \"peer-12-4 gpu-box callable\""
+        ));
+        assert_eq!(r.matches("callable\"").count(), 1);
+        // no callable rule ever names another tenant's subnet or a non-callable peer
+        assert!(!r.contains("ip saddr 172.21.5.0/24 ip daddr 172.20.12.4"));
+        assert!(!r.contains("ip daddr 172.20.5.2 "));
+        assert!(!r.contains("ip daddr 172.20.5.3 "));
+        // and it is an egress-interface match, never an ingress one
+        assert!(!r.contains("iifname \"wg0\" ip saddr 172.21."));
     }
 
     #[test]

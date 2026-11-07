@@ -636,7 +636,7 @@ tillader. Den private nøgle laves lokalt; kun den offentlige sendes.
 ### peer add
 
 ```bash
-nordkraft peer add NAVN (--all | --container CONTAINER ...) [--ports 80,443] [--pubkey NØGLE] [--out FIL] [--qr]
+nordkraft peer add NAVN (--all | --container CONTAINER ...) [--ports 80,443] [--callable [--callable-ports 11434]] [--pubkey NØGLE] [--out FIL] [--qr]
 ```
 
 | Flag | Beskrivelse |
@@ -644,6 +644,8 @@ nordkraft peer add NAVN (--all | --container CONTAINER ...) [--ports 80,443] [--
 | `--all` | Må nå alle dine containere, også dem du laver senere |
 | `--container`, `-c` | Må kun nå denne container (gentag flaget for flere) |
 | `--ports` | Begræns de angivne containere til disse TCP-porte |
+| `--callable` | Lad dine containere åbne forbindelser *til* peeren (default: de må kun svare) |
+| `--callable-ports` | Med `--callable`: kun disse TCP-porte på peeren, fx `11434` |
 | `--pubkey` | Brug enhedens egen offentlige nøgle i stedet for at lave et nøglepar her |
 | `--out`, `-o` | Skriv WireGuard-konfigurationen hertil (default `~/.nordkraft/peers/NAVN.conf`) |
 | `--qr` | Vis også konfigurationen som QR-kode til WireGuard-appen (ingen ekstra værktøj) |
@@ -654,6 +656,7 @@ nordkraft peer add NAVN (--all | --container CONTAINER ...) [--ports 80,443] [--
 nordkraft peer add anna-laptop --all
 nordkraft peer add ci --container web --ports 80,443 --container db
 nordkraft peer add telefon --all --qr
+nordkraft peer add gpu-box --all --callable --callable-ports 11434
 ```
 
 Konfigurationen importeres i WireGuard-appen på enheden, eller med
@@ -676,13 +679,15 @@ nå med deres aktuelle IP. En container, der ikke kører lige nu, vises som
 
 ---
 
-### peer allow / revoke / set
+### peer allow / revoke / set / callable
 
 ```bash
 nordkraft peer allow NAVN --container CONTAINER [--ports 80]
 nordkraft peer revoke NAVN --container CONTAINER
 nordkraft peer set NAVN --all
 nordkraft peer set NAVN --only web,db
+nordkraft peer callable NAVN [--ports 11434]   # dine containere må kalde peeren
+nordkraft peer callable NAVN --off             # tilbage til default: kun svar
 ```
 
 Ændringer slår igennem på få sekunder; enheden skal ikke gøre noget.
