@@ -113,8 +113,24 @@ mister den gamle konfiguration forbindelsen i samme sekund.
 
 Reglerne på noden tillader *peer → dine containere* (hele området eller de
 containere, du har nævnt) og kun svar den anden vej. Med `--callable` kommer
-der én regel mere for den peer: *dine containere → peeren*, evt. kun på de
-porte, du har angivet.
+der én regel mere for den peer: *dine containere → peeren*, kun TCP og kun på
+de porte, du har angivet. Porte er ikke valgfri: en callable peer er aldrig
+åben på alle porte, så SSH og admin-API'er på din maskine forbliver uden for
+rækkevidde af en container, der kører fremmed kode.
+
+### Peerens egen firewall
+
+Noden slipper trafikken igennem, men maskinen i den anden ende skal også tage
+imod den. Kører peeren fx Ubuntu med `ufw`, så åbn kun den port, det drejer
+sig om, og kun fra dit containerområde på WireGuard-interfacet:
+
+```bash
+sudo ufw allow in on <wg-interface> from 172.21.<slot>.0/24 to any port 11434 proto tcp
+```
+
+Lad inference-API'et sidde bag en nøgle eller en lille proxy, hvis det ikke
+selv kan kræve login. Det er dine containere, der kalder, og de kan køre kode,
+du ikke har skrevet.
 
 Konfigurationen, du giver videre, ruter kun dit containerområde ind i
 tunnelen. Det er bekvemmelighed, ikke sikkerhed: det er noden, der håndhæver,

@@ -29,7 +29,7 @@ table inet filter {
 		iifname "wg0" ip saddr 172.20.5.3 ip daddr 172.21.5.17 tcp dport { 80, 443 } accept comment "peer-5-3 ci-runner web"
 		iifname "wg0" ip saddr 172.20.12.4 ip daddr 172.21.12.0/24 accept comment "peer-12-4 gpu-box all"
 		# callable peers: owner's containers -> 172.20.<slot>.<index>
-		oifname "wg0" ip saddr 172.21.12.0/24 ip daddr 172.20.12.4 tcp dport { 8000, 11434 } accept comment "peer-12-4 gpu-box callable"
+		oifname "wg0" ip saddr 172.21.12.0/24 ip daddr 172.20.12.4 tcp dport { 8000, 11434 } counter accept comment "peer-12-4 gpu-box callable"
 		# anything else arriving from the VPN
 		iifname "wg0" counter drop comment "vpn-default-deny"
 	}

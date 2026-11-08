@@ -69,7 +69,7 @@ pub struct CreatePeerRequest {
     /// May the owner's containers open connections to this peer? Default false.
     #[serde(default)]
     pub callable: Option<bool>,
-    /// With callable: accepted TCP ports on the peer; omitted or empty = every port.
+    /// With callable: the TCP ports your containers may call on the peer. Required with callable.
     #[serde(default)]
     pub callable_ports: Option<Vec<u16>>,
 }
@@ -81,7 +81,7 @@ pub struct PatchPeerRequest {
     /// Turn the reverse grant on or off.
     #[serde(default)]
     pub callable: Option<bool>,
-    /// Replace the callable port list (implies callable = true). Empty = every port.
+    /// Replace the callable port list (implies callable = true). Must be non-empty.
     #[serde(default)]
     pub callable_ports: Option<Vec<u16>>,
     /// Replace the whole target list (implies scope "containers").
@@ -117,6 +117,8 @@ pub fn validate_name(name: &str) -> Result<(), String> {
         Err("name must be 1-63 characters of a-z, 0-9 and '-', e.g. anna-laptop".into())
     }
 }
+
+const CALLABLE_NEEDS_PORTS: &str = "callable needs callable_ports: list the TCP ports your containers may call on the peer (e.g. [11434]); a callable peer is never open on every port";
 
 fn validate_ports(ports: &Option<Vec<u16>>) -> Result<Option<Vec<u16>>, String> {
     match ports {
@@ -496,6 +498,11 @@ pub async fn create_peer(
     };
     // ports given without callable:true means callable — nobody lists ports for a grant they don't want
     let callable = req.callable.unwrap_or(false) || callable_ports.is_some();
+    // A callable peer is never open on every port: SSH and admin APIs on the
+    // owner's machine must stay out of reach of a container running foreign code.
+    if callable && callable_ports.is_none() {
+        return err(CALLABLE_NEEDS_PORTS);
+    }
     let ctx = match context(pool, user).await {
         Ok(c) => c,
         Err(e) => return err(e),
@@ -771,6 +778,9 @@ pub async fn patch_peer(
     }
     if !callable {
         callable_ports = None;
+    }
+    if callable && callable_ports.is_none() {
+        return err(CALLABLE_NEEDS_PORTS);
     }
 
     let result: Result<(), BoxError> = async {

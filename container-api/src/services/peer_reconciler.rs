@@ -563,13 +563,16 @@ pub fn render_ruleset(state: &DesiredState, wg_interface: &str, mode: DenyMode) 
         let Some(ports) = &c.callable else {
             continue;
         };
+        // Always TCP: a callable grant never opens UDP or ICMP towards the
+        // peer. The API refuses callable without ports; an old row without
+        // them still gets at most "every TCP port".
         let ports = match ports {
             Some(p) if !p.is_empty() => format!(" tcp dport {}", port_set(p)),
-            _ => String::new(),
+            _ => " meta l4proto tcp".to_string(),
         };
         let _ = writeln!(
             out,
-            "\t\toifname {} ip saddr {} ip daddr {}{} accept comment {}",
+            "\t\toifname {} ip saddr {} ip daddr {}{} counter accept comment {}",
             wg,
             c.container_subnet,
             c.vpn_ip(),
@@ -1275,7 +1278,7 @@ mod tests {
         assert!(!r.contains("172.20.16."));
         // callable follows the allocation too: whole /20 may call the peer
         assert!(r.contains(
-            "oifname \"wg0\" ip saddr 172.21.16.0/20 ip daddr 172.20.2.2 accept comment \"peer-2-2 all callable\""
+            "oifname \"wg0\" ip saddr 172.21.16.0/20 ip daddr 172.20.2.2 meta l4proto tcp counter accept comment \"peer-2-2 all callable\""
         ));
     }
 
@@ -1284,7 +1287,7 @@ mod tests {
         let r = render_ruleset(&sample(), "wg0", DenyMode::Drop);
         // only the gpu-box is callable, from its owner's subnet only, on its ports only
         assert!(r.contains(
-            "oifname \"wg0\" ip saddr 172.21.12.0/24 ip daddr 172.20.12.4 tcp dport { 8000, 11434 } accept comment \"peer-12-4 gpu-box callable\""
+            "oifname \"wg0\" ip saddr 172.21.12.0/24 ip daddr 172.20.12.4 tcp dport { 8000, 11434 } counter accept comment \"peer-12-4 gpu-box callable\""
         ));
         assert_eq!(r.matches("callable\"").count(), 1);
         // no callable rule ever names another tenant's subnet or a non-callable peer
@@ -1293,6 +1296,10 @@ mod tests {
         assert!(!r.contains("ip daddr 172.20.5.3 "));
         // and it is an egress-interface match, never an ingress one
         assert!(!r.contains("iifname \"wg0\" ip saddr 172.21."));
+        // every callable rule is TCP-only, so UDP/ICMP never open towards a peer
+        for line in r.lines().filter(|l| l.contains("callable\"")) {
+            assert!(line.contains(" tcp dport ") || line.contains("meta l4proto tcp"), "{line}");
+        }
     }
 
     #[test]

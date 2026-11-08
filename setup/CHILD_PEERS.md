@@ -206,15 +206,20 @@ Notes on the ruleset:
   so the journal shows what a flip to `drop` would cut.
 - **Container → peer initiated traffic is not allowed by default.** Only
   replies (`established,related`) flow back. The one relaxation is per peer
-  and opt-in: `tenant_peers.callable` (with optional `callable_ports`) adds
+  and opt-in: `tenant_peers.callable` with a non-empty `callable_ports` adds
   `oifname wg0 ip saddr <owner subnet> ip daddr 172.20.<slot>.<index>
-  [tcp dport {…}] accept` — the owner's own containers may then open
+  tcp dport {…} counter accept` — the owner's own containers may then open
   connections to that one peer, for instance a sandbox calling an inference
   API on a GPU machine the owner has peered in. Matched on the egress
   interface so it holds for any LAN interface the container traffic arrives
   on; still bounded by the owner's subnet, so no tenant ever reaches another
-  tenant's peers. CLI: `nordkraft peer add … --callable [--callable-ports
-  11434]`, `nordkraft peer callable <name> [--ports …|--off]`.
+  tenant's peers. The API refuses `callable` without ports and the rule is
+  always TCP-only (a row without ports renders `meta l4proto tcp`), so a
+  callable grant never exposes SSH, UDP or ICMP on the owner's machine to a
+  container running foreign code. The peer's own host firewall is the last
+  layer and must admit the owner's container subnet on the port. CLI:
+  `nordkraft peer add … --callable --callable-ports 11434`,
+  `nordkraft peer callable <name> (--ports …|--off)`.
 - **Children cannot reach each other or the owner** over the hub: there is no
   accept with a `172.20.x.x` destination.
 - **A target outside the owner's subnet never becomes a rule**, even if a bad

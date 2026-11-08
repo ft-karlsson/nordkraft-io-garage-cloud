@@ -671,10 +671,11 @@ enum PeerCommands {
         /// Restrict the given containers to these TCP ports, e.g. 80,443
         #[arg(long)]
         ports: Option<String>,
-        /// Let your containers open connections TO this peer (default: replies only)
-        #[arg(long)]
+        /// Let your containers open connections TO this peer (default: replies only).
+        /// Needs --callable-ports: a callable peer is never open on every port.
+        #[arg(long, requires = "callable_ports")]
         callable: bool,
-        /// With --callable: only these TCP ports on the peer, e.g. 11434
+        /// With --callable: the TCP ports your containers may call on the peer, e.g. 11434
         #[arg(long, requires = "callable")]
         callable_ports: Option<String>,
         /// Use this public key instead of generating a keypair here
@@ -694,8 +695,8 @@ enum PeerCommands {
     Callable {
         /// Peer name
         name: String,
-        /// Only these TCP ports on the peer, e.g. 11434 (omit = every port)
-        #[arg(long, conflicts_with = "off")]
+        /// The TCP ports your containers may call on the peer, e.g. 11434 (required unless --off)
+        #[arg(long, conflicts_with = "off", required_unless_present = "off")]
         ports: Option<String>,
         /// Back to the default: containers may only reply, never call
         #[arg(long)]
