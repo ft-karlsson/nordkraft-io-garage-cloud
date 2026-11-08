@@ -1298,7 +1298,10 @@ mod tests {
         assert!(!r.contains("iifname \"wg0\" ip saddr 172.21."));
         // every callable rule is TCP-only, so UDP/ICMP never open towards a peer
         for line in r.lines().filter(|l| l.contains("callable\"")) {
-            assert!(line.contains(" tcp dport ") || line.contains("meta l4proto tcp"), "{line}");
+            assert!(
+                line.contains(" tcp dport ") || line.contains("meta l4proto tcp"),
+                "{line}"
+            );
         }
     }
 
