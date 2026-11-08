@@ -859,6 +859,8 @@ CREATE TABLE public.tenant_peers (
     status character varying(20) DEFAULT 'active'::character varying NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    callable boolean DEFAULT false NOT NULL,
+    callable_ports integer[],
     CONSTRAINT tenant_peers_peer_index_check CHECK (((peer_index >= 2) AND (peer_index <= 254))),
     CONSTRAINT tenant_peers_scope_check CHECK (((scope)::text = ANY ((ARRAY['all'::character varying, 'containers'::character varying])::text[]))),
     CONSTRAINT tenant_peers_status_check CHECK (((status)::text = ANY ((ARRAY['active'::character varying, 'disabled'::character varying])::text[])))

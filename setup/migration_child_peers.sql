@@ -46,3 +46,12 @@ CREATE TABLE IF NOT EXISTS public.tenant_peer_targets (
 CREATE INDEX IF NOT EXISTS idx_tenant_peers_user ON public.tenant_peers (user_id);
 
 ALTER TABLE public.plans ADD COLUMN IF NOT EXISTS max_peers integer NOT NULL DEFAULT 5;
+
+-- Callable peers (Nov 2026). By default a child peer may open connections to
+-- the owner's containers, never the other way round. `callable` lets the
+-- owner's containers open connections TO this peer — e.g. a sandbox calling an
+-- inference API on a GPU machine the owner has peered in. `callable_ports`
+-- narrows that to TCP ports (NULL = every port). Rendered by the reconciler as
+-- one `oifname wg0 ip saddr <owner subnet> ip daddr <peer ip> accept` rule.
+ALTER TABLE public.tenant_peers ADD COLUMN IF NOT EXISTS callable boolean NOT NULL DEFAULT false;
+ALTER TABLE public.tenant_peers ADD COLUMN IF NOT EXISTS callable_ports integer[];

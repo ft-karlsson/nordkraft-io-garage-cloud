@@ -657,6 +657,8 @@ enum PeerCommands {
     ///   nordkraft peer add ci --container web --ports 80,443 --container db
     ///   nordkraft peer add phone --all --qr
     ///   nordkraft peer add anna --all --pubkey 'K7f…='   (she made her own key)
+    ///   nordkraft peer add gpu-box --all --callable --callable-ports 11434
+    ///       (your containers may call the peer on tcp 11434, e.g. an inference API)
     Add {
         /// Peer name: a-z, 0-9 and '-', e.g. anna-laptop
         name: String,
@@ -669,6 +671,13 @@ enum PeerCommands {
         /// Restrict the given containers to these TCP ports, e.g. 80,443
         #[arg(long)]
         ports: Option<String>,
+        /// Let your containers open connections TO this peer (default: replies only).
+        /// Needs --callable-ports: a callable peer is never open on every port.
+        #[arg(long, requires = "callable_ports")]
+        callable: bool,
+        /// With --callable: the TCP ports your containers may call on the peer, e.g. 11434
+        #[arg(long, requires = "callable")]
+        callable_ports: Option<String>,
         /// Use this public key instead of generating a keypair here
         #[arg(long)]
         pubkey: Option<String>,
@@ -678,6 +687,20 @@ enum PeerCommands {
         /// Also print the config as a QR code to scan with the WireGuard app
         #[arg(long)]
         qr: bool,
+    },
+    /// Let your containers call this peer (or stop that again)
+    ///
+    ///   nordkraft peer callable gpu-box --ports 11434
+    ///   nordkraft peer callable gpu-box --off
+    Callable {
+        /// Peer name
+        name: String,
+        /// The TCP ports your containers may call on the peer, e.g. 11434 (required unless --off)
+        #[arg(long, conflicts_with = "off", required_unless_present = "off")]
+        ports: Option<String>,
+        /// Back to the default: containers may only reply, never call
+        #[arg(long)]
+        off: bool,
     },
     /// List your peers with address, scope and last handshake
     #[command(alias = "ls")]
@@ -5245,10 +5268,11 @@ fn render_peer_config(peer: &serde_json::Value, private_key: Option<&str>) -> St
         }
     }
     format!(
-        "[Interface]\nPrivateKey = {private_key}\nAddress = {}\n\n[Peer]\nPublicKey = {server_key}\nEndpoint = {}\nAllowedIPs = {}\nPersistentKeepalive = 25\n\n# Nordkraft peer \"{name}\". Reachable from this device (enforced by Nordkraft, not by this file):\n{reach}",
+        "[Interface]\nPrivateKey = {private_key}\nAddress = {}\n\n[Peer]\nPublicKey = {server_key}\nEndpoint = {}\nAllowedIPs = {}\nPersistentKeepalive = 25\n\n# Nordkraft peer \"{name}\". Reachable from this device (enforced by Nordkraft, not by this file):\n{reach}# Callable by your containers: {callable}\n",
         s("address"),
         s("server_endpoint"),
         allowed.join(", "),
+        callable = callable_label(peer),
     )
 }
 
@@ -5404,11 +5428,31 @@ fn print_peer(peer: &serde_json::Value) {
             }
         }
     }
+    println!("   {} {}", "Callable:".cyan(), callable_label(peer));
     if let Some(errs) = peer["reconcile_errors"].as_array() {
         println!();
         for e in errs {
             println!("   {} {}", "⚠️".yellow(), e.as_str().unwrap_or(""));
         }
+    }
+}
+
+/// "no (replies only)" / "yes, every port" / "yes, tcp 11434" — may the
+/// owner's containers open connections to this peer?
+fn callable_label(peer: &serde_json::Value) -> String {
+    if peer["callable"].as_bool() != Some(true) {
+        return "no — your containers can only answer this peer, not call it".to_string();
+    }
+    match peer["callable_ports"].as_array() {
+        Some(a) if !a.is_empty() => format!(
+            "yes — your containers may call it on tcp {}",
+            a.iter()
+                .filter_map(|v| v.as_u64())
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        _ => "yes — your containers may call it on every port".to_string(),
     }
 }
 
@@ -5499,6 +5543,8 @@ async fn handle_peer(
             all,
             containers,
             ports,
+            callable,
+            callable_ports,
             pubkey,
             out,
             qr,
@@ -5512,6 +5558,7 @@ async fn handle_peer(
                 return Err("--all and --container exclude each other".into());
             }
             let ports = parse_port_list(&ports)?;
+            let callable_ports = parse_port_list(&callable_ports)?;
             let targets = peer_targets_json(&containers, &ports);
             let scope = if all { "all" } else { "containers" };
             let url = format!("{}/peers", *API_BASE_URL);
@@ -5522,9 +5569,23 @@ async fn handle_peer(
                     "public_key": public_key,
                     "scope": scope,
                     "targets": targets,
+                    "callable": callable,
+                    "callable_ports": callable_ports,
                 }))
             })
             .await
+        }
+
+        PeerCommands::Callable { name, ports, off } => {
+            let body = if off {
+                serde_json::json!({ "callable": false })
+            } else {
+                serde_json::json!({
+                    "callable": true,
+                    "callable_ports": parse_port_list(&ports)?.unwrap_or_default(),
+                })
+            };
+            peer_patch(&client, &name, body, json_output).await
         }
 
         PeerCommands::List => {
@@ -5567,6 +5628,11 @@ async fn handle_peer(
                                 .join(", ")
                         })
                         .unwrap_or_default()
+                };
+                let reaches = if p["callable"].as_bool() == Some(true) {
+                    format!("{reaches} · callable")
+                } else {
+                    reaches
                 };
                 let status = p["status"].as_str().unwrap_or("?");
                 println!(
