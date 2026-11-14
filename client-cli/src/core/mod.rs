@@ -6,5 +6,9 @@
 pub(crate) mod aliases;
 pub(crate) mod api;
 pub(crate) mod config;
+pub(crate) mod containers;
 pub(crate) mod registry;
 pub(crate) mod spec;
+
+/// Every core call fails with the message the terminal shows the user.
+pub(crate) type CoreResult<T> = Result<T, Box<dyn std::error::Error>>;
