@@ -114,7 +114,15 @@ enum Commands {
     },
     Ui,
     /// MCP server for AI agents (Claude Code, Claude Desktop, Cursor): speaks MCP on stdio
-    Mcp,
+    ///
+    ///   nordkraft mcp install     add it to the agent configs on this machine
+    ///   nordkraft mcp doctor      check setup, tunnel, API and agent configs
+    ///   nordkraft mcp             the server itself (agents start this)
+    #[command(verbatim_doc_comment)]
+    Mcp {
+        #[command(subcommand)]
+        command: Option<McpCommands>,
+    },
     // ===== ALIAS MANAGEMENT =====
     /// Manage container aliases (short names)
     Alias {
@@ -339,6 +347,23 @@ enum Commands {
         #[arg(short = 'n', long, default_value = "20")]
         limit: usize,
     },
+}
+
+// ============= MCP COMMANDS =============
+
+#[derive(Subcommand)]
+enum McpCommands {
+    /// Add the server to your agent's config (Claude Desktop, Claude Code, Cursor)
+    Install {
+        /// Only this client: claude-desktop, claude-code or cursor (default: every one found)
+        #[arg(long)]
+        client: Option<String>,
+        /// Print the config snippet instead of writing any file
+        #[arg(long)]
+        print: bool,
+    },
+    /// Check setup, WireGuard tunnel, API and agent configs in one go
+    Doctor,
 }
 
 // ============= AUTH COMMANDS =============
@@ -951,7 +976,13 @@ async fn main() {
         Commands::Registry { command } => handle_registry(command, json_output).await,
         // UI console
         Commands::Ui => crate::tui::run_tui().await,
-        Commands::Mcp => mcp::run().await,
+        Commands::Mcp { command } => match command {
+            None => mcp::run().await,
+            Some(McpCommands::Install { client, print }) => {
+                mcp::install::install(client, print, json_output).await
+            }
+            Some(McpCommands::Doctor) => mcp::install::doctor(json_output).await,
+        },
 
         // WireGuard management
         Commands::Setup { token } => handle_setup(token, json_output).await,
@@ -4344,6 +4375,12 @@ fn show_help() {
     println!("   nordkraft registry list                 List stored images");
     println!("   nordkraft registry status               Show registry status");
     println!("   nordkraft registry destroy              Remove registry");
+    println!();
+
+    println!("{}", "AI AGENTS (MCP):".yellow().bold());
+    println!("   nordkraft mcp install                   Add the MCP server to Claude Desktop / Claude Code / Cursor");
+    println!("   nordkraft mcp doctor                    Check setup, tunnel, API and agent configs");
+    println!("   nordkraft mcp                           The server itself (agents start this over stdio)");
     println!();
 
     println!("{}", "UPDATES:".yellow().bold());

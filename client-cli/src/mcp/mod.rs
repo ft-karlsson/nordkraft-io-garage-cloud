@@ -8,6 +8,8 @@
 //! Stdout is the protocol channel. Nothing in this module, and nothing it
 //! calls, may print to it.
 
+pub(crate) mod install;
+
 use std::collections::HashMap;
 
 use rmcp::handler::server::wrapper::Parameters;
