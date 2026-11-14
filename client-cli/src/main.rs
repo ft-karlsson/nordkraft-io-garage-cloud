@@ -11,6 +11,7 @@ use std::time::Duration;
 
 mod cli;
 mod core;
+mod mcp;
 mod spinner;
 mod stream;
 mod tui;
@@ -112,6 +113,8 @@ enum Commands {
         command: RegistryCommands,
     },
     Ui,
+    /// MCP server for AI agents (Claude Code, Claude Desktop, Cursor): speaks MCP on stdio
+    Mcp,
     // ===== ALIAS MANAGEMENT =====
     /// Manage container aliases (short names)
     Alias {
@@ -948,6 +951,7 @@ async fn main() {
         Commands::Registry { command } => handle_registry(command, json_output).await,
         // UI console
         Commands::Ui => crate::tui::run_tui().await,
+        Commands::Mcp => mcp::run().await,
 
         // WireGuard management
         Commands::Setup { token } => handle_setup(token, json_output).await,

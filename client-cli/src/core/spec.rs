@@ -677,14 +677,21 @@ pub(crate) fn set_field(
 ) -> CoreResult<(PathBuf, SpecSetOutcome)> {
     let (path, mut doc) = load_doc(name)?;
     let (table, field) = parse_key_path(key)?;
+    let strings_only = STRING_TABLES.contains(&table);
 
+    // An empty table may be absent from the file; create it on first write.
     let table_tbl: &mut Table = doc
         .as_table_mut()
-        .get_mut(table)
-        .and_then(Item::as_table_mut)
+        .entry(table)
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
         .ok_or_else(|| format!("Table '[{}]' missing from spec", table))?;
 
-    let outcome = if let Some(stripped) = raw_value.strip_prefix('+') {
+    let outcome = if strings_only {
+        let created = !table_tbl.contains_key(field);
+        table_tbl[field] = value(raw_value);
+        SpecSetOutcome::Replaced { created }
+    } else if let Some(stripped) = raw_value.strip_prefix('+') {
         let existing = table_tbl.entry(field).or_insert(value(Array::new()));
         let arr = existing
             .as_array_mut()
@@ -754,8 +761,21 @@ pub(crate) fn delete_spec(name: &str) -> CoreResult<PathBuf> {
 
 /// Known top-level tables in a DeploymentSpec. Used to validate dotted keys
 /// so a typo like `deployment.imag` doesn't silently create a dead field.
-pub(crate) const KNOWN_TABLES: &[&str] =
-    &["deployment", "resources", "network", "storage", "placement"];
+pub(crate) const KNOWN_TABLES: &[&str] = &[
+    "deployment",
+    "resources",
+    "network",
+    "storage",
+    "placement",
+    "lifecycle",
+    "env",
+    "labels",
+];
+
+/// Tables whose values are always strings (`env.PORT = 8080` must stay
+/// `"8080"`), and where a leading `+`/`-` is part of the value, not an array
+/// operation.
+const STRING_TABLES: &[&str] = &["env", "labels"];
 
 pub(crate) fn load_doc(name: &str) -> Result<(PathBuf, DocumentMut), Box<dyn Error>> {
     let path = nk_path(name);

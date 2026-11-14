@@ -489,24 +489,7 @@ pub(crate) async fn handle_specs_list(json_output: bool) -> Result<(), Box<dyn s
         aliases.iter().map(|(alias, name)| (name, alias)).collect();
 
     if json_output {
-        let items: Vec<serde_json::Value> = specs
-            .iter()
-            .filter_map(|name| {
-                load_deployment_spec(name).map(|s| {
-                    let mut item = serde_json::json!({
-                        "name": s.deployment.name,
-                        "image": s.deployment.image,
-                        "revision": s.deployment.revision,
-                        "updated": s.deployment.updated,
-                    });
-                    if let Some(alias) = reverse_aliases.get(&s.deployment.name) {
-                        item["alias"] = serde_json::json!(alias);
-                    }
-                    item
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&items)?);
+        println!("{}", serde_json::to_string_pretty(&crate::mcp::spec_summaries())?);
         return Ok(());
     }
 
