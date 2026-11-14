@@ -8,8 +8,10 @@ pub(crate) mod api;
 pub(crate) mod config;
 pub(crate) mod containers;
 pub(crate) mod deploy;
+pub(crate) mod ingress;
 pub(crate) mod registry;
 pub(crate) mod spec;
+pub(crate) mod usage;
 
 /// Every core call fails with the message the terminal shows the user.
 pub(crate) type CoreResult<T> = Result<T, Box<dyn std::error::Error>>;

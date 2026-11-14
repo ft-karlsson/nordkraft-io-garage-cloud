@@ -3,4 +3,6 @@
 
 pub(crate) mod containers;
 pub(crate) mod deploy;
+pub(crate) mod ingress;
 pub(crate) mod specs;
+pub(crate) mod usage;
