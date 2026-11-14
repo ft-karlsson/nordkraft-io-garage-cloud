@@ -1,0 +1,7 @@
+//! Core layer: everything that talks to the controller or to `~/.nordkraft/`
+//! and returns typed values. No printing, no prompts, no colour — the
+//! terminal (`cli`), `--json` and the MCP server are three presentations
+//! over these functions, so they can never disagree about what happened.
+
+pub(crate) mod api;
+pub(crate) mod config;
