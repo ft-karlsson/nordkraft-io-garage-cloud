@@ -334,6 +334,27 @@ pub(crate) fn spec_for(
     }
 }
 
+/// Build a `DeployInput` from a saved spec, the way `deploy --from` does.
+pub(crate) fn input_from_spec(spec: &DeploymentSpec) -> DeployInput {
+    DeployInput {
+        image: spec.deployment.image.clone(),
+        ports: spec.network.ports.clone(),
+        env: spec.env.clone(),
+        cpu: spec.resources.cpu,
+        memory: spec.resources.memory.clone(),
+        persistence: spec.storage.persistence,
+        volume_path: spec.storage.volume_path.clone(),
+        volume_size: spec.storage.volume_size.clone(),
+        ipv6: spec.network.ipv6,
+        garage: spec.placement.garage.clone(),
+        hardware: spec.placement.hardware.clone(),
+        command: spec.deployment.command.clone(),
+        lifecycle: spec.lifecycle.clone(),
+        labels: spec.labels.clone(),
+        wait: false,
+    }
+}
+
 // ============= UPGRADE =============
 
 /// The full desired state from a `.nk` spec, as `PUT /containers/{name}/upgrade`

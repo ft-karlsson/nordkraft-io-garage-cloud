@@ -17,9 +17,11 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::core::deploy::{DeployError, DeployInput};
 use crate::core::spec::{
     compute_diff, diff_changes_json, fetch_live_spec, fetch_stored_spec, list_deployment_specs,
-    load_deployment_spec, nk_path, save_deployment_spec, set_field, unset_field, SpecSetOutcome,
+    load_deployment_spec, nk_path, resolve_and_load_spec, save_deployment_spec, set_field,
+    unset_field, LifecycleSpec, SpecSetOutcome,
 };
 use crate::core::{aliases, containers, deploy, ingress, usage};
 
@@ -49,11 +51,32 @@ fn fail(message: impl Into<String>) -> ToolResult {
 /// The message for an error from core. A connection failure is the tunnel.
 fn error_text(e: &(dyn std::error::Error + 'static)) -> String {
     if let Some(re) = e.downcast_ref::<reqwest::Error>() {
-        if re.is_connect() || re.is_timeout() {
+        if re.is_connect() {
             return "Cannot reach the API. Is WireGuard connected? (nordkraft connect)".to_string();
+        }
+        if re.is_timeout() {
+            return "The API did not answer in time. If WireGuard is connected, the controller may be busy; try again."
+                .to_string();
         }
     }
     e.to_string()
+}
+
+fn fail_deploy(e: DeployError) -> ToolResult {
+    match e {
+        DeployError::Quota(q) => {
+            let mut text = format!("Deploy blocked — plan quota exceeded: {}", q.error);
+            if let Some(plan) = &q.plan {
+                text.push_str(&format!(" (plan {plan})"));
+            }
+            if let Some(usage) = &q.usage {
+                text.push_str(&format!(" usage: {usage}"));
+            }
+            fail(text)
+        }
+        DeployError::Failed(msg) => fail(format!("Deploy failed: {msg}")),
+        DeployError::Other(e) => fail_with(e),
+    }
 }
 
 fn fail_with(e: Box<dyn std::error::Error>) -> ToolResult {
@@ -151,6 +174,127 @@ struct InitSpecParams {
     /// Replace an existing spec file. Default false: refuse if one exists.
     #[serde(default)]
     overwrite: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct DeployParams {
+    /// Container image, e.g. nginx:alpine, ghcr.io/user/app:v1, or
+    /// registry://name:tag for the user's private registry
+    image: String,
+    /// Port(s) the container listens on. Required: a container with no
+    /// exposed port cannot get an ingress URL. Ask suggest_port if unsure.
+    #[serde(default)]
+    ports: Vec<u16>,
+    /// Environment variables
+    #[serde(default)]
+    env: HashMap<String, String>,
+    /// CPU limit in cores (default 0.5)
+    #[serde(default)]
+    cpu: Option<f32>,
+    /// Memory limit, e.g. 256m, 512m, 1g (default 512m)
+    #[serde(default)]
+    memory: Option<String>,
+    /// Persistent volume; requires volume_path
+    #[serde(default)]
+    persistence: bool,
+    /// Path inside the container for the persistent volume, e.g. /data
+    #[serde(default)]
+    volume_path: Option<String>,
+    /// Volume size, e.g. 1g, 5g (default 1g)
+    #[serde(default)]
+    volume_size: Option<String>,
+    /// Allocate a global IPv6 address
+    #[serde(default)]
+    ipv6: bool,
+    /// Command to run instead of the image default (shell-style, quotes respected)
+    #[serde(default)]
+    command: Option<String>,
+    /// Restart policy: always, unless-stopped, on-failure, never
+    #[serde(default)]
+    restart: Option<String>,
+    /// Labels, filterable with `nordkraft list --label`
+    #[serde(default)]
+    labels: HashMap<String, String>,
+    /// Short local alias for the new container (names are assigned by the platform)
+    #[serde(default)]
+    alias: Option<String>,
+    /// Answer only once the node reports the container running (up to 5 min, image pull included)
+    #[serde(default)]
+    wait: bool,
+    /// Show the request that would be sent without sending it
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct DeployFromSpecParams {
+    /// Spec name (a saved .nk) or a path to a .nk file
+    spec: String,
+    /// Short local alias for the new container
+    #[serde(default)]
+    alias: Option<String>,
+    /// Answer only once the node reports the container running
+    #[serde(default)]
+    wait: bool,
+    /// Show the request that would be sent without sending it
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct UpgradeParams {
+    /// Container name or alias; its .nk spec is the desired state
+    name: String,
+    /// Return the pending diff and the request without applying anything
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct StartParams {
+    /// Container name or alias
+    name: String,
+    /// Return only when the container is running (so an exec right after works)
+    #[serde(default)]
+    wait: bool,
+}
+
+fn default_port() -> u16 {
+    80
+}
+
+fn default_mode() -> String {
+    "https".to_string()
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct EnableIngressParams {
+    /// Container name or alias
+    name: String,
+    /// Subdomain, e.g. "myapp" → https://myapp.<platform domain>
+    subdomain: String,
+    /// Port inside the container to route to (default 80)
+    #[serde(default = "default_port")]
+    port: u16,
+    /// http, https or tcp (default https: auto-TLS)
+    #[serde(default = "default_mode")]
+    mode: String,
+    /// Show the request that would be sent without sending it
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct RemoveParams {
+    /// Container name or alias
+    name: String,
+    /// Kill immediately instead of a graceful stop first
+    #[serde(default)]
+    force: bool,
+    /// Must be true. Removing a container also removes its volume; there is
+    /// no undo. Ask the user before setting this.
+    #[serde(default)]
+    confirm: bool,
 }
 
 // ============= SERVER =============
@@ -558,6 +702,347 @@ impl NordkraftMcp {
             json!({"path": path, "revision": revision, "source": source, "warnings": warnings, "spec": spec}),
         )
     }
+
+    // ----- Tier 3: mutating. Every one takes dry_run where a request is built. -----
+
+    #[tool(
+        description = "Deploy a new container. ports is required (use suggest_port when the user did not say); persistence needs volume_path. The platform assigns the name (app-<uuid>); pass alias for a short local name. A .nk spec is saved for the new container. With dry_run=true, returns the request that would be sent and sends nothing. The reply has the name, node, IPs and access URLs; the image may still be pulling — inspect_container or get_events show progress.",
+        annotations(
+            title = "Deploy container",
+            read_only_hint = false,
+            destructive_hint = false
+        )
+    )]
+    async fn deploy(&self, Parameters(p): Parameters<DeployParams>) -> ToolResult {
+        if p.ports.is_empty() {
+            return fail(
+                "ports is required: pass the port(s) the container listens on (suggest_port knows the usual one for an image). A container with no exposed port would get an ingress URL that serves nothing.",
+            );
+        }
+        let input = DeployInput {
+            image: p.image.clone(),
+            ports: p.ports.clone(),
+            env: p.env.clone(),
+            cpu: p.cpu.unwrap_or(0.5),
+            memory: p.memory.clone().unwrap_or_else(|| "512m".to_string()),
+            persistence: p.persistence,
+            volume_path: p.volume_path.clone(),
+            volume_size: p.volume_size.clone().unwrap_or_else(|| "1g".to_string()),
+            ipv6: p.ipv6,
+            command: p.command.clone(),
+            lifecycle: LifecycleSpec::from_flags(&p.restart, &None, &None, &None),
+            labels: p.labels.clone(),
+            wait: p.wait,
+            ..DeployInput::default()
+        };
+        self.run_deploy(input, p.alias, p.dry_run).await
+    }
+
+    #[tool(
+        description = "Deploy a new container from a saved .nk spec (by name) or a .nk file (by path), the way `nordkraft deploy --from` does. With dry_run=true, returns the request without sending it.",
+        annotations(
+            title = "Deploy from spec",
+            read_only_hint = false,
+            destructive_hint = false
+        )
+    )]
+    async fn deploy_from_spec(
+        &self,
+        Parameters(p): Parameters<DeployFromSpecParams>,
+    ) -> ToolResult {
+        // An alias names a container whose spec file carries the real name.
+        let spec = match resolve_and_load_spec(&aliases::resolve_alias(&p.spec)) {
+            Ok(spec) => spec,
+            Err(e) => return fail_with(e),
+        };
+        let mut input = deploy::input_from_spec(&spec);
+        input.wait = p.wait;
+        self.run_deploy(input, p.alias, p.dry_run).await
+    }
+
+    #[tool(
+        description = "Apply a container's .nk spec to the running container (restart with the spec's image, resources, ports, env, …; volumes are kept). Do spec_set first, then upgrade. With dry_run=true, returns the pending changes and the request without applying. A container with no live state is redeployed from the spec. Returns the old and new revision.",
+        annotations(
+            title = "Upgrade container",
+            read_only_hint = false,
+            destructive_hint = false
+        )
+    )]
+    async fn upgrade(&self, Parameters(p): Parameters<UpgradeParams>) -> ToolResult {
+        let name = aliases::resolve_alias(&p.name);
+        let Some(spec) = load_deployment_spec(&name) else {
+            return fail(no_spec(&name));
+        };
+        let live = match fetch_live_spec(&name).await {
+            Ok(live) => live,
+            Err(e) => return fail_with(e),
+        };
+        let (changes, warnings, live_state) = match &live {
+            Some(live) => (
+                diff_changes_json(&compute_diff(&spec, &live.spec)),
+                unread_warnings(&live.unread_limits),
+                true,
+            ),
+            None => (Vec::new(), Vec::new(), false),
+        };
+        if live_state && changes.is_empty() {
+            return ok(
+                format!(
+                    "{name} is already up to date (revision {})",
+                    spec.deployment.revision
+                ),
+                json!({"container": name, "applied": false, "changes": [], "revision": spec.deployment.revision}),
+            );
+        }
+        let request = match deploy::upgrade_request(&spec) {
+            Ok(r) => r,
+            Err(e) => return fail_with(e),
+        };
+        if p.dry_run {
+            return ok(
+                if live_state {
+                    format!(
+                        "{name}: dry run — {} change(s) would be applied: {}",
+                        changes.len(),
+                        field_list(&changes)
+                    )
+                } else {
+                    format!("{name}: dry run — no live state, would redeploy from the spec")
+                },
+                json!({"container": name, "dry_run": true, "live_state": live_state, "changes": changes, "warnings": warnings, "request": request}),
+            );
+        }
+        match deploy::upgrade(&name, &spec).await {
+            Ok(result) => {
+                let recorded = deploy::record_upgrade(&spec, &result).is_ok();
+                ok(
+                    format!(
+                        "Upgraded {name}: revision {} → {}{}",
+                        result.revision_old.unwrap_or(spec.deployment.revision),
+                        result.revision.unwrap_or(spec.deployment.revision + 1),
+                        if live_state {
+                            String::new()
+                        } else {
+                            " (redeployed from spec)".to_string()
+                        }
+                    ),
+                    json!({"container": name, "applied": true, "changes": changes, "warnings": warnings, "result": result, "spec_updated": recorded}),
+                )
+            }
+            Err(e) => fail_with(e),
+        }
+    }
+
+    #[tool(
+        description = "Start a stopped container. With wait=true the call returns only when the node reports it running.",
+        annotations(
+            title = "Start container",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn start_container(&self, Parameters(p): Parameters<StartParams>) -> ToolResult {
+        let name = aliases::resolve_alias(&p.name);
+        match containers::start(&name, p.wait).await {
+            Ok(r) => ok(
+                match r.status.as_deref() {
+                    Some("running") => format!("{name} is running"),
+                    Some("timeout") => format!(
+                        "{name}: start sent, but the container did not report running in time"
+                    ),
+                    _ => format!("{name} started"),
+                },
+                json!({"container": name, "result": r}),
+            ),
+            Err(e) => fail_with(e),
+        }
+    }
+
+    #[tool(
+        description = "Stop a running container gracefully (SIGTERM, then kill after the stop timeout). Volumes and the container itself are kept; start_container brings it back.",
+        annotations(
+            title = "Stop container",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn stop_container(&self, Parameters(p): Parameters<NameParams>) -> ToolResult {
+        let name = aliases::resolve_alias(&p.name);
+        match containers::stop(&name).await {
+            Ok(r) => ok(
+                format!("{name} stopped"),
+                json!({"container": name, "result": r}),
+            ),
+            Err(e) => fail_with(e),
+        }
+    }
+
+    #[tool(
+        description = "Give a container a public HTTPS URL: https://<subdomain>.<platform domain> with an automatic TLS certificate, routed to the given port inside the container. The container must expose that port. With dry_run=true, returns the request without sending it.",
+        annotations(
+            title = "Enable ingress",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn enable_ingress(&self, Parameters(p): Parameters<EnableIngressParams>) -> ToolResult {
+        let name = aliases::resolve_alias(&p.name);
+        if p.dry_run {
+            return ok(
+                format!(
+                    "{name}: dry run — would enable {} ingress at subdomain {} → port {}",
+                    p.mode, p.subdomain, p.port
+                ),
+                json!({"container": name, "dry_run": true, "request": {"subdomain": p.subdomain, "mode": p.mode, "target_port": p.port}}),
+            );
+        }
+        match ingress::enable(&name, &p.subdomain, p.port, &p.mode).await {
+            Ok(r) => ok(
+                format!(
+                    "{name}: ingress enabled at {}",
+                    r.url.as_deref().unwrap_or("(url pending)")
+                ),
+                json!({"container": name, "result": r}),
+            ),
+            Err(e) => fail_with(e),
+        }
+    }
+
+    #[tool(
+        description = "Remove a container's public ingress route. The container keeps running.",
+        annotations(
+            title = "Disable ingress",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        )
+    )]
+    async fn disable_ingress(&self, Parameters(p): Parameters<NameParams>) -> ToolResult {
+        let name = aliases::resolve_alias(&p.name);
+        match ingress::disable(&name).await {
+            Ok(r) => ok(
+                format!("{name}: ingress disabled"),
+                json!({"container": name, "result": r.map(|r| serde_json::to_value(r).unwrap_or_default()).unwrap_or(json!({"status": "disabled"}))}),
+            ),
+            Err(e) => fail_with(e),
+        }
+    }
+
+    #[tool(
+        description = "Remove a container and its volume. Irreversible: refuses unless confirm=true, so ask the user first. The local .nk spec and alias are kept so it can be redeployed with deploy_from_spec.",
+        annotations(
+            title = "Remove container",
+            read_only_hint = false,
+            destructive_hint = true
+        )
+    )]
+    async fn remove_container(&self, Parameters(p): Parameters<RemoveParams>) -> ToolResult {
+        let name = aliases::resolve_alias(&p.name);
+        if !p.confirm {
+            return fail(format!(
+                "Refusing to remove {name} without confirm=true. This deletes the container and its volume and cannot be undone; confirm with the user, then call again with confirm=true."
+            ));
+        }
+        match containers::remove(&name, p.force).await {
+            Ok(r) => ok(
+                format!("{name} removed (spec {} kept)", nk_path(&name).display()),
+                json!({"container": name, "result": r}),
+            ),
+            Err(e) => fail_with(e),
+        }
+    }
+}
+
+impl NordkraftMcp {
+    /// deploy and deploy_from_spec share everything after the input is built.
+    async fn run_deploy(
+        &self,
+        input: DeployInput,
+        alias: Option<String>,
+        dry_run: bool,
+    ) -> ToolResult {
+        if let Err(e) = deploy::validate(&input) {
+            return fail(e.to_string());
+        }
+        let request = match deploy::build_request(&input) {
+            Ok(r) => r,
+            Err(e) => return fail_with(e),
+        };
+        if dry_run {
+            return ok(
+                format!(
+                    "dry run — would deploy {} with ports {:?}, {} cpu, {}{}",
+                    request.image,
+                    input.ports,
+                    input.cpu,
+                    input.memory,
+                    if input.persistence {
+                        format!(
+                            ", volume {} at {}",
+                            input.volume_size,
+                            input.volume_path.as_deref().unwrap_or("?")
+                        )
+                    } else {
+                        String::new()
+                    }
+                ),
+                json!({"dry_run": true, "request": request}),
+            );
+        }
+        let result = match deploy::deploy(&request).await {
+            Ok(r) => r,
+            Err(e) => return fail_deploy(e),
+        };
+        let mut spec_path = None;
+        let mut alias_set = None;
+        if let Some(name) = &result.container_name {
+            let spec = deploy::spec_for(&input, name, result.garage.as_deref());
+            if save_deployment_spec(&spec).is_ok() {
+                spec_path = Some(nk_path(name));
+            }
+            if let Some(alias) = alias.as_deref().filter(|a| !a.is_empty()) {
+                if aliases::set_alias(alias, name).is_ok() {
+                    alias_set = Some(alias.to_string());
+                }
+            }
+        }
+        let name = result
+            .container_name
+            .clone()
+            .unwrap_or_else(|| "?".to_string());
+        let mut summary = format!(
+            "Deployed {name}{} ({}) on {}",
+            alias_set
+                .as_deref()
+                .map(|a| format!(" [{a}]"))
+                .unwrap_or_default(),
+            request.image,
+            result.node.as_deref().unwrap_or("?")
+        );
+        if !result.access_urls.is_empty() {
+            summary.push_str(&format!("; URLs: {}", result.access_urls.join(", ")));
+        } else if let Some(ip) = &result.container_ip {
+            summary.push_str(&format!("; IPv4 {ip}"));
+        }
+        if result.ipv6_address.is_some() {
+            summary.push_str("; IPv6 allocated (firewall closed until `nordkraft ipv6 open`)");
+        }
+        ok(
+            summary,
+            json!({"result": result, "alias": alias_set, "spec": spec_path, "request": request}),
+        )
+    }
+}
+
+fn field_list(changes: &[serde_json::Value]) -> String {
+    changes
+        .iter()
+        .map(|c| c["field"].as_str().unwrap_or("?").to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn no_spec(name: &str) -> String {
@@ -603,7 +1088,9 @@ const INSTRUCTIONS: &str = "Nordkraft Garage Cloud: containers on the user's own
 Names look like app-<uuid> and are assigned by the platform; aliases are short local names. Both work everywhere. \
 Read-only tools (list_containers, inspect_container, get_logs, get_usage, get_events, list_ingress, ingress_status, suggest_port, list_specs, read_spec, diff_spec) may be called freely. \
 Every deploy saves a .nk spec; to change a running container, call spec_set, then diff_spec, then upgrade. \
-Mutating tools take dry_run=true to show what would be sent without sending it. \
+Mutating tools (deploy, deploy_from_spec, upgrade, enable_ingress) take dry_run=true to show what would be sent without sending it. \
+deploy requires ports; a container with no exposed port cannot be reached through ingress. \
+remove_container deletes the container and its volume and refuses unless confirm=true: ask the user first. \
 If a tool fails with 'Cannot reach the API', the user's WireGuard tunnel is down: ask them to run `nordkraft connect`.";
 
 #[tool_handler]
