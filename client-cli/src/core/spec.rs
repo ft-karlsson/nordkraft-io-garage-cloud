@@ -2,15 +2,15 @@
 //! `~/.nordkraft/deployments/`, rebuilding a spec from a live or stored
 //! container, and the spec ↔ live diff.
 
-use colored::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
-use toml_edit::{value, DocumentMut, Item, Value};
+use toml_edit::{value, Array, DocumentMut, Item, Table, Value};
 
 use super::api::*;
 use super::config::*;
+use super::CoreResult;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct DeploymentSpec {
@@ -244,6 +244,21 @@ pub(crate) fn resolve_and_load_spec(
     .into())
 }
 
+/// The limits the API could not read from the runtime (`cpu`, `memory`).
+/// `spec_from_inspect` writes defaults for these — 0.5 cpu / 512m — which
+/// keeps the spec valid, but a silent default is how a spec ends up capping
+/// a container below what it actually runs with, so callers should say so.
+pub(crate) fn unread_limits(c: &ContainerInspectResponse) -> Vec<&'static str> {
+    let mut unread = Vec::new();
+    if c.cpu_limit.is_none() {
+        unread.push("cpu");
+    }
+    if c.memory_limit.is_none() {
+        unread.push("memory");
+    }
+    unread
+}
+
 pub(crate) fn spec_from_inspect(c: &ContainerInspectResponse) -> DeploymentSpec {
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
@@ -264,27 +279,6 @@ pub(crate) fn spec_from_inspect(c: &ContainerInspectResponse) -> DeploymentSpec 
                 .map(|(k, v)| (k.to_string(), v.to_string()))
         })
         .collect();
-
-    // The API returns None when it could not read a limit from the runtime. The
-    // defaults below keep the spec valid, but say so out loud — a silent 0.5/512m
-    // is how a spec ends up capping a container below what it actually runs with.
-    let mut unread: Vec<&str> = Vec::new();
-    if c.cpu_limit.is_none() {
-        unread.push("cpu");
-    }
-    if c.memory_limit.is_none() {
-        unread.push("memory");
-    }
-    if !unread.is_empty() {
-        eprintln!(
-            "{} Could not read {} from the running container — wrote defaults (0.5 cpu / 512m).",
-            "⚠".yellow(),
-            unread.join(" and ")
-        );
-        eprintln!(
-            "   Verify against the node before running 'nordkraft upgrade' on this container."
-        );
-    }
 
     // Parse memory from bytes to human string
     let memory = c
@@ -606,7 +600,7 @@ pub(crate) async fn fetch_stored_spec(
 
 pub(crate) async fn fetch_live_spec(
     name: &str,
-) -> Result<Option<DeploymentSpec>, Box<dyn std::error::Error>> {
+) -> Result<Option<LiveSpec>, Box<dyn std::error::Error>> {
     let client = create_client()?;
     let url = format!("{}/containers/{}", *API_BASE_URL, name);
     let response = client.get(&url).send().await?;
@@ -628,7 +622,134 @@ pub(crate) async fn fetch_live_spec(
     let inspect: ContainerInspectResponse = serde_json::from_str(&body)
         .map_err(|e| format!("Failed to parse inspect response: {}", e))?;
 
-    Ok(Some(spec_from_inspect(&inspect)))
+    Ok(Some(LiveSpec {
+        spec: spec_from_inspect(&inspect),
+        unread_limits: unread_limits(&inspect),
+    }))
+}
+
+/// A running container rebuilt as a spec, with the limits that had to be
+/// defaulted because the runtime did not report them.
+#[derive(Debug, Clone)]
+pub(crate) struct LiveSpec {
+    pub(crate) spec: DeploymentSpec,
+    pub(crate) unread_limits: Vec<&'static str>,
+}
+
+/// The diff entries that are not `Same`, as the `--json` output and the MCP
+/// server report them.
+pub(crate) fn diff_changes_json(diffs: &[SpecDiff]) -> Vec<serde_json::Value> {
+    diffs
+        .iter()
+        .filter(|d| d.kind != DiffKind::Same)
+        .map(|d| {
+            serde_json::json!({
+                "field": d.field,
+                "spec": d.spec_value,
+                "live": d.live_value,
+                "kind": format!("{:?}", d.kind).to_lowercase(),
+            })
+        })
+        .collect()
+}
+
+// ============= EDITING SPECS IN PLACE =============
+
+/// What `set_field` did.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SpecSetOutcome {
+    /// `+item`: appended to an array.
+    Appended(String),
+    /// `-item`: removed from an array.
+    Removed(String),
+    /// Plain value: replaced, or created when the field did not exist.
+    Replaced { created: bool },
+}
+
+/// `spec-set`: set a dotted key in a `.nk` file, keeping comments and
+/// formatting. `+item` appends to an array, `-item` removes from one;
+/// anything else replaces. The result is validated as a `DeploymentSpec`
+/// before it is written.
+pub(crate) fn set_field(
+    name: &str,
+    key: &str,
+    raw_value: &str,
+) -> CoreResult<(PathBuf, SpecSetOutcome)> {
+    let (path, mut doc) = load_doc(name)?;
+    let (table, field) = parse_key_path(key)?;
+
+    let table_tbl: &mut Table = doc
+        .as_table_mut()
+        .get_mut(table)
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| format!("Table '[{}]' missing from spec", table))?;
+
+    let outcome = if let Some(stripped) = raw_value.strip_prefix('+') {
+        let existing = table_tbl.entry(field).or_insert(value(Array::new()));
+        let arr = existing
+            .as_array_mut()
+            .ok_or_else(|| format!("'{}' is not an array — cannot append", key))?;
+        arr.push(coerce_array_element(stripped));
+        SpecSetOutcome::Appended(stripped.to_string())
+    } else if let Some(stripped) = raw_value.strip_prefix('-') {
+        let existing = table_tbl
+            .get_mut(field)
+            .ok_or_else(|| format!("'{}' does not exist", key))?;
+        let arr = existing
+            .as_array_mut()
+            .ok_or_else(|| format!("'{}' is not an array — cannot remove from", key))?;
+        let before = arr.len();
+        // Compare against each element's display form so typed arrays
+        // (Vec<u16>, Vec<String>, Vec<bool>) all work with the same `-value` syntax.
+        arr.retain(|v: &Value| {
+            let as_str = v.as_str().map(|s| s.to_string());
+            let as_int = v.as_integer().map(|i| i.to_string());
+            let as_float = v.as_float().map(|f| f.to_string());
+            let as_bool = v.as_bool().map(|b| b.to_string());
+            let repr = as_str.or(as_int).or(as_float).or(as_bool);
+            repr.as_deref() != Some(stripped)
+        });
+        if arr.len() == before {
+            return Err(format!("'{}' not found in {}", stripped, key).into());
+        }
+        SpecSetOutcome::Removed(stripped.to_string())
+    } else {
+        let created = !table_tbl.contains_key(field);
+        table_tbl[field] = coerce_value(raw_value);
+        SpecSetOutcome::Replaced { created }
+    };
+
+    save_and_validate(&path, &doc)?;
+    Ok((path, outcome))
+}
+
+/// `spec-unset`: remove a dotted key from a `.nk` file.
+pub(crate) fn unset_field(name: &str, key: &str) -> CoreResult<PathBuf> {
+    let (path, mut doc) = load_doc(name)?;
+    let (table, field) = parse_key_path(key)?;
+
+    let table_tbl: &mut Table = doc
+        .as_table_mut()
+        .get_mut(table)
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| format!("Table '[{}]' missing", table))?;
+
+    if table_tbl.remove(field).is_none() {
+        return Err(format!("'{}' was not set", key).into());
+    }
+
+    save_and_validate(&path, &doc)?;
+    Ok(path)
+}
+
+/// `spec-delete`: remove the `.nk` file. The container is not touched.
+pub(crate) fn delete_spec(name: &str) -> CoreResult<PathBuf> {
+    let path = nk_path(name);
+    if !path.exists() {
+        return Err(format!("No .nk spec found for '{}'", name).into());
+    }
+    std::fs::remove_file(&path)?;
+    Ok(path)
 }
 
 /// Known top-level tables in a DeploymentSpec. Used to validate dotted keys

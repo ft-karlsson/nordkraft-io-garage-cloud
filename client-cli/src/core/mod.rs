@@ -7,6 +7,7 @@ pub(crate) mod aliases;
 pub(crate) mod api;
 pub(crate) mod config;
 pub(crate) mod containers;
+pub(crate) mod deploy;
 pub(crate) mod registry;
 pub(crate) mod spec;
 
