@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use super::config::*;
-use crate::LifecycleSpec;
+use super::spec::LifecycleSpec;
 
 pub(crate) static API_BASE_URL: LazyLock<String> = LazyLock::new(|| resolve_api_base_url().0);
 

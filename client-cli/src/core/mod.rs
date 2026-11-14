@@ -3,5 +3,8 @@
 //! terminal (`cli`), `--json` and the MCP server are three presentations
 //! over these functions, so they can never disagree about what happened.
 
+pub(crate) mod aliases;
 pub(crate) mod api;
 pub(crate) mod config;
+pub(crate) mod registry;
+pub(crate) mod spec;

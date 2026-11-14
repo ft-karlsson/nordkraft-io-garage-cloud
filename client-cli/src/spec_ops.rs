@@ -9,101 +9,13 @@
 use colored::Colorize;
 use dialoguer::{theme::ColorfulTheme, Confirm};
 use std::error::Error;
-use std::path::PathBuf;
-use toml_edit::{value, Array, DocumentMut, Item, Table, Value};
+use toml_edit::{value, Array, Item, Table, Value};
 
 // These come from main.rs — re-exported via `use crate::...` when this is a module.
-use crate::{handle_upgrade_interactive, nk_path, resolve_alias, DeploymentSpec};
-
-/// Known top-level tables in a DeploymentSpec. Used to validate dotted keys
-/// so a typo like `deployment.imag` doesn't silently create a dead field.
-const KNOWN_TABLES: &[&str] = &["deployment", "resources", "network", "storage", "placement"];
-
-fn load_doc(name: &str) -> Result<(PathBuf, DocumentMut), Box<dyn Error>> {
-    let path = nk_path(name);
-    if !path.exists() {
-        return Err(format!(
-            "No .nk spec found for '{}'. Run 'nordkraft init {}' first.",
-            name, name
-        )
-        .into());
-    }
-    let contents = std::fs::read_to_string(&path)?;
-    let doc: DocumentMut = contents
-        .parse()
-        .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
-    Ok((path, doc))
-}
-
-fn save_and_validate(path: &PathBuf, doc: &DocumentMut) -> Result<(), Box<dyn Error>> {
-    let serialized = doc.to_string();
-    // Round-trip through DeploymentSpec to catch type errors early.
-    if let Err(e) = toml::from_str::<DeploymentSpec>(&serialized) {
-        return Err(format!(
-            "Refusing to save: result would be an invalid spec.\n  → {}",
-            e
-        )
-        .into());
-    }
-    std::fs::write(path, serialized)?;
-    Ok(())
-}
-
-/// Parse a dotted key path like "resources.cpu" or "deployment.image" into
-/// (table, field). Single-segment keys are rejected — every field lives under
-/// a table in our schema.
-fn parse_key_path(key: &str) -> Result<(&str, &str), Box<dyn Error>> {
-    let parts: Vec<&str> = key.splitn(2, '.').collect();
-    if parts.len() != 2 {
-        return Err(format!(
-            "Key must be dotted (e.g. 'resources.cpu', 'deployment.image'). Got: '{}'",
-            key
-        )
-        .into());
-    }
-    let (table, field) = (parts[0], parts[1]);
-    if !KNOWN_TABLES.contains(&table) {
-        return Err(format!(
-            "Unknown table '{}'. Known tables: {}",
-            table,
-            KNOWN_TABLES.join(", ")
-        )
-        .into());
-    }
-    Ok((table, field))
-}
-
-/// Coerce a CLI string into the right TOML type by trying int → float → bool → string.
-fn coerce_value(raw: &str) -> Item {
-    if let Ok(i) = raw.parse::<i64>() {
-        return value(i);
-    }
-    if let Ok(f) = raw.parse::<f64>() {
-        return value(f);
-    }
-    match raw.to_ascii_lowercase().as_str() {
-        "true" => return value(true),
-        "false" => return value(false),
-        _ => {}
-    }
-    value(raw)
-}
-
-/// Same coercion but returns a `Value` suitable for pushing into an Array.
-fn coerce_array_element(raw: &str) -> Value {
-    if let Ok(i) = raw.parse::<i64>() {
-        return Value::from(i);
-    }
-    if let Ok(f) = raw.parse::<f64>() {
-        return Value::from(f);
-    }
-    match raw.to_ascii_lowercase().as_str() {
-        "true" => return Value::from(true),
-        "false" => return Value::from(false),
-        _ => {}
-    }
-    Value::from(raw)
-}
+use crate::core::spec::{
+    coerce_array_element, coerce_value, load_doc, nk_path, parse_key_path, save_and_validate,
+};
+use crate::{handle_upgrade_interactive, resolve_alias};
 
 /// `nordkraft spec set <app> <key> <value> [--apply]`
 ///
