@@ -426,7 +426,10 @@ Redigér et felt i en `.nk` spec direkte fra kommandolinjen — uden at åbne en
 nordkraft spec-set <container> <key> <value> [--apply]
 ```
 
-**Dotted key syntax:** `table.field`, fx `resources.cpu`, `deployment.image`, `network.ipv6`.
+**Dotted key syntax:** `table.field`, fx `resources.cpu`, `deployment.image`, `network.ipv6`,
+`lifecycle.restart`, `env.PORT`, `labels.team`. Under `env` og `labels` forbliver værdien tekst
+(`env.PORT 8080` gemmes som `"8080"`), og et foranstillet `+`/`-` er en del af værdien. Mangler
+tabellen i filen, oprettes den.
 
 **Array operationer:** Prefix værdien med `+` for at tilføje, eller `-` for at fjerne:
 
@@ -945,6 +948,42 @@ nordkraft registry destroy [--force]
 ```
 
 Fjerner registry-containeren og alle images i den.
+
+---
+
+## MCP (AI-agenter)
+
+CLI'en har en indbygget MCP-server, så Claude Code, Claude Desktop, Cursor og
+andre agenter kan styre dine containere gennem din egen WireGuard-tunnel. Se
+[guiden](../guides/mcp.md) for hvad agenten kan, og hvilke regler der gælder.
+
+### mcp install
+
+```bash
+nordkraft mcp install [--client claude-desktop|claude-code|cursor] [--print]
+```
+
+Finder de agenter der er installeret på maskinen og skriver `nordkraft`-indgangen
+i deres MCP-konfiguration. Filen får en `.bak`-kopi først. `--client` begrænser
+til én agent (og opretter filen hvis den mangler), `--print` skriver kun
+JSON-snippet'et ud til manuel opsætning.
+
+### mcp doctor
+
+```bash
+nordkraft mcp doctor
+```
+
+Tjekker i ét hug: er `setup` kørt, svarer API'et gennem tunnelen, hvilken binær
+agenterne starter, og har hver agent indgangen. Exit-kode 1 hvis noget mangler.
+
+### mcp
+
+```bash
+nordkraft mcp
+```
+
+Selve serveren: MCP over stdin/stdout. Den startes af agenten, ikke af dig.
 
 ---
 

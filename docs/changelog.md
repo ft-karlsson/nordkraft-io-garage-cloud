@@ -4,6 +4,24 @@
 
 ---
 
+## November 2026 — v0.3.53
+
+**Lad en AI-agent styre dine containere**
+
+`nordkraft mcp` er en MCP-server indbygget i CLI'en. `nordkraft mcp install` lægger den ind i
+Claude Desktop, Claude Code og Cursor på din maskine; derefter kan agenten liste, inspicere,
+deploye, opgradere og give dine containere en HTTPS-adresse, med de samme funktioner CLI'en selv
+bruger, gennem din egen WireGuard-tunnel og uden API-nøgle. Porte er påkrævede ved deploy,
+`dry_run` viser forespørgslen før den sendes, og `remove_container` kræver en bekræftelse.
+`nordkraft mcp doctor` tjekker setup, tunnel, API og agent-konfigurationer. Se
+[guiden](guides/mcp.md).
+
+Samtidig kan `spec-set` og `spec-unset` nu sætte og fjerne `env.*`, `labels.*` og `lifecycle.*`,
+og opretter tabellen i `.nk`-filen hvis den mangler. Værdier under `env` og `labels` forbliver
+tekst, så `env.PORT 8080` bliver `"8080"`.
+
+---
+
 ## November 2026 — v0.3.52
 
 **Peers dine containere må kalde**

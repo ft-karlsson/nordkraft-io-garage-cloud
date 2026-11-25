@@ -4,6 +4,11 @@ Denne side er designet til at blive givet til en AI-assistent (ChatGPT, Claude, 
 
 ---
 
+!!! tip "Kan din assistent kalde værktøjer?"
+    Claude Code, Claude Desktop og Cursor behøver ikke denne side: `nordkraft mcp install`
+    giver dem adgang til `nordkraft` direkte gennem din WireGuard-tunnel. Se
+    [AI-agenter (MCP)](../guides/mcp.md). Siden her er til assistenter der kun kan læse.
+
 ## Sådan bruger du denne side
 
 Kopier og indsæt følgende prompt til din AI-assistent:

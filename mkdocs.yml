@@ -56,6 +56,7 @@ nav:
     - Sandboxes (shell, exec, livscyklus): guides/sandboxes.md
     - Giv andre adgang (peers): guides/peers.md
     - Watt og CO₂ per container: guides/energy.md
+    - AI-agenter (MCP): guides/mcp.md
   - Reference:
     - CLI kommandoer: reference/cli.md
     - API: reference/api.md
