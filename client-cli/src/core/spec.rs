@@ -366,12 +366,20 @@ pub(crate) fn spec_from_inspect(c: &ContainerInspectResponse) -> DeploymentSpec 
 /// Normalize Docker image names for comparison.
 /// containerd resolves short names: nginx:alpine → docker.io/library/nginx:alpine
 /// This strips the prefix so both sides compare equal.
+///
+/// `registry://name:tag` shorthand is resolved to the private registry
+/// address first: the live container stores what containerd pulled
+/// (e.g. `172.21.1.3:5001/app:v9`) while the spec keeps the shorthand, and
+/// the two must compare equal. If the registry is not initialised, or the
+/// image is not a `registry://` reference, this step is a no-op.
 pub(crate) fn normalize_image(image: &str) -> String {
-    let s = image
+    let resolved =
+        super::registry::resolve_registry_image(image).unwrap_or_else(|_| image.to_string());
+    resolved
         .strip_prefix("docker.io/library/")
-        .or_else(|| image.strip_prefix("docker.io/"))
-        .unwrap_or(image);
-    s.to_string()
+        .or_else(|| resolved.strip_prefix("docker.io/"))
+        .unwrap_or(&resolved)
+        .to_string()
 }
 
 pub(crate) fn compute_diff(spec: &DeploymentSpec, live: &DeploymentSpec) -> Vec<SpecDiff> {
