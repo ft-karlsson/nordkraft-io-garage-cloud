@@ -1164,16 +1164,18 @@ pub async fn upgrade_container(
                         warn!("Failed to update stored config: {}", e);
                     }
 
-                    // Update image in containers table
-                    let _ = sqlx::query(
-                        "UPDATE containers SET image = $1, updated_at = NOW()
-                         WHERE container_name = $2 AND user_id = $3",
+                    // Image and resource allocation in the containers table
+                    if let Err(e) = crate::storage::update_container_resources(
+                        pool.inner(),
+                        &container_name,
+                        &user.0.id,
+                        &merged,
+                        None,
                     )
-                    .bind(&merged.image)
-                    .bind(&container_name)
-                    .bind(&user.0.id)
-                    .execute(pool.inner())
-                    .await;
+                    .await
+                    {
+                        warn!("Failed to update container row: {}", e);
+                    }
 
                     let old_rev = get_container_config_revision(pool.inner(), &container_name)
                         .await
@@ -1304,16 +1306,18 @@ async fn upgrade_local(
         .await
     {
         Ok((new_name, _pod, new_ip, ports, deployed_ipv6)) => {
-            // Update containers table
-            let _ = sqlx::query(
-                "UPDATE containers SET image = $1, status = 'running', updated_at = NOW()
-                 WHERE container_name = $2 AND user_id = $3",
+            // Image, status and resource allocation in the containers table
+            if let Err(e) = crate::storage::update_container_resources(
+                pool.inner(),
+                container_name,
+                &user.0.id,
+                merged,
+                Some("running"),
             )
-            .bind(&merged.image)
-            .bind(container_name)
-            .bind(&user.0.id)
-            .execute(pool.inner())
-            .await;
+            .await
+            {
+                warn!("Failed to update container row: {}", e);
+            }
 
             // Update stored config
             if let Err(e) = store_container_config(pool.inner(), &user.0.id, merged).await {

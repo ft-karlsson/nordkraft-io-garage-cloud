@@ -887,6 +887,40 @@ pub async fn track_container_deployment(
     Ok(())
 }
 
+/// After an upgrade: bring the `containers` row in line with the merged
+/// config. The plan-quota check sums cpu_limit, memory_limit_mb and
+/// volume_size_mb from this table, so a size change made through upgrade
+/// has to land here too, not only in container_config.
+pub async fn update_container_resources(
+    pool: &PgPool,
+    container_name: &str,
+    user_id: &str,
+    config: &ContainerConfig,
+    status: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let vol_mb = if config.enable_persistence {
+        parse_memory_spec_mb(&config.volume_size)
+    } else {
+        0
+    };
+    sqlx::query(
+        "UPDATE containers
+         SET image = $1, cpu_limit = $2, memory_limit_mb = $3, volume_size_mb = $4,
+             status = COALESCE($5, status), updated_at = NOW()
+         WHERE container_name = $6 AND user_id = $7",
+    )
+    .bind(&config.image)
+    .bind(config.cpu_limit as f64)
+    .bind(parse_memory_spec_mb(&config.memory_limit))
+    .bind(vol_mb)
+    .bind(status)
+    .bind(container_name)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Update container status (called when agent reports deployment result)
 pub async fn update_container_status(
     pool: &PgPool,
