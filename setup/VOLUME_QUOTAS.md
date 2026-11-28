@@ -80,15 +80,29 @@ echo "LABEL=nordkraft /var/lib/nordkraft xfs defaults,prjquota 0 2" >> /etc/fsta
 mount /var/lib/nordkraft
 findmnt -T /var/lib/nordkraft -o SOURCE,FSTYPE,OPTIONS   # xfs ... prjquota
 
-# 5. Packages and config
+# 5. Never start the agent without the mount: without this guard a missing
+#    mount would make it create volumes on the root filesystem underneath.
+mkdir -p /etc/systemd/system/nordkraft-node.service.d
+printf '[Unit]\nRequiresMountsFor=/var/lib/nordkraft\n' \
+  > /etc/systemd/system/nordkraft-node.service.d/mount.conf
+systemctl daemon-reload
+
+# 6. Packages and config
 apt-get install -y xfsprogs
 sed -i 's/^VOLUME_QUOTA=.*/VOLUME_QUOTA=required/' /etc/nordkraft/config.env \
   || echo VOLUME_QUOTA=required >> /etc/nordkraft/config.env
 
-# 6. Start, and watch the reconcile
+# 7. Start, and watch the reconcile
 systemctl start nordkraft-node
 journalctl -u nordkraft-node -f | grep -E "Volume quota"
 ```
+
+Only the containers with volumes have to be stopped (the others do not
+touch the data directory); run the rsync once while they still run, then
+stop them and rsync again with `--delete` so the outage is the second,
+short pass. Compare `find | wc -l` and `du -sb` of source and copy before
+the swap. Done on dellopt1 2026-11-28: 2.2 GB, about two minutes of
+downtime for five containers.
 
 Keep `/var/lib/nordkraft.old` until the volumes have been checked; then
 remove it.
