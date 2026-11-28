@@ -921,6 +921,26 @@ pub async fn update_container_resources(
     Ok(())
 }
 
+/// Allocated volume size (MB) per container name, for the containers of
+/// one user that have a volume. The fallback for list/inspect when a node
+/// cannot report size and usage itself.
+pub async fn volume_sizes_by_name(
+    pool: &PgPool,
+    user_id: &str,
+) -> Result<HashMap<String, i64>, Box<dyn std::error::Error + Send + Sync>> {
+    let rows = sqlx::query(
+        "SELECT container_name, volume_size_mb FROM containers
+         WHERE user_id = $1 AND volume_size_mb > 0 AND status <> 'deleted'",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get("container_name"), r.get("volume_size_mb")))
+        .collect())
+}
+
 /// Update container status (called when agent reports deployment result)
 pub async fn update_container_status(
     pool: &PgPool,
@@ -1014,6 +1034,7 @@ pub async fn get_non_running_containers(
                 ipv6_address: None,
                 ipv6_enabled: false,
                 labels: Default::default(),
+                volume: None,
             }
         })
         .collect();

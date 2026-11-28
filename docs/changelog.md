@@ -4,6 +4,22 @@
 
 ---
 
+## November 2026 — v0.3.56
+
+**Volumens størrelse gælder nu**
+
+`--volume-size` var indtil nu kun et tal i regnskabet: selve volumen lå på nodens disk uden
+grænse, og `df` inde i containeren viste hele nodens disk. Nu håndhæver noden størrelsen med
+XFS-projektkvoter. `df -h` viser den valgte størrelse, og skrivninger ud over den fejler i den
+volume alene. Størrelsen hæves med `storage.volume_size` i `.nk`-specen og `nordkraft upgrade`,
+og en ændring via `upgrade` tæller nu korrekt i planens storage.
+
+`nordkraft list` og `nordkraft container inspect` viser `Disk: brugt / størrelse` for containere
+med en volume; `nordkraft ui` viser det under *Describe*, og API-svarene har et `volume`-felt,
+som MCP-værktøjerne også får med. Se [storage-guiden](guides/storage.md#størrelse).
+
+---
+
 ## November 2026 — v0.3.53
 
 **Lad en AI-agent styre dine containere**

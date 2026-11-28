@@ -4379,7 +4379,9 @@ fn show_help() {
 
     println!("{}", "AI AGENTS (MCP):".yellow().bold());
     println!("   nordkraft mcp install                   Add the MCP server to Claude Desktop / Claude Code / Cursor");
-    println!("   nordkraft mcp doctor                    Check setup, tunnel, API and agent configs");
+    println!(
+        "   nordkraft mcp doctor                    Check setup, tunnel, API and agent configs"
+    );
     println!("   nordkraft mcp                           The server itself (agents start this over stdio)");
     println!();
 

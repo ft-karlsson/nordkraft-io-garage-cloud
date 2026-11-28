@@ -279,6 +279,10 @@ pub struct ContainerInspectData {
     pub memory_limit: Option<i64>, // bytes
     pub persistence_enabled: bool,
     pub volume_mounts: Vec<String>,
+    /// Size, usage and enforcement of the volume (absent without one, or
+    /// from agents that predate this field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<crate::models::VolumeInfo>,
     pub labels: std::collections::HashMap<String, String>,
 }
 

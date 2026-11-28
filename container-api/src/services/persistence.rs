@@ -6,8 +6,10 @@
 //   users/<slot>/volumes/<container>/quota.json  project id + size, agent-owned
 //   users/<slot>/backups/                        tar.gz taken on removal
 
+use crate::models::VolumeInfo;
 use crate::services::volume_quota::{self, Backend, QuotaMode, QuotaRecord};
 use chrono::Utc;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -191,6 +193,51 @@ impl PersistenceManager {
         if seen > 0 || failed > 0 {
             info!("📏 Volume quota reconcile: {seen} volumes, {fixed} applied, {failed} failed");
         }
+    }
+
+    /// Size and usage of the volumes of the named containers, from their
+    /// sidecars and one `xfs_quota` report. Containers without a sidecar
+    /// (no volume, or one made before quotas) are simply absent.
+    pub async fn volume_infos(&self, names: &[String]) -> HashMap<String, VolumeInfo> {
+        let mut out = HashMap::new();
+        if names.is_empty() {
+            return out;
+        }
+        let records: Vec<(PathBuf, QuotaRecord)> = self
+            .all_records()
+            .await
+            .into_iter()
+            .filter(|(_, r)| names.contains(&r.container))
+            .collect();
+        if records.is_empty() {
+            return out;
+        }
+        let enforcing = self.quota_mode != QuotaMode::Off && self.quota().await.is_enforcing();
+        let used = if enforcing {
+            match self.quota().await.report_used_kib().await {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    warn!("quota report failed: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        for (_, r) in records {
+            out.insert(
+                r.container.clone(),
+                VolumeInfo {
+                    mount_path: None,
+                    size_mb: r.size_mb,
+                    used_mb: used
+                        .as_ref()
+                        .map(|m| m.get(&r.project_id).copied().unwrap_or(0) / 1024),
+                    enforced: enforcing,
+                },
+            );
+        }
+        out
     }
 
     /// Every (volume dir, sidecar) under users/*/volumes/*.

@@ -196,6 +196,90 @@ pub(crate) struct ContainerInfo {
     /// Attributed share of the node's measured watts, when the node is metered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) watts: Option<f64>,
+    /// The container's persistent volume: size, usage, enforcement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) volume: Option<VolumeInfo>,
+}
+
+/// Mirrors `VolumeInfo` on the server.
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+pub(crate) struct VolumeInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mount_path: Option<String>,
+    /// Allocated size in MB (the quota).
+    #[serde(default)]
+    pub(crate) size_mb: u64,
+    /// In use, in MB. None when the node cannot measure it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) used_mb: Option<u64>,
+    /// True when the node holds the container to `size_mb`.
+    #[serde(default)]
+    pub(crate) enforced: bool,
+}
+
+/// "9 MB" below a gigabyte, "2.0 GB" from there on.
+pub(crate) fn fmt_mb(mb: u64) -> String {
+    if mb < 1024 {
+        format!("{mb} MB")
+    } else {
+        format!("{:.1} GB", mb as f64 / 1024.0)
+    }
+}
+
+impl VolumeInfo {
+    /// One-line summary: "9 MB / 1.0 GB (1%)", or "1.0 GB allocated" when
+    /// the node reports no usage.
+    pub(crate) fn describe(&self) -> String {
+        match self.used_mb {
+            Some(used) => {
+                let pct = (used * 100).checked_div(self.size_mb).unwrap_or(0);
+                format!("{} / {} ({pct}%)", fmt_mb(used), fmt_mb(self.size_mb))
+            }
+            None => format!("{} allocated", fmt_mb(self.size_mb)),
+        }
+    }
+
+    /// `describe()` plus the mount point, for inspect views.
+    pub(crate) fn describe_with_mount(&self) -> String {
+        match &self.mount_path {
+            Some(m) => format!("{} on {m}", self.describe()),
+            None => self.describe(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod volume_info_tests {
+    use super::*;
+
+    #[test]
+    fn sizes_format() {
+        assert_eq!(fmt_mb(0), "0 MB");
+        assert_eq!(fmt_mb(9), "9 MB");
+        assert_eq!(fmt_mb(1023), "1023 MB");
+        assert_eq!(fmt_mb(1024), "1.0 GB");
+        assert_eq!(fmt_mb(10240), "10.0 GB");
+    }
+
+    #[test]
+    fn describe_variants() {
+        let v = VolumeInfo {
+            mount_path: Some("/data".into()),
+            size_mb: 2048,
+            used_mb: Some(123),
+            enforced: true,
+        };
+        assert_eq!(v.describe(), "123 MB / 2.0 GB (6%)");
+        assert_eq!(v.describe_with_mount(), "123 MB / 2.0 GB (6%) on /data");
+        let a = VolumeInfo {
+            mount_path: None,
+            size_mb: 1024,
+            used_mb: None,
+            enforced: false,
+        };
+        assert_eq!(a.describe(), "1.0 GB allocated");
+        assert_eq!(a.describe_with_mount(), "1.0 GB allocated");
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -510,6 +594,9 @@ pub(crate) struct ContainerInspectResponse {
     pub(crate) persistence_enabled: bool,
     #[serde(default)]
     pub(crate) volume_mounts: Vec<String>,
+    /// Size, usage and enforcement of the volume (absent without one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) volume: Option<VolumeInfo>,
     #[serde(default)]
     pub(crate) labels: std::collections::HashMap<String, String>,
 }

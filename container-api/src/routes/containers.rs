@@ -517,16 +517,30 @@ pub async fn list_containers_route(
             let watts = crate::services::energy::store::watts_now_by_name(pool.inner(), &user.0.id)
                 .await
                 .unwrap_or_default();
+            // Allocated sizes from the DB: the answer for nodes whose agent
+            // does not report size and usage itself.
+            let sizes = crate::storage::volume_sizes_by_name(pool.inner(), &user.0.id)
+                .await
+                .unwrap_or_default();
             let mut list = serde_json::to_value(filter_by_labels(containers, &label))
                 .unwrap_or(serde_json::Value::Array(vec![]));
             if let Some(items) = list.as_array_mut() {
                 for item in items {
-                    let w = item
+                    let name = item
                         .get("name")
                         .and_then(|n| n.as_str())
-                        .and_then(|n| watts.get(n).copied());
-                    if let (Some(obj), Some(w)) = (item.as_object_mut(), w) {
-                        obj.insert("watts".into(), serde_json::json!(w));
+                        .map(str::to_string);
+                    let w = name.as_deref().and_then(|n| watts.get(n).copied());
+                    let size = name.as_deref().and_then(|n| sizes.get(n).copied());
+                    if let Some(obj) = item.as_object_mut() {
+                        if let Some(w) = w {
+                            obj.insert("watts".into(), serde_json::json!(w));
+                        }
+                        if !obj.contains_key("volume") {
+                            if let Some(mb) = size {
+                                obj.insert("volume".into(), allocated_only(mb));
+                            }
+                        }
                     }
                 }
             }
@@ -549,6 +563,18 @@ pub async fn list_containers_route(
         })),
         Err(e) => Json(serde_json::json!({"error": e.to_string()})),
     }
+}
+
+/// A `volume` object that states only the allocated size (nothing measured,
+/// nothing enforced) — what the controller knows on its own.
+fn allocated_only(size_mb: i64) -> serde_json::Value {
+    serde_json::to_value(crate::models::VolumeInfo {
+        mount_path: None,
+        size_mb: size_mb.max(0) as u64,
+        used_mb: None,
+        enforced: false,
+    })
+    .unwrap_or(serde_json::Value::Null)
 }
 
 fn filter_by_labels(
@@ -947,9 +973,10 @@ pub async fn inspect_container(
     user: AuthenticatedUser,
     app_state: &rocket::State<AppState>,
     orchestrator: &rocket::State<OrchestratorService>,
+    pool: &rocket::State<sqlx::PgPool>,
 ) -> Json<serde_json::Value> {
     // Try local first (hybrid mode or single-node)
-    if let Ok(data) = app_state
+    let data = match app_state
         .container_manager
         .inspect_container(
             &container_id,
@@ -958,23 +985,41 @@ pub async fn inspect_container(
         )
         .await
     {
-        return Json(
-            serde_json::to_value(data)
-                .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"})),
-        );
+        Ok(data) => Some(data),
+        // Broadcast via NATS — no need to know which node, agents self-select
+        Err(_) => {
+            orchestrator
+                .request_container_inspect(&user.0.wireguard_public_key, &container_id, None)
+                .await
+        }
+    };
+    let Some(data) = data else {
+        return Json(serde_json::json!({"error": "Container not found or not accessible"}));
+    };
+    let mut value = match serde_json::to_value(&data) {
+        Ok(v) => v,
+        Err(_) => return Json(serde_json::json!({"error": "serialization failed"})),
+    };
+    // No size from the node (old agent, or a node without quotas): at least
+    // state what was allocated.
+    if data.volume.is_none() && data.persistence_enabled {
+        if let Ok(sizes) = crate::storage::volume_sizes_by_name(pool.inner(), &user.0.id).await {
+            if let (Some(mb), Some(obj)) = (sizes.get(&data.name).copied(), value.as_object_mut()) {
+                let mut v = allocated_only(mb);
+                if let Some(o) = v.as_object_mut() {
+                    let mount = data.volume_mounts.iter().find_map(|m| {
+                        let (src, dst) = m.split_once(':')?;
+                        (!src.starts_with("tmpfs")).then(|| dst.to_string())
+                    });
+                    if let Some(m) = mount {
+                        o.insert("mount_path".into(), serde_json::json!(m));
+                    }
+                }
+                obj.insert("volume".into(), v);
+            }
+        }
     }
-
-    // Broadcast via NATS — no need to know which node, agents self-select
-    match orchestrator
-        .request_container_inspect(&user.0.wireguard_public_key, &container_id, None)
-        .await
-    {
-        Some(data) => Json(
-            serde_json::to_value(data)
-                .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"})),
-        ),
-        None => Json(serde_json::json!({"error": "Container not found or not accessible"})),
-    }
+    Json(value)
 }
 
 // ============= STORED CONFIG =============

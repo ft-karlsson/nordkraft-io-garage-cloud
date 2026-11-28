@@ -995,7 +995,15 @@ impl ContainerManager {
                 ipv6_address,
                 ipv6_enabled,
                 labels: user_labels(container["Labels"].as_str().unwrap_or("")),
+                volume: None,
             });
+        }
+
+        // Volume size and usage, one lookup for the whole list
+        let names: Vec<String> = containers.iter().map(|c| c.name.clone()).collect();
+        let mut volumes = self.persistence.volume_infos(&names).await;
+        for c in &mut containers {
+            c.volume = volumes.remove(&c.name);
         }
 
         info!("Found {} containers", containers.len());
@@ -1580,6 +1588,21 @@ impl ContainerManager {
             })
             .unwrap_or_default();
 
+        // Volume size/usage from the quota sidecar; mount path from the runtime
+        let volume = self
+            .persistence
+            .volume_infos(std::slice::from_ref(&owned.name))
+            .await
+            .remove(&owned.name)
+            .map(|mut v| {
+                let marker = format!("/volumes/{}/", owned.name);
+                v.mount_path = volume_mounts.iter().find_map(|m| {
+                    let (src, dst) = m.split_once(':')?;
+                    src.contains(&marker).then(|| dst.to_string())
+                });
+                v
+            });
+
         Ok(crate::services::nats_service::ContainerInspectData {
             container_id: c["Id"].as_str().unwrap_or(container_id).to_string(),
             name: owned.name.clone(),
@@ -1626,6 +1649,7 @@ impl ContainerManager {
             memory_limit,
             persistence_enabled,
             volume_mounts,
+            volume,
             labels,
         })
     }

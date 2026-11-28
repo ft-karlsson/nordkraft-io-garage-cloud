@@ -21,6 +21,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tracing::{info, warn};
@@ -153,6 +154,21 @@ pub fn parse_quota_used_kib(output: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// `xfs_quota -x -c "report -p -N -b" <mount>`: one row per project,
+/// `#<id> <used KiB> <soft> <hard> <warn> [grace]`. Returns used KiB by
+/// project id (project 0, the unassigned rest, is left out).
+pub fn parse_report_used_kib(output: &str) -> HashMap<u32, u64> {
+    output
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let id: u32 = f.next()?.strip_prefix('#')?.parse().ok()?;
+            let used: u64 = f.next()?.parse().ok()?;
+            (id != 0).then_some((id, used))
+        })
+        .collect()
+}
+
 /// Where a volume's sidecar lives: next to its `data` directory.
 pub fn sidecar_path(volume_dir: &Path) -> PathBuf {
     volume_dir.join(SIDECAR)
@@ -269,6 +285,12 @@ impl Backend {
             .xfs_quota(&format!("quota -p -N -v -b {project_id}"))
             .await?;
         Ok(parse_quota_used_kib(&out))
+    }
+
+    /// Used KiB of every project on the mount, in one call.
+    pub async fn report_used_kib(&self) -> Result<HashMap<u32, u64>, String> {
+        let out = self.xfs_quota("report -p -N -b").await?;
+        Ok(parse_report_used_kib(&out))
     }
 
     /// Pick a project id for a brand-new volume: the name's hash, moved on
@@ -451,6 +473,16 @@ mod tests {
             parse_quota_used_kib("/dev/sda1 0 0 0 00 [------] /var/lib/nordkraft"),
             0
         );
+    }
+
+    #[test]
+    fn report_parses_per_project() {
+        let out = "#0 2097152 0 0 00 [--------]\n#159029728 3379 0 10485760 00 [------]\n#558438691 224 0 1048576 00 [------]\n";
+        let m = parse_report_used_kib(out);
+        assert_eq!(m.get(&159029728), Some(&3379));
+        assert_eq!(m.get(&558438691), Some(&224));
+        assert!(!m.contains_key(&0));
+        assert!(parse_report_used_kib("").is_empty());
     }
 
     #[test]
