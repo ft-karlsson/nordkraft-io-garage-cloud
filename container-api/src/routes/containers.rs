@@ -202,6 +202,7 @@ pub async fn deploy_container(
                 user.0.user_slot,
                 deploy_req.enable_persistence.unwrap_or(false),
                 deploy_req.volume_path.clone(),
+                deploy_req.volume_size.clone(),
                 allocated_ip.clone(),
                 Some(container_name.clone()),
                 deploy_req.enable_ipv6, // Pass bool, not Option<String>
@@ -327,6 +328,7 @@ pub async fn deploy_container(
                 user_slot: user.0.user_slot,
                 persistence_enabled: deploy_req.enable_persistence.unwrap_or(false),
                 volume_path: deploy_req.volume_path.clone(),
+                volume_size: deploy_req.volume_size.clone(),
                 enable_ipv6: deploy_req.enable_ipv6,
                 ipv6_address: None, // Will be assigned by agent via SLAAC
                 registry_auth: registry_auth.clone(),
@@ -1288,6 +1290,7 @@ async fn upgrade_local(
             user.0.user_slot,
             merged.enable_persistence,
             merged.volume_path.clone(),
+            Some(merged.volume_size.clone()),
             Some(container_ip.to_string()),   // preserve IP
             Some(container_name.to_string()), // preserve name
             merged.enable_ipv6,

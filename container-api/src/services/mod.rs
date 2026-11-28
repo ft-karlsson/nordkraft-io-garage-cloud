@@ -20,3 +20,4 @@ pub mod route_manager;
 pub mod tenant_purge;
 pub mod verification;
 pub mod volume_backup;
+pub mod volume_quota;
