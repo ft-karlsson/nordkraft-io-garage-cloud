@@ -1049,10 +1049,30 @@ async fn run_loop(
                 // ── Per-view routing ──────────────────────────────────────
                 match app.view {
                     View::ContainerList if app.tab == Tab::Containers => {
-                        // `e` on containers → edit the backing .nk spec if
-                        // one exists. Shortcut to the Specs-tab edit flow
-                        // without forcing a tab switch.
-                        if key.code == KeyCode::Char('e') {
+                        // `S` → interactive shell in the selected container.
+                        // Suspends the TUI, so it is handled inline like `e`.
+                        if key.code == KeyCode::Char('S') {
+                            match app.selected_container() {
+                                Some(c) if is_running(&c.status) => {
+                                    let name = c.name.clone();
+                                    let label = alias_for(&name).unwrap_or_else(|| name.clone());
+                                    match shell_into_container(terminal, &name, &label).await {
+                                        Ok(code) => app.set_result(ActionResult::Success(format!(
+                                            "shell · {label} exited {code}"
+                                        ))),
+                                        Err(e) => app
+                                            .set_result(ActionResult::Error(format!("shell: {e}"))),
+                                    }
+                                }
+                                Some(_) => app.set_result(ActionResult::Error(
+                                    "container is not running".into(),
+                                )),
+                                None => {}
+                            }
+                        } else if key.code == KeyCode::Char('e') {
+                            // `e` on containers → edit the backing .nk spec if
+                            // one exists. Shortcut to the Specs-tab edit flow
+                            // without forcing a tab switch.
                             if let Some(name) = app.selected_name() {
                                 let path = nk_path(&name);
                                 if !path.exists() {
@@ -1338,6 +1358,54 @@ fn edit_spec_in_editor(
         Ok(s) => Err(format!("{editor} exited with status {s}")),
         Err(e) => Err(format!("{editor} failed: {e}")),
     }
+}
+
+/// `nordkraft shell <name>` without leaving the process: suspend the
+/// alternate-screen TUI, hand the terminal to `stream::shell` (which runs
+/// raw mode itself), and resume when the remote shell exits. Returns the
+/// remote exit code. If the shell never started, the error stays on screen
+/// until Enter so it can be read; a normal exit returns to the TUI at once.
+async fn shell_into_container(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    name: &str,
+    label: &str,
+) -> Result<i32, String> {
+    disable_raw_mode().map_err(|e| e.to_string())?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        crossterm::cursor::MoveTo(0, 0)
+    )
+    .map_err(|e| e.to_string())?;
+    println!("$ nordkraft shell {label}");
+
+    let result = crate::stream::shell(name, &[]).await;
+
+    if let Err(e) = &result {
+        println!("\nnordkraft shell: {e}\n\n[press Enter to return to TUI]");
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
+
+    // Always restore the TUI, whatever happened in the shell.
+    enable_raw_mode().map_err(|e| e.to_string())?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen).map_err(|e| e.to_string())?;
+    terminal.clear().map_err(|e| e.to_string())?;
+
+    result.map_err(|e| e.to_string())
+}
+
+/// Alias for a container name, if one is set.
+fn alias_for(name: &str) -> Option<String> {
+    crate::core::aliases::load_aliases()
+        .into_iter()
+        .find(|(_, n)| n == name)
+        .map(|(alias, _)| alias)
+}
+
+fn is_running(status: &str) -> bool {
+    let s = status.to_lowercase();
+    s == "running" || s == "up"
 }
 
 /// Run a shell command (like `nordkraft upgrade`) with full TTY access.
@@ -1894,6 +1962,7 @@ fn render_keybinds(f: &mut Frame, app: &App, area: Rect) {
             kb("↑↓", "nav"),
             kb("l/↵", "logs"),
             kb("v", "describe"),
+            kb("S", "shell"),
             kb("e", "edit spec"),
             kb("s", "stop"),
             kb("r", "restart"),
@@ -2699,6 +2768,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         hint("  ↑↓ / j k", "Navigate"),
         hint("  l / Enter", "View logs"),
         hint("  v", "Describe (rich inspect)"),
+        hint("  S", "Open a shell in the container (nordkraft shell)"),
         hint("  e", "Edit .nk spec in $EDITOR"),
         hint("  s", "Stop container"),
         hint("  r", "Restart container"),

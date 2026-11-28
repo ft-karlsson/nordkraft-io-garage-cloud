@@ -10,7 +10,7 @@
 // frame is the channel (0 stdin, 1 stdout, 2 stderr, 3 status, 4 resize).
 
 use futures::{SinkExt, StreamExt};
-use std::io::{Read, Write};
+use std::io::Write;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -52,26 +52,17 @@ pub async fn shell(container: &str, cmd: &[String]) -> Result<i32, Error> {
 
     // stdin is read on a blocking thread — tokio's stdin is line-buffered
     // through a blocking pool anyway, and this way ^C reaches the container.
+    // The thread polls fd 0 instead of sitting in read(), so once the session
+    // is over it notices the closed channel and exits without swallowing the
+    // next keypress; `nordkraft ui` goes back to reading the same terminal.
     let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(64);
-    std::thread::spawn(move || {
-        let mut stdin = std::io::stdin().lock();
-        let mut buf = [0u8; 4096];
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if stdin_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
+    let stdin_thread = std::thread::spawn(move || read_stdin_until_closed(stdin_tx));
 
     let mut winch = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
     let mut stdout = std::io::stdout().lock();
     let mut exit_code: Option<i32> = None;
     let mut remote_error: Option<String> = None;
+    let mut stdin_open = true;
 
     loop {
         tokio::select! {
@@ -95,7 +86,7 @@ pub async fn shell(container: &str, cmd: &[String]) -> Result<i32, Error> {
                 Some(Ok(_)) => {}
                 Some(Err(e)) => { remote_error.get_or_insert(e.to_string()); break; }
             },
-            input = stdin_rx.recv() => match input {
+            input = stdin_rx.recv(), if stdin_open => match input {
                 Some(bytes) => {
                     let mut frame = Vec::with_capacity(bytes.len() + 1);
                     frame.push(STDIN);
@@ -103,7 +94,8 @@ pub async fn shell(container: &str, cmd: &[String]) -> Result<i32, Error> {
                     if sink.send(Message::Binary(frame)).await.is_err() { break; }
                 }
                 None => {
-                    // Local stdin closed (piped input ended): send EOF.
+                    // Local stdin closed (piped input ended): send EOF once.
+                    stdin_open = false;
                     let _ = sink.send(Message::Binary(vec![STDIN])).await;
                 }
             },
@@ -119,11 +111,57 @@ pub async fn shell(container: &str, cmd: &[String]) -> Result<i32, Error> {
     }
     drop(_restore);
 
+    // Let the reader notice the dropped receiver and stop (at most one poll
+    // interval) before the caller reads the terminal again.
+    drop(stdin_rx);
+    let _ = tokio::task::spawn_blocking(move || stdin_thread.join()).await;
+
     if let Some(err) = remote_error {
         eprintln!("\r\nnordkraft shell: {err}");
         return Ok(exit_code.unwrap_or(1));
     }
     Ok(exit_code.unwrap_or(0))
+}
+
+/// Forward raw stdin bytes into `tx` until stdin hits EOF or the receiver is
+/// gone. poll() with a short timeout keeps the thread from blocking in read()
+/// past the end of the session, which would eat the next key typed.
+fn read_stdin_until_closed(tx: mpsc::Sender<Vec<u8>>) {
+    const POLL_MS: libc::c_int = 100;
+    let mut buf = [0u8; 4096];
+    while !tx.is_closed() {
+        let mut pfd = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is a valid pollfd for the duration of the call, and
+        // `buf` is a live, writable 4096-byte buffer; both are plain libc
+        // calls on fd 0 with the lengths they are given.
+        let ready = unsafe { libc::poll(&mut pfd, 1, POLL_MS) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if ready == 0 {
+            continue;
+        }
+        let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if n == 0 {
+            break; // EOF
+        }
+        if tx.blocking_send(buf[..n as usize].to_vec()).is_err() {
+            break;
+        }
+    }
 }
 
 struct RawModeGuard;
