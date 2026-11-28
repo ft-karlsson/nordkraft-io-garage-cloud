@@ -408,9 +408,28 @@ pub(crate) async fn handle_edit_interactive(
             if specs.is_empty() {
                 return Err("No .nk specs found. Run 'nordkraft init <container>' first.".into());
             }
+            // Show the alias first so the picker reads "nginx  (app-b006…)"
+            // instead of a bare container id.
+            let aliases = load_aliases();
+            let reverse_aliases: std::collections::HashMap<&String, &String> =
+                aliases.iter().map(|(alias, name)| (name, alias)).collect();
+            let display_items: Vec<String> = specs
+                .iter()
+                .map(|name| match reverse_aliases.get(name) {
+                    Some(alias) => {
+                        let short: String = if name.chars().count() > 30 {
+                            format!("{}…", name.chars().take(29).collect::<String>())
+                        } else {
+                            name.clone()
+                        };
+                        format!("{}  ({})", alias, short)
+                    }
+                    None => name.clone(),
+                })
+                .collect();
             let selection = Select::with_theme(&ColorfulTheme::default())
                 .with_prompt("Select spec to edit")
-                .items(&specs)
+                .items(&display_items)
                 .default(0)
                 .interact()?;
             specs[selection].clone()
