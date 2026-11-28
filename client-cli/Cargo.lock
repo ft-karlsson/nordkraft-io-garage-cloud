@@ -1499,6 +1499,7 @@ dependencies = [
  "dirs",
  "futures",
  "hex",
+ "libc",
  "qrcode",
  "ratatui",
  "reqwest",
