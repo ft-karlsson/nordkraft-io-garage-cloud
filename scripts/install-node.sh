@@ -144,7 +144,7 @@ section "Phase 1: Packages"
 # =============================================================================
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-PKGS=(curl jq uuid-runtime ca-certificates containerd iptables file zstd)
+PKGS=(curl jq uuid-runtime ca-certificates containerd iptables file zstd xfsprogs)
 if $IS_SERVER; then PKGS+=(postgresql postgresql-client); fi
 if ! $DEV; then PKGS+=(wireguard wireguard-tools nftables); fi
 apt-get install -y -qq "${PKGS[@]}"
@@ -390,6 +390,8 @@ ADMIN_ALLOWED_IPS=127.0.0.1,${VPN_SERVER_IP}
 USE_KATA=$($KATA && echo true || echo false)
 INGRESS_ENABLED=false
 QUOTA_ENFORCED=false
+# Per-volume disk limits (XFS project quotas): auto | required | off. See setup/VOLUME_QUOTAS.md
+VOLUME_QUOTA=auto
 RUST_LOG=info
 EOF
     EXEC="/usr/local/bin/nordkraft-node"
@@ -411,6 +413,8 @@ MACVLAN_INTERFACE=$(ip -o route get "$CONTROLLER_IP" | awk '{print $5}')
 AGENT_INTERFACE=$(ip -o route get "$CONTROLLER_IP" | awk '{print $5}')
 ADMIN_API_KEY=unused-on-agent
 USE_KATA=$($KATA && echo true || echo false)
+# Per-volume disk limits (XFS project quotas): auto | required | off. See setup/VOLUME_QUOTAS.md
+VOLUME_QUOTA=auto
 RUST_LOG=info
 EOF
     EXEC="/usr/local/bin/nordkraft-node"

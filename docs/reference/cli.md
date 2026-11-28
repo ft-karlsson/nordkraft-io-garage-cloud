@@ -57,6 +57,7 @@ nordkraft deploy IMAGE [FLAG]
 | `--memory` | `-m` | `512m` | Hukommelsesgrænse ⚠️ |
 | `--persistence` | | `false` | Aktiver persistent storage |
 | `--volume-path` | | - | Sti til persistent storage (påkrævet med --persistence) |
+| `--volume-size` | | `1g` | Volumens størrelse, fx `512m`, `5g`, `10g`. Håndhæves på noden; `df` i containeren viser den |
 | `--ipv6` | | `false` | Allokér global IPv6 adresse |
 | `--name` | `-n` | auto | Brugerdefineret container navn |
 | `--garage` | | auto | Target garage (ry, aarhus, etc.) |

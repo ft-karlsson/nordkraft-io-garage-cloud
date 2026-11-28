@@ -37,6 +37,27 @@ pub struct ContainerInfo {
     /// User labels (the `user.*` runtime labels, prefix stripped).
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// The container's persistent volume, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<VolumeInfo>,
+}
+
+/// What a tenant gets to see about a container's volume: the size they
+/// asked for (and are billed for), how much of it is in use, and whether
+/// the node actually holds the container to that size.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct VolumeInfo {
+    /// Mount point inside the container, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_path: Option<String>,
+    /// Allocated size in MB (the quota).
+    pub size_mb: u64,
+    /// Bytes in use, in MB. None when the node cannot measure it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_mb: Option<u64>,
+    /// True when the kernel enforces `size_mb` (XFS project quota).
+    #[serde(default)]
+    pub enforced: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

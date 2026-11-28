@@ -188,6 +188,8 @@ struct ContainerDescribe {
     memory_limit: Option<i64>,
     #[serde(default)]
     volume_mounts: Vec<String>,
+    #[serde(default)]
+    volume: Option<crate::core::api::VolumeInfo>,
 }
 
 // ─── Background Task Messages ────────────────────────────────────────────────
@@ -2440,7 +2442,7 @@ fn describe_container_lines(app: &App) -> (String, Vec<Line<'static>>) {
             }
         }
 
-        if d.cpu_limit.is_some() || d.memory_limit.is_some() {
+        if d.cpu_limit.is_some() || d.memory_limit.is_some() || d.volume.is_some() {
             lines.push(Line::from(""));
             lines.push(section("  LIMITS"));
             if let Some(c) = d.cpu_limit {
@@ -2448,6 +2450,9 @@ fn describe_container_lines(app: &App) -> (String, Vec<Line<'static>>) {
             }
             if let Some(m) = d.memory_limit {
                 lines.push(row("Memory", &format!("{m} MB")));
+            }
+            if let Some(v) = &d.volume {
+                lines.push(row("Disk", &v.describe_with_mount()));
             }
         }
 

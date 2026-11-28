@@ -89,6 +89,10 @@ pub enum NatsMessage {
         persistence_enabled: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         volume_path: Option<String>,
+        /// Disk limit for the volume ("1g", "512m"). Absent from older
+        /// controllers; the agent then uses its default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        volume_size: Option<String>,
         #[serde(default)]
         enable_ipv6: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -275,6 +279,10 @@ pub struct ContainerInspectData {
     pub memory_limit: Option<i64>, // bytes
     pub persistence_enabled: bool,
     pub volume_mounts: Vec<String>,
+    /// Size, usage and enforcement of the volume (absent without one, or
+    /// from agents that predate this field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<crate::models::VolumeInfo>,
     pub labels: std::collections::HashMap<String, String>,
 }
 
@@ -589,6 +597,7 @@ impl NatsService {
         user_slot: Option<i32>,
         persistence_enabled: bool,
         volume_path: Option<String>,
+        volume_size: Option<String>,
         enable_ipv6: bool,
         ipv6_address: Option<String>,
         registry_auth: Option<crate::models::RegistryAuth>,
@@ -610,6 +619,7 @@ impl NatsService {
             user_slot,
             persistence_enabled,
             volume_path,
+            volume_size,
             enable_ipv6,
             ipv6_address,
             registry_auth,

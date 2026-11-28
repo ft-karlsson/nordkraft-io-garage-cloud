@@ -38,6 +38,10 @@ Alle requests autentificeres via din WireGuard VPN-forbindelse. Ingen API keys n
 
 `GET /containers` tager `?label=KEY=VALUE` (kan gentages) og returnerer kun containere med alle de angivne labels.
 
+Containere med en volume har i `GET /containers` og `GET /containers/{id}` et `volume`-objekt:
+`size_mb` (den valgte størrelse), `used_mb` (forbrug; udelades hvis noden ikke kan måle det),
+`mount_path` (kun i inspect) og `enforced` (`true` når noden håndhæver størrelsen).
+
 ### Peers: ekstra WireGuard-adgang til dine containere
 
 En peer er en netværksidentitet, ikke en bruger: den får en adresse i dit eget

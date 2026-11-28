@@ -59,6 +59,11 @@ pub struct AppConfig {
 
     // Quota enforcement (cloud.nordkraft.io = true, self-hosted = false)
     pub quota_enforced: bool,
+    /// Per-volume disk limits on the node (XFS project quotas): "auto"
+    /// (default: enforce where the filesystem allows, warn otherwise),
+    /// "required" (refuse persistent deploys that cannot be limited) or
+    /// "off". See setup/VOLUME_QUOTAS.md.
+    pub volume_quota: crate::services::volume_quota::QuotaMode,
 
     // Container networking: "macvlan" (production, containers get LAN IPs)
     // or "bridge" (dev/local, containers behind nerdctl's default bridge with
@@ -149,6 +154,7 @@ pub fn apply_dev_preset() {
         ("INGRESS_ENABLED", "false"),
         ("CUSTOM_DOMAINS_ENABLED", "false"),
         ("QUOTA_ENFORCED", "false"),
+        ("VOLUME_QUOTA", "off"),
         ("BIND_ADDRESS", "127.0.0.1"),
         ("BIND_PORT", "8001"),
         ("ADMIN_API_KEY", "dev"),
@@ -304,6 +310,10 @@ pub fn init_config() -> AppConfig {
             .unwrap_or_else(|_| "false".to_string())
             .parse()
             .unwrap_or(false),
+        volume_quota: env::var("VOLUME_QUOTA")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(crate::services::volume_quota::QuotaMode::Auto),
 
         // Networking — macvlan unless told otherwise
         network_mode: env::var("NETWORK_MODE")

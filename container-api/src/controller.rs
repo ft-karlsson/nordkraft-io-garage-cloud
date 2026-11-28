@@ -701,6 +701,7 @@ fn make_container_assignment_handler(
             user_slot,
             persistence_enabled,
             volume_path,
+            volume_size,
             enable_ipv6,
             ipv6_address: _, // Ignored - SLAAC used instead
             registry_auth,
@@ -756,6 +757,7 @@ fn make_container_assignment_handler(
                     user_slot,
                     persistence_enabled,
                     volume_path,
+                    volume_size,
                     allocated_ip,
                     Some(container_name.clone()),
                     enable_ipv6,
@@ -1003,6 +1005,7 @@ fn make_container_upgrade_handler(
                     user_slot,
                     config.enable_persistence,
                     config.volume_path.clone(),
+                    Some(config.volume_size.clone()),
                     Some(container_ip.clone()),
                     Some(container_name.clone()),
                     config.enable_ipv6,

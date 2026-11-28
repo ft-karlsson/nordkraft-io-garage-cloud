@@ -13,6 +13,32 @@ genstarter og `nordkraft upgrade`. Data ligger på den node containeren kører p
 !!! note "Mark I"
     I Mark I er storage uencrypteret. LUKS-krypteret storage kommer i Mark II.
 
+## Størrelse
+
+`--volume-size` sætter volumens størrelse (standard `1g`; fx `512m`, `5g`, `10g`). Noden
+håndhæver den: `df -h` inde i containeren viser netop den størrelse, og skrivninger ud over
+den fejler med `ENOSPC` i den volume alene. Størrelsen tæller med i din plans samlede storage.
+
+```bash
+nordkraft deploy ghcr.io/basecamp/once-campfire:latest --port 3000 \
+  --persistence --volume-path /rails/storage --volume-size 5g
+
+nordkraft list                         # Disk: 9 MB / 5.0 GB
+nordkraft container inspect campfire   # Disk: 9 MB / 5.0 GB (0%) on /rails/storage
+```
+
+Det samme står i `nordkraft ui` under *Describe* og i API-svarenes `volume`-felt.
+
+**Gør den større** med `storage.volume_size` i `.nk`-specen og `nordkraft upgrade`:
+
+```bash
+nordkraft spec-set campfire storage.volume_size 10g
+nordkraft upgrade campfire
+```
+
+Containeren genstarter, data bliver. En volume kan også gøres mindre, men er den allerede
+større end den nye grænse, fejler skrivninger indtil der er ryddet op.
+
 ## Backup og gendannelse
 
 En backup er hele volumen som én fil på din egen maskine. Jeg gemmer ingen kopier på

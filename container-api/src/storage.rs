@@ -887,6 +887,60 @@ pub async fn track_container_deployment(
     Ok(())
 }
 
+/// After an upgrade: bring the `containers` row in line with the merged
+/// config. The plan-quota check sums cpu_limit, memory_limit_mb and
+/// volume_size_mb from this table, so a size change made through upgrade
+/// has to land here too, not only in container_config.
+pub async fn update_container_resources(
+    pool: &PgPool,
+    container_name: &str,
+    user_id: &str,
+    config: &ContainerConfig,
+    status: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let vol_mb = if config.enable_persistence {
+        parse_memory_spec_mb(&config.volume_size)
+    } else {
+        0
+    };
+    sqlx::query(
+        "UPDATE containers
+         SET image = $1, cpu_limit = $2, memory_limit_mb = $3, volume_size_mb = $4,
+             status = COALESCE($5, status), updated_at = NOW()
+         WHERE container_name = $6 AND user_id = $7",
+    )
+    .bind(&config.image)
+    .bind(config.cpu_limit as f64)
+    .bind(parse_memory_spec_mb(&config.memory_limit))
+    .bind(vol_mb)
+    .bind(status)
+    .bind(container_name)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Allocated volume size (MB) per container name, for the containers of
+/// one user that have a volume. The fallback for list/inspect when a node
+/// cannot report size and usage itself.
+pub async fn volume_sizes_by_name(
+    pool: &PgPool,
+    user_id: &str,
+) -> Result<HashMap<String, i64>, Box<dyn std::error::Error + Send + Sync>> {
+    let rows = sqlx::query(
+        "SELECT container_name, volume_size_mb FROM containers
+         WHERE user_id = $1 AND volume_size_mb > 0 AND status <> 'deleted'",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get("container_name"), r.get("volume_size_mb")))
+        .collect())
+}
+
 /// Update container status (called when agent reports deployment result)
 pub async fn update_container_status(
     pool: &PgPool,
@@ -980,6 +1034,7 @@ pub async fn get_non_running_containers(
                 ipv6_address: None,
                 ipv6_enabled: false,
                 labels: Default::default(),
+                volume: None,
             }
         })
         .collect();

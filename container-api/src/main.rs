@@ -955,6 +955,13 @@ async fn rocket() -> _ {
 
     let app_state = AppState::new(config.clone(), peer_cache);
 
+    // Nodes that run workloads: probe the quota backend and put every known
+    // volume back under its limit (no-op where nothing changed).
+    if config.mode.is_agent() {
+        let cm = Arc::clone(&app_state.container_manager);
+        tokio::spawn(async move { cm.reconcile_volume_quotas().await });
+    }
+
     // Initialize clients
     let pfsense_client = init_pfsense_client();
     let haproxy_client = init_haproxy_client(&config);

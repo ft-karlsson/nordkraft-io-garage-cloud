@@ -508,7 +508,10 @@ pub(crate) async fn handle_specs_list(json_output: bool) -> Result<(), Box<dyn s
         aliases.iter().map(|(alias, name)| (name, alias)).collect();
 
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&crate::mcp::spec_summaries())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&crate::mcp::spec_summaries())?
+        );
         return Ok(());
     }
 

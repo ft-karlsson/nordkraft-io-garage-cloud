@@ -211,13 +211,19 @@ impl ContainerManager {
             use_kata,
             kata_runtime_class: config.kata_runtime_class.clone(),
             restart_policy: config.container_restart_policy.clone(),
-            persistence: PersistenceManager::new(),
+            persistence: PersistenceManager::new(config.volume_quota),
             macvlan: MacvlanManager::with_defaults(),
             network_mode: config.network_mode,
             bridge_publish_addr: config.bridge_publish_addr.clone(),
             public_host: config.public_host.clone(),
             stop_timeout: config.container_stop_timeout,
         }
+    }
+
+    /// Probe the quota backend and re-apply every volume's limit from its
+    /// sidecar. Called once at agent start.
+    pub async fn reconcile_volume_quotas(&self) {
+        self.persistence.reconcile_quotas().await;
     }
 
     /// True when containers live behind nerdctl's default bridge with
@@ -274,6 +280,7 @@ impl ContainerManager {
         user_slot: Option<i32>,
         enable_persistence: bool,
         volume_path: Option<String>,
+        volume_size: Option<String>, // disk limit, e.g. "1g" (None = platform default)
         allocated_ip: Option<String>, // IPv4 from controller
         container_name: Option<String>,
         enable_ipv6: bool,
@@ -529,10 +536,21 @@ impl ContainerManager {
             }
 
             let container_mount_path = volume_path.as_deref().unwrap_or("/data");
+            let size_mb = match volume_size.as_deref() {
+                None => None,
+                Some(spec) => match crate::services::volume_quota::parse_size_mb(spec) {
+                    Some(mb) => Some(mb),
+                    None => {
+                        return Err(
+                            format!("invalid volume_size '{spec}' (use e.g. 1g, 512m)").into()
+                        )
+                    }
+                },
+            };
 
             match self
                 .persistence
-                .create_container_volume(user_slot as u32, &container_name, "data")
+                .create_container_volume(user_slot as u32, &container_name, "data", size_mb)
                 .await
             {
                 Ok(host_volume_path) => {
@@ -977,7 +995,15 @@ impl ContainerManager {
                 ipv6_address,
                 ipv6_enabled,
                 labels: user_labels(container["Labels"].as_str().unwrap_or("")),
+                volume: None,
             });
+        }
+
+        // Volume size and usage, one lookup for the whole list
+        let names: Vec<String> = containers.iter().map(|c| c.name.clone()).collect();
+        let mut volumes = self.persistence.volume_infos(&names).await;
+        for c in &mut containers {
+            c.volume = volumes.remove(&c.name);
         }
 
         info!("Found {} containers", containers.len());
@@ -1562,6 +1588,21 @@ impl ContainerManager {
             })
             .unwrap_or_default();
 
+        // Volume size/usage from the quota sidecar; mount path from the runtime
+        let volume = self
+            .persistence
+            .volume_infos(std::slice::from_ref(&owned.name))
+            .await
+            .remove(&owned.name)
+            .map(|mut v| {
+                let marker = format!("/volumes/{}/", owned.name);
+                v.mount_path = volume_mounts.iter().find_map(|m| {
+                    let (src, dst) = m.split_once(':')?;
+                    src.contains(&marker).then(|| dst.to_string())
+                });
+                v
+            });
+
         Ok(crate::services::nats_service::ContainerInspectData {
             container_id: c["Id"].as_str().unwrap_or(container_id).to_string(),
             name: owned.name.clone(),
@@ -1608,6 +1649,7 @@ impl ContainerManager {
             memory_limit,
             persistence_enabled,
             volume_mounts,
+            volume,
             labels,
         })
     }

@@ -87,6 +87,9 @@ pub(crate) async fn handle_container_list(
         if let Some(w) = c.watts {
             println!("    {} {}", "Power:".dimmed(), format!("{w:.1} W").yellow());
         }
+        if let Some(v) = &c.volume {
+            println!("    {} {}", "Disk:".dimmed(), v.describe());
+        }
 
         // Show failure reason
         if let Some(reason) = failure_reason {
@@ -493,13 +496,16 @@ pub(crate) async fn handle_container_inspect(
         println!();
 
         // ── Resources ─────────────────────────────────────────────
-        if c.cpu_limit.is_some() || c.memory_limit.is_some() {
+        if c.cpu_limit.is_some() || c.memory_limit.is_some() || c.volume.is_some() {
             println!("   {}", "Resources:".cyan().bold());
             if let Some(cpu) = c.cpu_limit {
                 println!("     {} {:.2} vCPU", "CPU:".cyan(), cpu);
             }
             if let Some(mem) = c.memory_limit {
                 println!("     {} {} MB", "Memory:".cyan(), mem / 1024 / 1024);
+            }
+            if let Some(v) = &c.volume {
+                println!("     {} {}", "Disk:".cyan(), v.describe_with_mount());
             }
             println!();
         }
