@@ -141,17 +141,15 @@ pub fn parse_lsproj(output: &str) -> Option<u32> {
 }
 
 /// `xfs_quota -x -c "quota -p -N -v -b <id>" <mount>` prints one line,
-/// `#<id> <used KiB> <soft> <hard> ...`, or nothing when the project has
-/// never been used. Returns the used kibibytes.
+/// `<device or #id> <used KiB> <soft> <hard> ...`, or nothing when the
+/// project has never been used. Returns the used kibibytes.
 pub fn parse_quota_used_kib(output: &str) -> u64 {
+    // First column is the device path (or `#id`); a long device path makes
+    // xfs_quota wrap the numbers onto the next line, so scan tokens rather
+    // than columns: the first integer is the used blocks.
     output
-        .lines()
-        .filter_map(|l| {
-            let mut f = l.split_whitespace();
-            f.next()?; // project name or #id
-            f.next()?.parse::<u64>().ok()
-        })
-        .next()
+        .split_whitespace()
+        .find_map(|t| t.parse::<u64>().ok())
         .unwrap_or(0)
 }
 
@@ -442,6 +440,17 @@ mod tests {
         );
         assert_eq!(parse_quota_used_kib(""), 0);
         assert_eq!(parse_quota_used_kib("#7 0 0 0 00 [--------] /x"), 0);
+        // Real dellopt1 output: device path on its own line, numbers wrapped.
+        assert_eq!(
+            parse_quota_used_kib(
+                "/dev/mapper/ubuntu--vg-nordkraft\n               102400      0   102400  00 [------] /var/lib/nordkraft\n"
+            ),
+            102400
+        );
+        assert_eq!(
+            parse_quota_used_kib("/dev/sda1 0 0 0 00 [------] /var/lib/nordkraft"),
+            0
+        );
     }
 
     #[test]
