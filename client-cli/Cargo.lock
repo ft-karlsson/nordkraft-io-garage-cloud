@@ -1488,7 +1488,7 @@ dependencies = [
 
 [[package]]
 name = "nordkraft"
-version = "0.3.54"
+version = "0.3.55"
 dependencies = [
  "chrono",
  "clap",
